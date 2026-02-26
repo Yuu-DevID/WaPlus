@@ -87,10 +87,20 @@ export const useChatStore = create((set, get) => ({
     }),
 
     // ── Message actions ─────────────────────────────
+    // _seq: counter per-JID untuk cancel request lama saat switch chat cepat
+    _seq: {},
+
     loadMessages: async (jid, limit = 50, offset = 0) => {
-        set({ messagesLoading: true })
+        // Naikkan sequence untuk JID ini — request lama yang masih pending akan discard
+        const seq = ((get()._seq[jid] || 0) + 1)
+        set(s => ({ _seq: { ...s._seq, [jid]: seq }, messagesLoading: true }))
+
         try {
             const result = await window.api?.dbMessages?.({ jid, limit, offset })
+
+            // Kalau sequence sudah berubah (user switch chat lagi), buang hasilnya
+            if (get()._seq[jid] !== seq) return []
+
             if (result?.ok) {
                 const msgs = (result.data || []).slice().reverse() // oldest first
                 set((s) => ({
@@ -102,7 +112,11 @@ export const useChatStore = create((set, get) => ({
         } catch (err) {
             console.error("loadMessages error:", err)
         }
-        set({ messagesLoading: false })
+
+        // Hanya clear loading jika masih request yang sama
+        if (get()._seq[jid] === seq) {
+            set({ messagesLoading: false })
+        }
         return []
     },
 

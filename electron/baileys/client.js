@@ -22,6 +22,21 @@
 
 "use strict"
 
+// Guard global — cegah Electron crash popup dari network error yang tidak tertangkap
+// Khususnya: undici "terminated", fetch abort, dan ECONNRESET saat download media WA
+process.on('unhandledRejection', (reason) => {
+  const msg = reason?.message || String(reason)
+  const isMediaNetworkErr =
+    msg.includes('terminated') ||
+    msg.includes('Failed to fetch') ||
+    msg.includes('ECONNRESET') ||
+    msg.includes('ECACHEFULL') ||
+    msg.includes('empty media key') ||
+    msg.includes('Cannot derive')
+  if (isMediaNetworkErr) return // suppress — sudah di-log di catch block masing-masing
+  console.error('[AuroraChat] Unhandled rejection:', msg)
+})
+
 const {
   makeWASocket,
   useMultiFileAuthState,
@@ -162,66 +177,70 @@ function assertConnected() {
 // MEDIA DOWNLOAD HANDLER
 // ════════════════════════════════════════════════════════════
 
-async function downloadAndSaveMedia(msg, messageType) {
-  try {
-    const buffer = await downloadMediaMessage(
-      msg,
-      'buffer',
-      {},
-      {
-        logger,
-        reuploadRequest: sock.updateMediaMessage,
-      }
-    )
-
-    if (!buffer) return null
-
-    // Check file size
-    const sizeMB = buffer.length / (1024 * 1024)
-    if (sizeMB > CONFIG.MAX_MEDIA_SIZE_MB) {
-      logW(`Media too large: ${sizeMB.toFixed(2)}MB, skipping download`)
-      return { skipped: true, reason: 'too_large', size: buffer.length }
-    }
-
-    // Generate filename
-    const ext = getExtensionFromMimetype(msg.message[messageType].mimetype)
-    const timestamp = Date.now()
-    const filename = `${msg.key.id}_${timestamp}.${ext}`
-    const localPath = path.join(CONFIG.MEDIA_DIR, filename)
-
-    // Save file
-    fs.writeFileSync(localPath, buffer)
-
-    // Update database
-    db.updateMediaDownload(
-      msg.key.id,
-      localPath,
-      buffer.length,
-      'downloaded'
-    )
-
-    // Update message record
-    const dbMsg = db.getMessageById(msg.key.id)
-    if (dbMsg) {
-      const { Database } = require('better-sqlite3')
-      const database = new Database(path.join(__dirname, './database/aurora_chat.db'))
-      database.prepare(`
-        UPDATE messages SET 
-          media_saved_path = ?,
-          media_is_downloaded = 1
-        WHERE id = ?
-      `).run(localPath, msg.key.id)
-      database.close()
-    }
-
-    logOk(`Media downloaded: ${filename} (${sizeMB.toFixed(2)}MB)`)
-    return { localPath, size: buffer.length, filename }
-  } catch (error) {
-    logE(`Error downloading media: ${error.message}`)
-    db.updateMediaDownload(msg.key.id, null, null, 'failed', error.message)
-    return { error: error.message }
+// Semaphore sederhana untuk batasi concurrent download
+// Mencegah overload koneksi saat history sync (ratusan media sekaligus)
+const _dlQueue = { running: 0, max: 3 }
+async function _withDlSemaphore(fn) {
+  while (_dlQueue.running >= _dlQueue.max) {
+    await new Promise(r => setTimeout(r, 200))
   }
+  _dlQueue.running++
+  try { return await fn() }
+  finally { _dlQueue.running-- }
 }
+
+async function downloadAndSaveMedia(msg, messageType, isHistorySync = false) {
+  // Jangan download media dari history sync — URL sering expired/key kosong
+  if (isHistorySync) return { skipped: true, reason: 'history_sync' }
+
+  return _withDlSemaphore(async () => {
+    try {
+      const buffer = await Promise.resolve(
+        downloadMediaMessage(msg, 'buffer', {}, {
+          logger,
+          reuploadRequest: sock?.updateMediaMessage,
+        })
+      )
+
+      if (!buffer || buffer.length === 0) return null
+
+      const sizeMB = buffer.length / (1024 * 1024)
+      if (sizeMB > CONFIG.MAX_MEDIA_SIZE_MB) {
+        logW(`Media too large: ${sizeMB.toFixed(2)}MB, skipping`)
+        return { skipped: true, reason: 'too_large', size: buffer.length }
+      }
+
+      const msgObj = msg.message?.[messageType]
+      const ext = getExtensionFromMimetype(msgObj?.mimetype || 'application/octet-stream')
+      const filename = `${msg.key.id}_${Date.now()}.${ext}`
+      const localPath = path.join(CONFIG.MEDIA_DIR, filename)
+
+      fs.writeFileSync(localPath, buffer)
+
+      db.updateMediaDownload(msg.key.id, localPath, buffer.length, 'downloaded')
+      db.updateMediaSavedPath(msg.key.id, localPath)
+
+      logOk(`Media downloaded: ${filename} (${sizeMB.toFixed(2)}MB)`)
+      return { localPath, size: buffer.length, filename }
+    } catch (error) {
+      const msg_err = error.message || String(error)
+      const isExpired = msg_err.includes('empty media key') || msg_err.includes('Cannot derive')
+      const isNetwork = msg_err.includes('terminated') || msg_err.includes('fetch') || msg_err.includes('ECONNRESET')
+
+      if (!isExpired) {
+        if (isNetwork) {
+          logW(`Media network error (${msg.key.id?.slice(0,8)}…): ${msg_err.slice(0,80)}`)
+        } else {
+          logE(`Error downloading media: ${msg_err}`)
+        }
+      }
+
+      try { db.updateMediaDownload(msg.key.id, null, null, 'failed', msg_err.slice(0,200)) } catch (_) {}
+      return { error: msg_err }
+    }
+  })
+}
+
 
 function getExtensionFromMimetype(mimetype) {
   const map = {
@@ -278,8 +297,8 @@ async function handleMessage(msg, type, isHistorySync = false) {
       const mediaType = mediaTypes.find(mt => msg.message[mt])
       if (mediaType) {
         db.queueMediaDownload(msg.key.id, msg.key.remoteJid, mediaType.replace('Message', ''), msg.message[mediaType].url)
-        // Download async
-        downloadAndSaveMedia(msg, mediaType).catch(console.error)
+        // Download async — pass isHistorySync agar media lama tidak di-download
+        downloadAndSaveMedia(msg, mediaType, isHistorySync).catch(() => {})
       }
     }
 
@@ -288,12 +307,25 @@ async function handleMessage(msg, type, isHistorySync = false) {
       syncStats.messages++
     }
 
-    // Emit to renderer
+    // Update chat last message in DB (so chat list shows correct preview)
     const jid = msg.key.remoteJid || ""
+    const body = extractBody(msg.message)
+    if (!isHistorySync && jid) {
+      try {
+        db.statements?.updateChatLastMessage?.run({
+          jid,
+          timestamp: Number(msg.messageTimestamp) || Math.floor(Date.now() / 1000),
+          message_id: msg.key.id,
+          body: body || null,
+        })
+      } catch (_) {}
+    }
+
+    // Emit to renderer
     const isGroup = isJidGroup(jid)
     const isMe = msg.key.fromMe
     const pushname = msg.pushName || "Unknown"
-    const body = extractBody(msg.message)
+    
 
     // Cache for retry
     if (msg.message) {
@@ -389,12 +421,15 @@ async function connectToWhatsApp(phoneForPairing = null) {
     browser: ['Ubuntu', 'Chrome', '20.0.04'],
     syncFullHistory: CONFIG.SYNC_FULL_HISTORY,
     shouldSyncHistoryMessage: (msg) => {
-      // Terima semua history sync
       return true
     },
     generateHighQualityLinkPreview: true,
     msgRetryCounterCache: msgRetryCache,
-    keepAliveIntervalMs: 25000,
+    keepAliveIntervalMs: 15000,       // more frequent keepalive
+    connectTimeoutMs: 60000,          // 60s connect timeout
+    defaultQueryTimeoutMs: 60000,     // 60s query timeout
+    emitOwnEvents: true,
+    retryRequestDelayMs: 500,
     getMessage: async (key) => {
       const cached = msgRetryCache.get(key.id)
       if (cached) return cached
@@ -498,6 +533,12 @@ async function connectToWhatsApp(phoneForPairing = null) {
       if (statusCode === DisconnectReason.multideviceMismatch) {
         logW("Multidevice mismatch — reconnect...")
         scheduleReconnect(0)
+        return
+      }
+
+      if (statusCode === DisconnectReason.connectionReplaced) {
+        logW("Connection replaced (multiple devices) — reconnect...")
+        scheduleReconnect(2000)
         return
       }
 
@@ -612,12 +653,7 @@ async function connectToWhatsApp(phoneForPairing = null) {
           })
 
           // Update poll votes in database
-          const { Database } = require('better-sqlite3')
-          const database = new Database(path.join(__dirname, './database/aurora_chat.db'))
-          database.prepare(`
-            UPDATE messages SET poll_votes = ? WHERE id = ?
-          `).run(JSON.stringify(pollResults), key.id)
-          database.close()
+          db.updatePollVotes(key.id, JSON.stringify(pollResults))
 
           // Save individual votes
           for (const vote of update.pollUpdates) {

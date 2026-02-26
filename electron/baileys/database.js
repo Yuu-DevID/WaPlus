@@ -246,9 +246,34 @@ const statements = {
 
     getMessageById: db.prepare('SELECT * FROM messages WHERE id = ?'),
     getMessagesByJid: db.prepare(`
-        SELECT * FROM messages 
-        WHERE remote_jid = ? 
-        ORDER BY message_timestamp DESC 
+        SELECT
+            msg.id,
+            msg.remote_jid              AS chat_jid,
+            msg.from_me,
+            msg.participant             AS sender_jid,
+            COALESCE(msg.push_name, c.name, c.push_name) AS sender_name,
+            msg.message_type            AS msg_type,
+            msg.body,
+            msg.message_timestamp       AS timestamp,
+            msg.status, msg.starred, msg.broadcast,
+            msg.is_history_sync,
+            msg.media_mimetype          AS mimetype,
+            msg.media_duration          AS duration,
+            msg.media_saved_path,
+            msg.media_is_downloaded,
+            msg.media_url,
+            msg.poll_options,
+            msg.poll_votes,
+            msg.context_stanza_id       AS quoted_id,
+            msg.context_participant     AS quoted_sender,
+            msg.context_quoted_message  AS quoted_body,
+            msg.location_lat, msg.location_lng, msg.location_name, msg.location_address,
+            msg.reaction_text, msg.reaction_target_id,
+            CASE WHEN msg.remote_jid LIKE '%@g.us' THEN 1 ELSE 0 END AS is_group
+        FROM messages msg
+        LEFT JOIN contacts c ON c.jid = msg.participant
+        WHERE msg.remote_jid = ?
+        ORDER BY msg.message_timestamp DESC
         LIMIT @limit OFFSET @offset
     `),
     searchMessages: db.prepare(`
@@ -280,8 +305,24 @@ const statements = {
         )
     `),
     getChats: db.prepare(`
-        SELECT * FROM chats 
-        ORDER BY pinned DESC, last_message_timestamp DESC 
+        SELECT
+            c.jid,
+            COALESCE(c.name, ct.name, ct.push_name, ct.short_name) AS name,
+            c.is_group, c.is_community, c.unread_count, c.pinned, c.archived,
+            c.muted_until,
+            COALESCE(c.profile_pic_url, ct.profile_pic_url) AS profile_pic_url,
+            c.status, c.presence,
+            c.last_message_timestamp    AS last_msg_at,
+            c.last_message_body         AS last_msg,
+            c.last_message_id           AS last_msg_id,
+            m.message_type              AS last_msg_type,
+            COALESCE(m.push_name, msender.name, msender.push_name) AS last_sender_name,
+            m.from_me                   AS from_me
+        FROM chats c
+        LEFT JOIN contacts ct ON ct.jid = c.jid
+        LEFT JOIN messages m ON m.id = c.last_message_id
+        LEFT JOIN contacts msender ON msender.jid = m.participant
+        ORDER BY c.pinned DESC, c.last_message_timestamp DESC
         LIMIT @limit OFFSET @offset
     `),
     getChatByJid: db.prepare('SELECT * FROM chats WHERE jid = ?'),
@@ -292,8 +333,7 @@ const statements = {
         UPDATE chats SET 
             last_message_timestamp = @timestamp,
             last_message_id = @message_id,
-            last_message_body = @body,
-            unread_count = unread_count + 1
+            last_message_body = @body
         WHERE jid = @jid
     `),
 
@@ -370,20 +410,17 @@ const statements = {
 function detectMessageType(message) {
     if (!message) return 'unknown';
 
-    // Check for ephemeral wrapper
-    if (message.ephemeralMessage) {
-        return 'ephemeral';
+    // Ephemeral wrapper — unwrap to inner type
+    if (message.ephemeralMessage?.message) {
+        return detectMessageType(message.ephemeralMessage.message);
     }
 
-    // Check for view once wrapper
-    if (message.viewOnceMessage || message.viewOnceMessageV2) {
-        return 'view_once';
-    }
+    // View once wrapper
+    if (message.viewOnceMessage) return 'viewOnceMessage';
+    if (message.viewOnceMessageV2) return 'viewOnceMessageV2';
 
-    // Check for edited message wrapper
-    if (message.editedMessage) {
-        return 'edited';
-    }
+    // Edited message — treat as text
+    if (message.editedMessage) return 'extendedTextMessage';
 
     // Protocol messages (delete, etc)
     if (message.protocolMessage) {
@@ -393,7 +430,7 @@ function detectMessageType(message) {
     // Direct message types
     const types = [
         'conversation', 'extendedTextMessage', 'imageMessage', 'videoMessage',
-        'audioMessage', 'documentMessage', 'stickerMessage', 'locationMessage',
+        'audioMessage', 'pttMessage', 'documentMessage', 'stickerMessage', 'locationMessage',
         'liveLocationMessage', 'contactMessage', 'contactsArrayMessage',
         'reactionMessage', 'pollCreationMessage', 'pollUpdateMessage',
         'groupInviteMessage', 'paymentMessage', 'orderMessage', 'productMessage',
@@ -404,8 +441,11 @@ function detectMessageType(message) {
         'pinInChatMessage', 'keepInChatMessage', 'ptvMessage'
     ];
 
+    // PTT (voice note) — Baileys uses audioMessage with ptt=true
+    if (message.audioMessage?.ptt) return 'pttMessage';
+
     for (const type of types) {
-        if (message[type]) return type.replace('Message', '').toLowerCase();
+        if (message[type]) return type;  // return full type e.g. "imageMessage"
     }
 
     return 'unknown';
@@ -427,54 +467,80 @@ function extractContent(message, type) {
         protocol: null
     };
 
-    // Handle wrappers
+    // ── Unwrap message wrappers ──────────────────────────────────────────────
     let actualMessage = message;
-    if (type === 'ephemeral' && message.ephemeralMessage) {
+
+    if (message.ephemeralMessage?.message) {
         actualMessage = message.ephemeralMessage.message;
         type = detectMessageType(actualMessage);
-    }
-    if (type === 'view_once' && (message.viewOnceMessage || message.viewOnceMessageV2)) {
-        actualMessage = message.viewOnceMessage?.message || message.viewOnceMessageV2?.message;
+    } else if (message.viewOnceMessage?.message) {
+        actualMessage = message.viewOnceMessage.message;
         type = detectMessageType(actualMessage);
-    }
-    if (type === 'edited' && message.editedMessage) {
+    } else if (message.viewOnceMessageV2?.message) {
+        actualMessage = message.viewOnceMessageV2.message;
+        type = detectMessageType(actualMessage);
+    } else if (message.editedMessage?.message) {
         actualMessage = message.editedMessage.message;
         type = detectMessageType(actualMessage);
     }
 
     const msg = actualMessage;
 
-    // Extract body/text
+    // ── Normalize type ───────────────────────────────────────────────────────
+    // detectMessageType() returns FULL Baileys type names e.g. "extendedTextMessage"
+    // but the old switch used SHORT names e.g. "extendedText". Normalize to
+    // full names so both old DB rows (short) and new rows (full) work correctly.
+    // We just add all full-name cases alongside the short ones in the switch below.
+
     switch (type) {
         case 'conversation':
             result.body = msg.conversation || '';
             break;
+
+        // ── THE BUG: was only 'extendedText', but detectMessageType returns 'extendedTextMessage'
+        case 'extendedTextMessage':
         case 'extendedText':
             result.body = msg.extendedTextMessage?.text || '';
             result.context = extractContextInfo(msg.extendedTextMessage?.contextInfo);
             break;
+
+        case 'imageMessage':
         case 'image':
             result.body = msg.imageMessage?.caption || '';
             result.media = extractMediaInfo(msg.imageMessage, 'image');
             result.context = extractContextInfo(msg.imageMessage?.contextInfo);
             break;
+
+        case 'videoMessage':
         case 'video':
             result.body = msg.videoMessage?.caption || '';
             result.media = extractMediaInfo(msg.videoMessage, 'video');
             result.context = extractContextInfo(msg.videoMessage?.contextInfo);
             break;
+
+        case 'audioMessage':
         case 'audio':
-            result.body = msg.audioMessage?.caption || '';
             result.media = extractMediaInfo(msg.audioMessage, 'audio');
             break;
+
+        case 'pttMessage':
+        case 'ptt':
+            result.media = extractMediaInfo(msg.audioMessage, 'audio');
+            break;
+
+        case 'documentMessage':
         case 'document':
-            result.body = msg.documentMessage?.caption || '';
+            result.body = msg.documentMessage?.fileName || msg.documentMessage?.caption || '';
             result.media = extractMediaInfo(msg.documentMessage, 'document');
             result.context = extractContextInfo(msg.documentMessage?.contextInfo);
             break;
+
+        case 'stickerMessage':
         case 'sticker':
             result.media = extractMediaInfo(msg.stickerMessage, 'sticker');
             break;
+
+        case 'locationMessage':
         case 'location':
             result.location = {
                 lat: msg.locationMessage?.degreesLatitude,
@@ -482,21 +548,35 @@ function extractContent(message, type) {
                 name: msg.locationMessage?.name,
                 address: msg.locationMessage?.address
             };
+            result.body = msg.locationMessage?.name || msg.locationMessage?.address || '';
             break;
+
+        case 'liveLocationMessage':
         case 'liveLocation':
             result.location = {
                 lat: msg.liveLocationMessage?.degreesLatitude,
                 lng: msg.liveLocationMessage?.degreesLongitude,
                 accuracy: msg.liveLocationMessage?.accuracyInMeters,
-                speed: msg.liveLocationMessage?.speedInMps
             };
+            result.body = msg.liveLocationMessage?.caption || '';
             break;
+
+        case 'contactMessage':
         case 'contact':
             result.contact = {
                 displayName: msg.contactMessage?.displayName,
                 vcard: msg.contactMessage?.vcard
             };
+            result.body = msg.contactMessage?.displayName || '';
             break;
+
+        case 'contactsArrayMessage':
+        case 'contactsArray':
+            result.body = (msg.contactsArrayMessage?.contacts || [])
+                .map(c => c.displayName).filter(Boolean).join(', ');
+            break;
+
+        case 'reactionMessage':
         case 'reaction':
             result.reaction = {
                 text: msg.reactionMessage?.text,
@@ -504,39 +584,58 @@ function extractContent(message, type) {
                 targetRemoteJid: msg.reactionMessage?.key?.remoteJid,
                 targetFromMe: msg.reactionMessage?.key?.fromMe
             };
+            result.body = msg.reactionMessage?.text || '';
             break;
+
+        case 'pollCreationMessage':
         case 'pollCreation':
             result.poll = {
                 name: msg.pollCreationMessage?.name,
                 options: msg.pollCreationMessage?.options?.map(o => o.optionName) || [],
                 selectableCount: msg.pollCreationMessage?.selectableOptionsCount
             };
+            result.body = msg.pollCreationMessage?.name || '';
             break;
+
         case 'protocol':
             result.protocol = {
                 type: msg.protocolMessage?.type,
                 keyId: msg.protocolMessage?.key?.id
             };
             break;
+
+        case 'groupInviteMessage':
         case 'groupInvite':
-            result.body = msg.groupInviteMessage?.caption || '';
+            result.body = msg.groupInviteMessage?.groupName || msg.groupInviteMessage?.caption || '';
             break;
+
         case 'payment':
-            result.body = `Payment: ${msg.paymentMessage?.amount} ${msg.paymentMessage?.currency}`;
+        case 'paymentMessage':
+            result.body = `Pembayaran: ${msg.paymentMessage?.amount || ''} ${msg.paymentMessage?.currency || ''}`.trim();
             break;
+
         case 'order':
-            result.body = `Order: ${msg.orderMessage?.orderTitle}`;
+        case 'orderMessage':
+            result.body = msg.orderMessage?.orderTitle || 'Pesanan';
             break;
+
         case 'event':
-            result.body = `Event: ${msg.eventMessage?.name}`;
+        case 'eventMessage':
+            result.body = msg.eventMessage?.name || 'Acara';
             break;
+
         case 'buttons':
-            result.body = msg.buttonsMessage?.text || '';
+        case 'buttonsMessage':
+            result.body = msg.buttonsMessage?.contentText || msg.buttonsMessage?.text || '';
             break;
+
         case 'list':
-            result.body = msg.listMessage?.title || '';
+        case 'listMessage':
+            result.body = msg.listMessage?.description || msg.listMessage?.title || '';
             break;
+
         case 'ptv':
+        case 'ptvMessage':
             result.media = extractMediaInfo(msg.ptvMessage, 'video');
             break;
     }
@@ -588,75 +687,90 @@ const database = {
             const type = detectMessageType(msg.message);
             const content = extractContent(msg.message, type);
 
+            // Sanitize helpers — Baileys uses protobufjs Long objects for numeric fields
+            const toNum = (v) => {
+                if (v == null) return null;
+                if (typeof v === 'object' && typeof v.toNumber === 'function') return v.toNumber();
+                const n = Number(v); return isNaN(n) ? null : n;
+            };
+            const toStr = (v) => {
+                if (v == null) return null;
+                if (typeof v === 'string') return v;
+                if (typeof v === 'object') return JSON.stringify(v);
+                return String(v);
+            };
+            const toBool = (v) => (v ? 1 : 0);
+
             const params = {
-                id: msg.key.id,
-                remote_jid: msg.key.remoteJid,
-                from_me: msg.key.fromMe ? 1 : 0,
-                participant: msg.participant || null,
-                push_name: msg.pushName || null,
-                message_type: type,
-                body: content.body,
+                id: toStr(msg.key.id),
+                remote_jid: toStr(msg.key.remoteJid),
+                from_me: toBool(msg.key.fromMe),
+                participant: toStr(msg.participant),
+                push_name: toStr(msg.pushName),
+                message_type: toStr(type),
+                body: toStr(content.body),
                 message_json: JSON.stringify(msg.message),
 
-                // Media
-                media_mimetype: content.media?.mimetype || null,
-                media_file_name: content.media?.fileName || null,
-                media_file_length: content.media?.fileLength || null,
-                media_duration: content.media?.duration || null,
-                media_height: content.media?.height || null,
-                media_width: content.media?.width || null,
-                media_caption: content.media?.caption || null,
+                // Media — fileLength/duration/height/width are Long in Baileys
+                media_mimetype: toStr(content.media?.mimetype),
+                media_file_name: toStr(content.media?.fileName),
+                media_file_length: toNum(content.media?.fileLength),
+                media_duration: toNum(content.media?.duration),
+                media_height: toNum(content.media?.height),
+                media_width: toNum(content.media?.width),
+                media_caption: toStr(content.media?.caption),
                 media_key: content.media?.mediaKey ? Buffer.from(content.media.mediaKey).toString('base64') : null,
-                media_direct_path: content.media?.directPath || null,
-                media_url: content.media?.url || null,
+                media_direct_path: toStr(content.media?.directPath),
+                media_url: toStr(content.media?.url),
                 media_sha256: content.media?.sha256 ? Buffer.from(content.media.sha256).toString('base64') : null,
                 media_enc_sha256: content.media?.encSha256 ? Buffer.from(content.media.encSha256).toString('base64') : null,
 
                 // Context
-                context_stanza_id: content.context?.stanzaId || null,
-                context_participant: content.context?.participant || null,
-                context_quoted_message: content.context?.quotedMessage || null,
-                context_mentioned_jids: content.context?.mentionedJids || null,
-                context_is_forwarded: content.context?.isForwarded ? 1 : 0,
-                context_forwarding_score: content.context?.forwardingScore || 0,
+                context_stanza_id: toStr(content.context?.stanzaId),
+                context_participant: toStr(content.context?.participant),
+                context_quoted_message: toStr(content.context?.quotedMessage),
+                context_mentioned_jids: toStr(content.context?.mentionedJids),
+                context_is_forwarded: toBool(content.context?.isForwarded),
+                context_forwarding_score: toNum(content.context?.forwardingScore) ?? 0,
 
                 // Reaction
-                reaction_text: content.reaction?.text || null,
-                reaction_target_id: content.reaction?.targetId || null,
-                reaction_target_remote_jid: content.reaction?.targetRemoteJid || null,
-                reaction_target_from_me: content.reaction?.targetFromMe ? 1 : 0,
+                reaction_text: toStr(content.reaction?.text),
+                reaction_target_id: toStr(content.reaction?.targetId),
+                reaction_target_remote_jid: toStr(content.reaction?.targetRemoteJid),
+                reaction_target_from_me: toBool(content.reaction?.targetFromMe),
 
                 // Poll
-                poll_name: content.poll?.name || null,
+                poll_name: toStr(content.poll?.name),
                 poll_options: content.poll?.options ? JSON.stringify(content.poll.options) : null,
-                poll_selectable_count: content.poll?.selectableCount || null,
-                poll_votes: null, // Will be updated when votes come in
+                poll_selectable_count: toNum(content.poll?.selectableCount),
+                poll_votes: null,
 
                 // Location
-                location_lat: content.location?.lat || null,
-                location_lng: content.location?.lng || null,
-                location_name: content.location?.name || null,
-                location_address: content.location?.address || null,
-                location_accuracy: content.location?.accuracy || null,
+                location_lat: toNum(content.location?.lat),
+                location_lng: toNum(content.location?.lng),
+                location_name: toStr(content.location?.name),
+                location_address: toStr(content.location?.address),
+                location_accuracy: toNum(content.location?.accuracy),
 
                 // Contact
-                contact_vcard: content.contact?.vcard || null,
-                contact_display_name: content.contact?.displayName || null,
+                contact_vcard: toStr(content.contact?.vcard),
+                contact_display_name: toStr(content.contact?.displayName),
 
                 // Protocol
-                protocol_type: content.protocol?.type || null,
-                protocol_key_id: content.protocol?.keyId || null,
+                protocol_type: toNum(content.protocol?.type),
+                protocol_key_id: toStr(content.protocol?.keyId),
 
                 // Status
-                status: msg.status || 0,
-                starred: msg.starred ? 1 : 0,
-                broadcast: msg.broadcast ? 1 : 0,
+                status: toNum(msg.status) ?? 0,
+                starred: toBool(msg.starred),
+                broadcast: toBool(msg.broadcast),
 
                 // Sync
-                is_history_sync: isHistorySync ? 1 : 0,
-                sync_type: syncType,
+                is_history_sync: toBool(isHistorySync),
+                sync_type: toStr(syncType),
 
-                message_timestamp: msg.messageTimestamp || Math.floor(Date.now() / 1000)
+                // messageTimestamp is a Long object in Baileys!
+                message_timestamp: toNum(msg.messageTimestamp) ?? Math.floor(Date.now() / 1000)
             };
 
             statements.insertMessage.run(params);
@@ -730,6 +844,72 @@ const database = {
 
     updateChatArchived: (jid, archived) => {
         statements.updateChatArchived.run(archived ? 1 : 0, jid);
+    },
+
+    // Aliases used by main.js IPC handlers
+    markChatRead: (jid) => {
+        statements.updateChatUnread.run(0, jid);
+    },
+    pinChat: (jid, pinned) => {
+        statements.updateChatPinned.run(pinned ? 1 : 0, jid);
+    },
+    archiveChat: (jid, archived) => {
+        statements.updateChatArchived.run(archived ? 1 : 0, jid);
+    },
+
+    // ── updateChatUnread — called from client.js chats.update event ──
+    updateChatUnread: (jid, count) => {
+        statements.updateChatUnread.run(count ?? 0, jid);
+    },
+
+    // ── getMessageById — called from getMessage() and media download ──
+    getMessageById: (id) => {
+        return statements.getMessageById.get(id) || null;
+    },
+
+    // ── saveMessageEdit — called from messages.update edited messages ──
+    saveMessageEdit: (id, newBody, timestamp) => {
+        try {
+            db.prepare('UPDATE messages SET body = ?, message_timestamp = ? WHERE id = ?')
+                .run(newBody ?? null, timestamp ?? Date.now(), id);
+        } catch (err) { console.error('[DB] saveMessageEdit:', err.message); }
+    },
+
+    // ── savePollVote — called from messages.update poll votes ──
+    savePollVote: (messageId, senderJid, vote) => {
+        try {
+            db.prepare(`
+                INSERT OR REPLACE INTO poll_votes (message_id, sender_jid, vote, voted_at)
+                VALUES (?, ?, ?, ?)
+            `).run(messageId, senderJid, JSON.stringify(vote), Math.floor(Date.now() / 1000));
+        } catch (err) { console.error('[DB] savePollVote:', err.message); }
+    },
+
+    // ── updatePollVotes — update poll_votes JSON on message row ──
+    updatePollVotes: (id, pollResultsJson) => {
+        try {
+            db.prepare('UPDATE messages SET poll_votes = ? WHERE id = ?')
+                .run(pollResultsJson, id);
+        } catch (err) { console.error('[DB] updatePollVotes:', err.message); }
+    },
+
+    // ── updateMediaSavedPath — replaces inline new Database() in client.js ──
+    updateMediaSavedPath: (id, localPath) => {
+        try {
+            db.prepare('UPDATE messages SET media_saved_path = ?, media_is_downloaded = 1 WHERE id = ?')
+                .run(localPath, id);
+        } catch (err) { console.error('[DB] updateMediaSavedPath:', err.message); }
+    },
+
+    // ── Aliases for main.js IPC bridge ──
+    getMessagesFromDB: (jid, limit = 50, offset = 0) => {
+        return statements.getMessagesByJid.all(jid, { limit, offset });
+    },
+    searchMessagesInDB: (jid, query) => {
+        return statements.searchMessages.all({ jid, query: `%${query}%` });
+    },
+    getDBStats: () => {
+        return statements.getStats.get();
     },
 
     // Contacts
@@ -833,10 +1013,96 @@ const database = {
         return statements.getStats.get();
     },
 
-    // Close
+    // ── Count helpers (called by main.js IPC handlers) ────────────────
+    getChatCount: () => {
+        return (db.prepare('SELECT COUNT(*) as n FROM chats WHERE is_community = 0').get()?.n) || 0;
+    },
+    getGroupCount: () => {
+        return (db.prepare('SELECT COUNT(*) as n FROM chats WHERE is_group = 1').get()?.n) || 0;
+    },
+    getCommunityCount: () => {
+        return (db.prepare('SELECT COUNT(*) as n FROM chats WHERE is_community = 1').get()?.n) || 0;
+    },
+    getContactCount: () => {
+        return (db.prepare('SELECT COUNT(*) as n FROM contacts').get()?.n) || 0;
+    },
+    getMessageCount: (jid) => {
+        return (db.prepare('SELECT COUNT(*) as n FROM messages WHERE remote_jid = ?').get(jid)?.n) || 0;
+    },
+
+    // Global message search (across all chats)
+searchMessagesGlobal: (query) => {
+    // Gunakan template literal yang benar untuk LIKE operator
+    const searchPattern = `%${query}%`;
+    return db.prepare(`
+        SELECT
+            id, remote_jid AS chat_jid, from_me, push_name AS sender_name,
+            message_type AS msg_type, body, message_timestamp AS timestamp,
+            status, is_history_sync,
+            CASE WHEN remote_jid LIKE '%@g.us' THEN 1 ELSE 0 END AS is_group
+        FROM messages
+        WHERE body LIKE ?
+        ORDER BY message_timestamp DESC
+        LIMIT 100
+    `).all(searchPattern); // Masukkan variabel ke sini
+},
+
+// Bulk upsert contacts (optimized with transaction)
+bulkUpsertContacts: (contacts) => {
+    // Pastikan 'database.saveContact' sudah terdefinisi atau ganti ke db.prepare langsung
+    const insertAction = db.transaction((list) => {
+        for (const contact of list) {
+            // Asumsi: database.saveContact adalah fungsi lain yang melakukan INSERT/REPLACE
+            database.saveContact(contact);
+        }
+    });
+
+    try { 
+        insertAction(contacts); 
+    } catch (err) { 
+        console.error('[DB] bulkUpsertContacts error:', err.message); 
+    }
+},
+
+// Groups subset
+getGroups: (limit = 200, offset = 0) => {
+    return db.prepare(`
+        SELECT
+            c.jid, c.name, c.is_group, c.is_community, c.unread_count, c.pinned,
+            c.last_message_timestamp AS last_msg_at,
+            c.last_message_body      AS last_msg
+        FROM chats c
+        WHERE c.is_group = 1
+        ORDER BY c.last_message_timestamp DESC
+        LIMIT ? OFFSET ?
+    `).all(limit, offset);
+},
+
+// Communities subset
+getCommunities: (limit = 100, offset = 0) => {
+    return db.prepare(`
+        SELECT jid, name, is_group, is_community, unread_count, pinned,
+               last_message_timestamp AS last_msg_at,
+               last_message_body      AS last_msg
+        FROM chats
+        WHERE is_community = 1
+        ORDER BY last_message_timestamp DESC
+        LIMIT ? OFFSET ?
+    `).all(limit, offset);
+},
+
+    // init() — called by main.js after require(). DB is already open (better-sqlite3
+    // opens synchronously), so this just validates the connection is alive.
+    init: () => {
+        // Verify DB is open by running a trivial query
+        db.prepare('SELECT 1').get();
+    },
+
+    // Close connection
     close: () => {
         db.close();
     }
+// Tidak perlu kurung kurawal tutup tambahan di sini jika ini akhir dari object
 };
 
 module.exports = database;

@@ -1449,12 +1449,13 @@ textarea {
 .msg-row {
   display: flex;
   flex-direction: column;
-  padding: 2px 14px;
+  padding: 2px 8% 2px 5%;
   animation: msgPop .22s ease both;
 }
 
 .msg-row.me {
   align-items: flex-end;
+  padding: 2px 5% 2px 8%;
 }
 
 .msg-row.them {
@@ -1473,6 +1474,7 @@ textarea {
   display: flex;
   align-items: flex-end;
   gap: 5px;
+  max-width: 65%;
 }
 
 .msg-inner.me {
@@ -1494,12 +1496,24 @@ textarea {
   margin-bottom: 2px;
 }
 
+/* bubble-wrap — container untuk bubble + reactions */
+.bubble-wrap {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
 .bubble {
-  max-width: 72%;
   border-radius: 4px 16px 16px 16px;
-  padding: 8px 11px 6px;
+  padding: 7px 10px 5px 10px;
   background: var(--bg-msg-in);
   position: relative;
+  /* width mengikuti konten, dibatasi parent .msg-inner */
+  width: fit-content;
+  max-width: 100%;
+  /* min-width supaya timestamp tidak collapse bubble pendek */
+  min-width: 80px;
+  word-break: break-word;
 }
 
 .bubble.me {
@@ -1509,16 +1523,18 @@ textarea {
 
 .bubble.no-pad {
   padding: 3px;
+  min-width: unset;
 }
 
 .bubble.sticker,
 .bubble.reaction {
   background: transparent !important;
   padding: 2px;
+  min-width: unset;
 }
 
 .bubble-text {
-  font-size: 13.5px;
+  font-size: 14px;
   line-height: 1.55;
   white-space: pre-wrap;
   word-break: break-word;
@@ -1531,12 +1547,24 @@ textarea {
   color: var(--text-3);
 }
 
-/* Bubble footer */
+/* Bubble footer — timestamp + ticks */
 .bubble-footer {
   display: flex;
   align-items: center;
-  gap: 4px;
-  margin-top: 3px;
+  gap: 3px;
+  /* Float ke kanan bawah, margin kiri auto supaya dorong ke kanan */
+  margin-top: 2px;
+  float: right;
+  /* Sedikit negatif margin bawah supaya tidak makan ruang vertikal ekstra */
+  margin-left: 8px;
+  margin-bottom: -2px;
+  /* Clear float di parent */
+  clear: none;
+}
+
+/* Tambah space di bawah bubble-text supaya footer tidak nutup teks */
+.bubble-text {
+  padding-bottom: 2px;
 }
 
 .bubble-footer.me {
@@ -1544,10 +1572,11 @@ textarea {
 }
 
 .bubble-time {
-  font-size: 10px;
+  font-size: 10.5px;
   color: var(--text-3);
   flex-shrink: 0;
   font-family: var(--font-mono);
+  white-space: nowrap;
 }
 
 /* Ticks */

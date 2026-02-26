@@ -80,26 +80,113 @@ function SkeletonBubble({ isMe }) {
   )
 }
 
+// Format nomor telepon agar tidak expose digits mentah: 62812345 → +62 812-345
+function formatPhone(raw) {
+  if (!raw || !/^\d{6,}$/.test(raw)) return raw || "Unknown"
+  // Pisahkan: kode negara 1-3 digit + sisa dengan grup 3-4
+  const m = raw.match(/^(\d{1,3})(\d{3})(\d{1,4})(\d*)$/)
+  if (!m) return `+${raw}`
+  const [, cc, a, b, rest] = m
+  return rest ? `+${cc} ${a}-${b}-${rest}` : `+${cc} ${a}-${b}`
+}
+
 export default function ChatWindow({ jid }) {
-  const { messages, loadMessages, chats } = useChatStore()
+  const { messages, loadMessages, chats, appendMessage } = useChatStore()
   const { setRightPanel } = useAppStore()
   const [loading, setLoading] = useState(true)
   const bottomRef = useRef(null)
   const areaRef = useRef(null)
 
   const chat = chats.find(c => c.jid === jid)
-  const name = chat?.name || (jid||"").split("@")[0] || "Chat"
+  // Jangan expose nomor mentah — format dengan + prefix jika tidak ada nama
+  const rawName = chat?.name || ""
+  const name = (rawName && !/^\d{6,}$/.test(rawName.trim()))
+    ? rawName
+    : formatPhone((jid || "").split("@")[0])
   const msgs = messages[jid] || []
   const isGroup = (jid||"").endsWith("@g.us")
 
+  // ── Load messages saat chat berganti ────────────────────────────────────
   useEffect(() => {
     setLoading(true)
     loadMessages(jid).finally(() => setLoading(false))
   }, [jid])
 
+  // ── Real-time: subscribe ke incoming messages ────────────────────────────
+  // Dua sumber: "messages:new" (client.js) dan "db:messages:new" (main.js)
+  useEffect(() => {
+    const subs = []
+
+    // Sumber 1: messages:new dari Baileys via client.js
+    // payload: { key, message, body, msgType, jid, pushname, isMe, isGroup,
+    //            timestamp, status, hasMedia, isHistorySync }
+    if (window.api?.onMessagesNew) {
+      subs.push(window.api.onMessagesNew(data => {
+        if (data.isHistorySync) return   // skip — sudah di-load via loadMessages
+        if (data.jid !== jid) return     // bukan chat aktif ini
+
+        const msgId = data.key?.id
+        if (!msgId) return
+
+        // appendMessage di store sudah ada dedup by id — aman dipanggil berkali-kali
+        appendMessage(jid, {
+          id: msgId,
+          chat_jid: jid,
+          body: data.body || "",
+          msg_type: data.msgType || "conversation",
+          timestamp: data.timestamp || Math.floor(Date.now() / 1000),
+          from_me: data.isMe ? 1 : 0,
+          status: data.status ?? 0,
+          sender_name: data.pushname || "",
+          is_group: data.isGroup ? 1 : 0,
+          mimetype: data.message?.imageMessage?.mimetype
+            || data.message?.videoMessage?.mimetype
+            || data.message?.stickerMessage?.mimetype
+            || data.message?.audioMessage?.mimetype
+            || null,
+          duration: data.message?.audioMessage?.seconds || null,
+          media_saved_path: null,
+          media_url: data.message?.imageMessage?.url
+            || data.message?.videoMessage?.url
+            || data.message?.stickerMessage?.url
+            || null,
+        })
+      }))
+    }
+
+    // Sumber 2: db:messages:new dari main.js onBaileysMessage
+    // payload: { chat_jid, message: { id, body, msg_type, from_me, ... } }
+    if (window.api?.onNewMessage) {
+      subs.push(window.api.onNewMessage(data => {
+        if (data.chat_jid !== jid) return
+        const m = data.message
+        if (!m?.id) return
+
+        appendMessage(jid, {
+          id: m.id,
+          chat_jid: jid,
+          body: m.body || "",
+          msg_type: m.msg_type || "conversation",
+          timestamp: m.timestamp || Math.floor(Date.now() / 1000),
+          from_me: m.from_me ?? 0,
+          status: m.status ?? 0,
+          sender_name: m.sender_name || "",
+          is_group: isGroup ? 1 : 0,
+          mimetype: m.mimetype || null,
+          duration: m.duration || null,
+          media_saved_path: m.media_saved_path || null,
+          media_url: m.media_url || null,
+        })
+      }))
+    }
+
+    return () => subs.forEach(fn => typeof fn === "function" && fn())
+  }, [jid, isGroup])
+
+  // ── Auto-scroll saat ada pesan baru ─────────────────────────────────────
   useEffect(() => {
     if (!loading) {
-      setTimeout(() => bottomRef.current?.scrollIntoView({ behavior:"smooth" }), 50)
+      setTimeout(() => bottomRef.current?.scrollIntoView({ behavior: "smooth" }), 60)
     }
   }, [msgs.length, loading])
 

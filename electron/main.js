@@ -23,7 +23,7 @@ let db = null
 
 // ── DB must be required AFTER app is ready (needs userData path) ──
 function getDB() {
-  if (!db) db = require("./db/database")
+  if (!db) db = require("./baileys/database")  // single source of truth
   return db
 }
 
@@ -95,7 +95,15 @@ ipcMain.handle("msg:send", async (_e, { jid, body, type = "text" }) => {
   try {
     if (!baileysClient) return { ok: false, error: "Client belum siap." }
     const result = await baileysClient.sendTextMessage(jid, body)
-    return { ok: true, message: result }
+    // result adalah WAMessage dari Baileys: { key: { id, remoteJid, fromMe }, ... }
+    // Pastikan key.id tersedia untuk dedup di renderer
+    return {
+      ok: true,
+      message: {
+        key: result?.key || {},
+        id: result?.key?.id || null,  // shortcut untuk kemudahan akses
+      }
+    }
   } catch (err) {
     console.error("[AuroraChat] sendMessage error:", err.message)
     return { ok: false, error: err.message }
@@ -131,8 +139,11 @@ ipcMain.handle("db:chats:list", (_e, { limit = 60, offset = 0 } = {}) => {
 })
 
 ipcMain.handle("db:chats:search", (_e, { query }) => {
-  try { return { ok: true, data: getDB().searchChats(query) } }
-  catch (err) { return { ok: false, error: err.message } }
+  try {
+    const d = getDB()
+    const fn = d.searchChats || d.searchContacts
+    return { ok: true, data: fn ? fn.call(d, query) : [] }
+  } catch (err) { return { ok: false, error: err.message } }
 })
 
 ipcMain.handle("db:chats:read", (_e, { jid }) => {
@@ -198,45 +209,6 @@ ipcMain.handle("db:stats", () => {
   catch (err) { return { ok: false, error: err.message } }
 })
 
-// ════════════════════════════════════════════════════════════
-// IPC — MESSAGES (untuk history sync)
-// ════════════════════════════════════════════════════════════
-
-// Handler untuk mendapatkan messages dari database Baileys
-ipcMain.handle("db:messages:list", (event, { jid, limit = 50, offset = 0 }) => {
-  try {
-    if (!baileysClient) return { ok: false, error: "Client not ready" }
-    const messages = baileysClient.getMessagesFromDB(jid, limit, offset)
-    return { ok: true, data: messages }
-  } catch (err) {
-    return { ok: false, error: err.message }
-  }
-})
-
-ipcMain.handle("db:messages:search", (event, { jid, query }) => {
-  try {
-    if (!baileysClient) return { ok: false, error: "Client not ready" }
-    const messages = baileysClient.searchMessagesInDB(jid, query)
-    return { ok: true, data: messages }
-  } catch (err) {
-    return { ok: false, error: err.message }
-  }
-})
-
-// ════════════════════════════════════════════════════════════
-// IPC — STATS & SYNC
-// ════════════════════════════════════════════════════════════
-
-ipcMain.handle("db:stats", () => {
-  try {
-    if (!baileysClient) return { ok: false, error: "Client not ready" }
-    const stats = baileysClient.getDBStats()
-    return { ok: true, data: stats }
-  } catch (err) {
-    return { ok: false, error: err.message }
-  }
-})
-
 ipcMain.handle("db:sync:status", () => {
   try {
     if (!baileysClient) return { ok: false, error: "Client not ready" }
@@ -256,8 +228,12 @@ ipcMain.handle("db:sync:status", () => {
 module.exports.onBaileysMessage = function (payload) {
   try {
     const d = getDB()
+    // ID selalu dari payload.key.id (Baileys WAMessage key)
+    const msgId = payload.key?.id
+    if (!msgId) return // abaikan pesan tanpa ID valid
+
     d.insertMessage({
-      id: payload.key?.id || `${Date.now()}`,
+      id: msgId,
       chat_jid: payload.jid,
       sender_jid: payload.sender,
       sender_name: payload.pushname,
@@ -272,11 +248,21 @@ module.exports.onBaileysMessage = function (payload) {
       quoted_id: null,
       raw: null,
     })
-    // Push update to renderer so it can refresh in real-time
+
+    // Ambil media path dari DB setelah insert (bisa sudah didownload)
+    let mediaSavedPath = null
+    let mediaUrl = null
+    try {
+      const saved = d.getMessageById?.(msgId)
+      mediaSavedPath = saved?.media_saved_path || null
+      mediaUrl = saved?.media_url || null
+    } catch (_) {}
+
+    // Push ke renderer — payload harus lengkap agar MessageBubble bisa render
     win?.webContents.send("db:messages:new", {
       chat_jid: payload.jid,
       message: {
-        id: payload.key?.id,
+        id: msgId,
         chat_jid: payload.jid,
         sender_name: payload.pushname,
         body: payload.body,
@@ -285,9 +271,15 @@ module.exports.onBaileysMessage = function (payload) {
         from_me: payload.isMe ? 1 : 0,
         status: payload.status || 0,
         has_media: payload.hasMedia ? 1 : 0,
+        mimetype: payload.mimetype || null,
+        duration: payload.duration || null,
+        media_saved_path: mediaSavedPath,
+        media_url: mediaUrl,
+        is_group: payload.isGroup ? 1 : 0,
       }
     })
-    // Also refresh chat list
+
+    // Refresh chat list sidebar
     win?.webContents.send("db:chats:updated")
   } catch (err) {
     console.error("[AuroraChat] DB write error:", err.message)

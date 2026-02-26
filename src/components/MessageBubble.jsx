@@ -1,6 +1,19 @@
 import { format } from "date-fns"
 import { useState } from "react"
 
+// ─── Helper: resolve media src ───────────────────────────────────────────────
+// DB menyimpan media_saved_path (absolute local path) dan media_url (remote).
+// Electron butuh prefix "file://" untuk local path.
+function getMediaSrc(msg) {
+  if (msg.media_saved_path) {
+    const p = msg.media_saved_path.replace(/\\/g, "/")
+    return p.startsWith("file://") ? p : `file://${p}`
+  }
+  if (msg.media_url) return msg.media_url
+  return null
+}
+
+// ─── Tick indicators ─────────────────────────────────────────────────────────
 function Ticks({ status }) {
   const s = Number(status)
   if (s === 0) return <span style={{fontSize:10,color:"var(--text-3)"}}>⏱</span>
@@ -114,17 +127,42 @@ function ViewOnceBubble({ mediaType }) {
   )
 }
 
-function renderContent(msg) {
-  const t = msg.msg_type || "conversation"
-  if (t==="viewOnceMessage"||t==="viewOnceMessageV2") return <ViewOnceBubble mediaType="image"/>
-  switch(t) {
-    case "imageMessage": return (
+// ─── Image bubble: render dari local path atau URL ────────────────────────────
+function ImageBubble({ msg }) {
+  const src = getMediaSrc(msg)
+  const [err, setErr] = useState(false)
+
+  if (!src || err) {
+    return (
       <div className="media-img">
-        <div className="media-img-thumb"><span style={{fontSize:42}}>🖼️</span></div>
+        <div className="media-img-thumb" style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:4,minHeight:80}}>
+          <span style={{fontSize:38}}>🖼️</span>
+          <span style={{fontSize:10,color:"var(--text-3)"}}>Foto</span>
+        </div>
         {msg.body && <div className="media-caption">{msg.body}</div>}
       </div>
     )
-    case "videoMessage": return (
+  }
+  return (
+    <div className="media-img">
+      <img
+        src={src}
+        alt={msg.body || "Foto"}
+        onError={() => setErr(true)}
+        style={{maxWidth:"100%",maxHeight:300,borderRadius:8,display:"block",objectFit:"cover",cursor:"pointer"}}
+      />
+      {msg.body && <div className="media-caption">{msg.body}</div>}
+    </div>
+  )
+}
+
+// ─── Video bubble: render video player jika tersedia ─────────────────────────
+function VideoBubble({ msg }) {
+  const src = getMediaSrc(msg)
+  const [err, setErr] = useState(false)
+
+  if (!src || err) {
+    return (
       <div className="media-video">
         <div className="media-video-thumb">
           <div className="play-btn">▶️</div>
@@ -132,10 +170,72 @@ function renderContent(msg) {
         </div>
       </div>
     )
-    case "audioMessage": return <AudioBubble isPtt={false} duration={msg.duration}/>
-    case "pttMessage":   return <AudioBubble isPtt duration={msg.duration}/>
-    case "documentMessage": return <DocBubble body={msg.body} mimetype={msg.mimetype}/>
-    case "stickerMessage": return <div style={{fontSize:72,padding:4,lineHeight:1}}>🎭</div>
+  }
+  return (
+    <div className="media-video">
+      <video
+        src={src}
+        controls
+        preload="metadata"
+        onError={() => setErr(true)}
+        style={{maxWidth:"100%",maxHeight:280,borderRadius:8,display:"block"}}
+      />
+      {msg.body && <div className="media-caption">{msg.body}</div>}
+    </div>
+  )
+}
+
+// ─── Sticker bubble: render WebP dari local path atau URL ────────────────────
+function StickerBubble({ msg }) {
+  const src = getMediaSrc(msg)
+  const [err, setErr] = useState(false)
+
+  if (!src || err) {
+    // Fallback ke emoji jika file belum didownload
+    return <div style={{fontSize:72,padding:4,lineHeight:1}}>🎭</div>
+  }
+  return (
+    <img
+      src={src}
+      alt="Stiker"
+      onError={() => setErr(true)}
+      style={{
+        width: 150,
+        height: 150,
+        objectFit: "contain",
+        display: "block",
+        // WebP animated stickers butuh ini
+        imageRendering: "auto",
+      }}
+    />
+  )
+}
+
+// ─── Main content renderer ────────────────────────────────────────────────────
+function renderContent(msg) {
+  const t = msg.msg_type || "conversation"
+
+  if (t==="viewOnceMessage"||t==="viewOnceMessageV2") return <ViewOnceBubble mediaType="image"/>
+
+  switch(t) {
+    case "imageMessage":
+      return <ImageBubble msg={msg}/>
+
+    case "videoMessage":
+      return <VideoBubble msg={msg}/>
+
+    case "audioMessage":
+      return <AudioBubble isPtt={false} duration={msg.duration}/>
+
+    case "pttMessage":
+      return <AudioBubble isPtt duration={msg.duration}/>
+
+    case "documentMessage":
+      return <DocBubble body={msg.body} mimetype={msg.mimetype}/>
+
+    case "stickerMessage":
+      return <StickerBubble msg={msg}/>
+
     case "locationMessage":
     case "liveLocationMessage": return (
       <div className="media-location">
@@ -158,9 +258,24 @@ function renderContent(msg) {
       </div>
     )
     case "reactionMessage": return <div style={{fontSize:32,padding:"2px 4px",lineHeight:1}}>{msg.body||"❤️"}</div>
+    case "extendedTextMessage":
+    case "conversation":
+      return <div className="bubble-text">{msg.body || ""}</div>
+
+    case "protocol":
+    case "unknown":
+    case "ephemeral":
+      return null
+
     default:
       if (msg.body) return <div className="bubble-text">{msg.body}</div>
-      return <div className="bubble-unsupported">[{t}]</div>
+      const UNSUPPORTED_LABELS = {
+        call: "📞 Panggilan", payment: "💳 Pembayaran", order: "🛒 Pesanan",
+        product: "🛍 Produk", event: "📅 Acara", buttons: "🔘 Tombol",
+        list: "📋 Daftar", interactive: "💬 Interaktif",
+      }
+      const label = UNSUPPORTED_LABELS[t] || `📎 ${t}`
+      return <div className="bubble-unsupported">{label}</div>
   }
 }
 
@@ -174,24 +289,24 @@ export default function MessageBubble({ msg }) {
 
   const bubbleClass = "bubble" + (isMe?" me":"") + (isReaction||isSticker?" sticker":"") + (hasNoPad?" no-pad":"")
 
+  const content = renderContent(msg)
+  if (content === null) return null
+
   return (
     <div className={"msg-row"+(isMe?" me":" them")}>
-      {/* Group sender name */}
       {!isMe && msg.is_group && msg.sender_name && (
         <div className="msg-sender-name">{msg.sender_name}</div>
       )}
       <div className={"msg-inner"+(isMe?" me":"")}>
-        {/* Mini avatar for group */}
         {!isMe && msg.is_group && (
           <div className="msg-mini-avatar" style={{background:"#1565c0",flexShrink:0}}>
             {(msg.sender_name||"?")[0].toUpperCase()}
           </div>
         )}
-
-        <div style={{maxWidth:"72%"}}>
+        <div className="bubble-wrap">
           <div className={bubbleClass}>
             {msg.quoted_id && <QuotedMsg body={msg.quoted_body} sender={msg.quoted_sender}/>}
-            {renderContent(msg)}
+            {content}
             {!isReaction && !isSticker && (
               <div className={"bubble-footer"+(isMe?" me":"")}>
                 <BubbleTime ts={msg.timestamp}/>

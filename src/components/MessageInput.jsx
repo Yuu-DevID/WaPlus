@@ -42,31 +42,56 @@ export default function MessageInput({ chatJid }) {
   const send = useCallback(async () => {
     const body = text.trim()
     if (!body || sending) return
+
     setText("")
     if (ref.current) ref.current.style.height = "42px"
     setSending(true)
+
     try {
       if (window.api?.sendMessage) {
+        // sendMessage returns WAMessage dari Baileys
+        // ID ada di result.key.id — ini SAMA dengan yang di-emit lewat messages:new
         const res = await window.api.sendMessage({ jid: chatJid, body })
-        if (res?.ok && res.message) {
+
+        if (res?.ok) {
+          // Baileys result bisa berupa WAMessage langsung atau { key, ... }
+          const msgId = res.message?.key?.id   // WAMessage key.id
+            ?? res.message?.id                  // shortcut dari main.js
+            ?? `local-${Date.now()}`
+
+          // Append dengan ID yang benar.
+          // Saat messages:new datang dari client.js (emitOwnEvents:true),
+          // appendMessage() di chat.js akan skip karena ID sudah ada (dedup).
           appendMessage(chatJid, {
-            id: res.message.id || Date.now().toString(),
-            chat_jid: chatJid, body,
+            id: msgId,
+            chat_jid: chatJid,
+            body,
             msg_type: "conversation",
-            timestamp: Math.floor(Date.now()/1000),
-            from_me: 1, status: 1,
+            timestamp: Math.floor(Date.now() / 1000),
+            from_me: 1,
+            status: 1,
           })
         }
+        // Jika !res.ok → pesan gagal dikirim, jangan append
+
       } else {
+        // Dev mode / no api
         appendMessage(chatJid, {
-          id: Date.now().toString(), chat_jid: chatJid, body,
+          id: `dev-${Date.now()}`,
+          chat_jid: chatJid,
+          body,
           msg_type: "conversation",
-          timestamp: Math.floor(Date.now()/1000),
-          from_me: 1, status: 1,
+          timestamp: Math.floor(Date.now() / 1000),
+          from_me: 1,
+          status: 1,
         })
       }
-    } catch(e) { console.error("Send error:", e) }
-    finally { setSending(false); ref.current?.focus() }
+    } catch(e) {
+      console.error("Send error:", e)
+    } finally {
+      setSending(false)
+      ref.current?.focus()
+    }
   }, [text, chatJid, sending])
 
   return (

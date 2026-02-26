@@ -8,7 +8,7 @@ function initials(n) { if(!n) return "?"; return n.trim().split(/\s+/).slice(0,2
 const picCache = new Map()
 const fetching = new Set()
 
-function Avatar({ jid, name, size=46, isGroup }) {
+function Avatar({ jid, name, size=46, isGroup, isCommunity }) {
   const [url, setUrl] = useState(() => picCache.has(jid) ? picCache.get(jid) : null)
   const [err, setErr] = useState(false)
   useEffect(() => {
@@ -38,6 +38,21 @@ function formatTime(ts) {
   return format(d,"dd/MM/yy")
 }
 
+// Jangan expose nomor mentah — format sebagai +XX XXX-XXXX
+function formatPhone(raw) {
+  if (!raw || !/^\d{6,}$/.test(raw)) return raw || "Unknown"
+  const m = raw.match(/^(\d{1,3})(\d{3})(\d{1,4})(\d*)$/)
+  if (!m) return `+${raw}`
+  const [, cc, a, b, rest] = m
+  return rest ? `+${cc} ${a}-${b}-${rest}` : `+${cc} ${a}-${b}`
+}
+
+function resolveName(chat) {
+  const n = chat.name || chat.push_name || ""
+  if (n && !/^\d{6,}$/.test(n.trim())) return n   // ada nama asli
+  return formatPhone((chat.jid || "").split("@")[0])
+}
+
 const PREVIEWS = {
   imageMessage:"📷 Foto", videoMessage:"🎬 Video", audioMessage:"🎵 Audio",
   pttMessage:"🎤 Pesan Suara", documentMessage:"📄 Dokumen", stickerMessage:"🎭 Stiker",
@@ -48,18 +63,21 @@ const PREVIEWS = {
 }
 
 export default function ChatItem({ chat, active, onClick, isContact, isCommunity }) {
-  const name = chat.name || chat.phone || (chat.jid||"").split("@")[0] || "Unknown"
+  const name = resolveName(chat)
   const isGroup = chat.is_group || (chat.jid||"").endsWith("@g.us")
   const hasUnread = !isContact && !isCommunity && chat.unread_count > 0
   const isMuted = chat.muted_until > Date.now()/1000
   const t = chat.last_msg_type
+
+  // Preview text — extendedTextMessage harus show body teks, bukan label "[extendedTextMessage]"
+  const isTextType = !t || t === "conversation" || t === "extendedTextMessage" || t === "extendedText"
   const preview = (isContact || isCommunity)
-    ? (chat.phone || (chat.jid||"").split("@")[0] || (isCommunity ? "Komunitas" : ""))
-    : ((!t||t==="conversation"||t==="extendedTextMessage") ? (chat.last_msg||"") : (PREVIEWS[t]||"📎 Media"))
+    ? formatPhone((chat.jid||"").split("@")[0])
+    : (isTextType ? (chat.last_msg || "") : (PREVIEWS[t] || "📎 Media"))
 
   return (
     <div className={"chat-item"+(active?" active":"")} onClick={onClick}>
-      <Avatar jid={chat.jid} name={name} isGroup={isGroup}/>
+      <Avatar jid={chat.jid} name={name} isGroup={isGroup} isCommunity={isCommunity}/>
       <div className="chat-meta">
         <div className="chat-top">
           <span className="chat-name">
