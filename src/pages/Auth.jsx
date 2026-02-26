@@ -49,8 +49,10 @@ export default function Auth() {
     }
 
     const handleQR = (qr) => {
+      setLoading(false)
       console.log("QR masuk:", qr)
       setQRData(qr)
+      setStep(2)
     }
 
     const handleConnected = (data) => {
@@ -129,7 +131,7 @@ export default function Auth() {
               <div className="mode-tabs">
                 {[
                   { id: "pairing", label: "📱 Nomor HP", action: () => { setMode("pairing"); setError(null) } },
-                  { id: "qr", label: "⬛ QR Code", action: () => { setMode("qr"); setError(null); } },
+                  { id: "qr", label: "⬛ QR Code", action: () => { setMode("qr"); setError(null); startQR() } },
                 ].map(t => (
                   <button key={t.id} className={"mode-tab" + (mode === t.id ? " active" : "")} onClick={t.action}>
                     {t.label}

@@ -1,10 +1,13 @@
+// electron/main.js
+// ╔═══════════════════════════════════════════════════════════╗
+// ║             WaPlus — Electron Main Process                ║
+// ╚═══════════════════════════════════════════════════════════╝
 const { app, BrowserWindow, ipcMain } = require("electron")
 const path = require("path")
 const fs = require("fs")
 
 const isDev = !app.isPackaged
 
-// Check if a valid WA session exists (creds.json with me field)
 function hasExistingSession() {
   const sessionDir = path.resolve(__dirname, "./baileys/session")
   const credsPath = path.join(sessionDir, "creds.json")
@@ -12,16 +15,13 @@ function hasExistingSession() {
   try {
     const creds = JSON.parse(fs.readFileSync(credsPath, "utf8"))
     return !!(creds && creds.me)
-  } catch {
-    return false
-  }
+  } catch { return false }
 }
 
-let win
+let win = null
 let baileysClient = null
 let db = null
 
-// ── DB must be required AFTER app is ready (needs userData path) ──
 function getDB() {
   if (!db) db = require("./db/database")
   return db
@@ -29,10 +29,7 @@ function getDB() {
 
 function createWindow() {
   win = new BrowserWindow({
-    width: 1280,
-    height: 820,
-    minWidth: 800,
-    minHeight: 600,
+    width: 1280, height: 820, minWidth: 900, minHeight: 600,
     backgroundColor: "#080e18",
     show: false,
     frame: true,
@@ -51,80 +48,58 @@ function createWindow() {
     win.loadFile(path.join(__dirname, "../dist/index.html"))
   }
 
-  // ── Init DB ─────────────────────────────────────
-  try {
-    getDB().init()
-    console.log("[AuroraChat] Database initialized")
-  } catch (err) {
-    console.error("[AuroraChat] DB init error:", err.message)
-  }
+  try { getDB().init(); console.log("[WaPlus] Database initialized") }
+  catch (err) { console.error("[WaPlus] DB init error:", err.message) }
 
-  // ── Init Baileys ─────────────────────────────────
   try {
     baileysClient = require("./baileys/client")
     baileysClient.init(win)
-  } catch (err) {
-    console.error("[AuroraChat] Baileys init error:", err.message)
-  }
+  } catch (err) { console.error("[WaPlus] Baileys init error:", err.message) }
 }
 
 // ════════════════════════════════════════════════════════════
 // IPC — AUTH
 // ════════════════════════════════════════════════════════════
-
 ipcMain.on("auth:request-pairing", async (_e, phone) => {
-  console.log("[AuroraChat] Pairing for:", phone)
   try {
     if (baileysClient) await baileysClient.requestPairingCode(phone)
     else win?.webContents.send("auth:pairing-error", { message: "Client belum siap." })
-  } catch (err) {
-    console.error("[AuroraChat]", err.message)
-  }
+  } catch (err) { console.error("[WaPlus]", err.message) }
 })
 
 ipcMain.on("auth:start-qr", async () => {
-  try {
-    if (baileysClient) await baileysClient.startQRMode()
-  } catch (err) {
-    console.error("[AuroraChat]", err.message)
-  }
-})
-
-// ── Send Message ────────────────────────────────────────────
-ipcMain.handle("msg:send", async (_e, { jid, body, type = "text" }) => {
-  try {
-    if (!baileysClient) return { ok: false, error: "Client belum siap." }
-    const result = await baileysClient.sendTextMessage(jid, body)
-    return { ok: true, message: result }
-  } catch (err) {
-    console.error("[AuroraChat] sendMessage error:", err.message)
-    return { ok: false, error: err.message }
-  }
+  try { if (baileysClient) await baileysClient.startQRMode() }
+  catch (err) { console.error("[WaPlus]", err.message) }
 })
 
 ipcMain.on("auth:logout", async () => {
   try {
     if (baileysClient) await baileysClient.logout()
-    getDB().close()
-    db = null
-  } catch (err) {
-    console.error("[AuroraChat]", err.message)
-  }
+    getDB().close(); db = null
+  } catch (err) { console.error("[WaPlus]", err.message) }
 })
 
 ipcMain.on("connection:force-reconnect", async () => {
+  try { if (baileysClient) await baileysClient.forceReconnect() }
+  catch (err) { console.error("[WaPlus]", err.message) }
+})
+
+ipcMain.handle("auth:check-session", () => ({ hasSession: hasExistingSession() }))
+
+// ════════════════════════════════════════════════════════════
+// IPC — SEND MESSAGE
+// ════════════════════════════════════════════════════════════
+ipcMain.handle("msg:send", async (_e, { jid, body, type = "text" }) => {
   try {
-    if (baileysClient) await baileysClient.forceReconnect()
-  } catch (err) {
-    console.error("[AuroraChat]", err.message)
-  }
+    if (!baileysClient) return { ok: false, error: "Client belum siap." }
+    const result = await baileysClient.sendTextMessage(jid, body)
+    return { ok: true, message: result }
+  } catch (err) { return { ok: false, error: err.message } }
 })
 
 // ════════════════════════════════════════════════════════════
-// IPC — DATABASE (synchronous via invoke)
+// IPC — DATABASE CHATS
 // ════════════════════════════════════════════════════════════
-
-// ── Chats ─────────────────────────────────────────────────
 ipcMain.handle("db:chats:list", (_e, { limit = 60, offset = 0 } = {}) => {
   try { return { ok: true, data: getDB().getChats(limit, offset), total: getDB().getChatCount() } }
   catch (err) { return { ok: false, error: err.message } }
@@ -150,7 +125,9 @@ ipcMain.handle("db:chats:archive", (_e, { jid, archived }) => {
   catch (err) { return { ok: false, error: err.message } }
 })
 
-// ── Contacts ───────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════
+// IPC — DATABASE CONTACTS
+// ════════════════════════════════════════════════════════════
 ipcMain.handle("db:contacts:list", (_e, { limit = 100, offset = 0 } = {}) => {
   try { return { ok: true, data: getDB().getContacts(limit, offset), total: getDB().getContactCount() } }
   catch (err) { return { ok: false, error: err.message } }
@@ -161,19 +138,22 @@ ipcMain.handle("db:contacts:search", (_e, { query }) => {
   catch (err) { return { ok: false, error: err.message } }
 })
 
-// ── Groups ─────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════
+// IPC — DATABASE GROUPS & COMMUNITIES
+// ════════════════════════════════════════════════════════════
 ipcMain.handle("db:groups:list", (_e, { limit = 200, offset = 0 } = {}) => {
   try { return { ok: true, data: getDB().getGroups(limit, offset), total: getDB().getGroupCount() } }
   catch (err) { return { ok: false, error: err.message } }
 })
 
-// ── Communities ────────────────────────────────────────────
 ipcMain.handle("db:communities:list", (_e, { limit = 100, offset = 0 } = {}) => {
   try { return { ok: true, data: getDB().getCommunities(limit, offset), total: getDB().getCommunityCount() } }
   catch (err) { return { ok: false, error: err.message } }
 })
 
-// ── Messages ───────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════
+// IPC — DATABASE MESSAGES
+// ════════════════════════════════════════════════════════════
 ipcMain.handle("db:messages:list", (_e, { jid, limit = 50, offset = 0 }) => {
   try {
     return {
@@ -193,66 +173,39 @@ ipcMain.handle("db:messages:search", (_e, { jid, query }) => {
   } catch (err) { return { ok: false, error: err.message } }
 })
 
+// ════════════════════════════════════════════════════════════
+// IPC — STATS & SYNC
+// ════════════════════════════════════════════════════════════
 ipcMain.handle("db:stats", () => {
   try { return { ok: true, data: getDB().getStats() } }
   catch (err) { return { ok: false, error: err.message } }
 })
 
-// ════════════════════════════════════════════════════════════
-// IPC — MESSAGES (untuk history sync)
-// ════════════════════════════════════════════════════════════
-
-// Handler untuk mendapatkan messages dari database Baileys
-ipcMain.handle("db:messages:list", (event, { jid, limit = 50, offset = 0 }) => {
-  try {
-    if (!baileysClient) return { ok: false, error: "Client not ready" }
-    const messages = baileysClient.getMessagesFromDB(jid, limit, offset)
-    return { ok: true, data: messages }
-  } catch (err) {
-    return { ok: false, error: err.message }
-  }
-})
-
-ipcMain.handle("db:messages:search", (event, { jid, query }) => {
-  try {
-    if (!baileysClient) return { ok: false, error: "Client not ready" }
-    const messages = baileysClient.searchMessagesInDB(jid, query)
-    return { ok: true, data: messages }
-  } catch (err) {
-    return { ok: false, error: err.message }
-  }
-})
-
-// ════════════════════════════════════════════════════════════
-// IPC — STATS & SYNC
-// ════════════════════════════════════════════════════════════
-
-ipcMain.handle("db:stats", () => {
-  try {
-    if (!baileysClient) return { ok: false, error: "Client not ready" }
-    const stats = baileysClient.getDBStats()
-    return { ok: true, data: stats }
-  } catch (err) {
-    return { ok: false, error: err.message }
-  }
-})
-
 ipcMain.handle("db:sync:status", () => {
+  try { return { ok: true, data: getDB().getSyncStatus() } }
+  catch (err) { return { ok: false, error: err.message } }
+})
+
+// ════════════════════════════════════════════════════════════
+// PROFILE PIC
+// ════════════════════════════════════════════════════════════
+ipcMain.handle("profile:get-pic", async (_e, { jid }) => {
   try {
-    if (!baileysClient) return { ok: false, error: "Client not ready" }
-    const status = baileysClient.getSyncStatus()
-    return { ok: true, data: status }
-  } catch (err) {
-    return { ok: false, error: err.message }
-  }
+    if (!baileysClient) return { ok: false, url: null }
+    const info = await baileysClient.getContactInfo(jid)
+    return { ok: true, url: info.imgUrl }
+  } catch { return { ok: false, url: null } }
 })
 
 // ════════════════════════════════════════════════════════════
 // BAILEYS EVENT → DB BRIDGE
-// Called from baileys/client.js via direct require
+// Called from baileys/client.js
 // ════════════════════════════════════════════════════════════
-// This module exports a function that the Baileys client can call
-// to write events to SQLite without going through IPC
+
+/**
+ * Dipanggil dari client.js setiap ada pesan masuk (live & offline).
+ * Meneruskan ke database dan push update ke renderer.
+ */
 module.exports.onBaileysMessage = function (payload) {
   try {
     const d = getDB()
@@ -271,8 +224,23 @@ module.exports.onBaileysMessage = function (payload) {
       starred: payload.starred ? 1 : 0,
       quoted_id: null,
       raw: null,
+      // ↓ TAMBAHKAN INI:
+      media_url: null, media_mime: null, media_size: null,
+      media_filename: null, media_duration: null,
+      media_width: null, media_height: null,
+      media_is_downloaded: 0, media_download_status: "pending",
+      is_view_once: 0, is_ephemeral: 0, ephemeral_expiry: null,
+      poll_options: null, poll_votes: null,
+      location_lat: null, location_lng: null,
+      location_name: null, location_address: null,
+      contact_display_name: null, contact_vcard: null,
+      reaction_emoji: null, reaction_target_id: null,
+      is_forwarded: 0, forward_score: 0,
+      quoted_body: null, quoted_sender: null, quoted_type: null,
+      message_json: null, is_deleted: 0, source: "live",
     })
-    // Push update to renderer so it can refresh in real-time
+
+    // Push ke renderer
     win?.webContents.send("db:messages:new", {
       chat_jid: payload.jid,
       message: {
@@ -285,59 +253,54 @@ module.exports.onBaileysMessage = function (payload) {
         from_me: payload.isMe ? 1 : 0,
         status: payload.status || 0,
         has_media: payload.hasMedia ? 1 : 0,
+        // Media extras
+        media_url: payload.mediaUrl || null,
+        media_mime: payload.mediaMime || null,
+        media_filename: payload.mediaFilename || null,
+        is_view_once: payload.isViewOnce ? 1 : 0,
+        is_ephemeral: payload.isEphemeral ? 1 : 0,
+        poll_options: payload.pollOptions || null,
+        location_lat: payload.locationLat || null,
+        location_lng: payload.locationLng || null,
+        reaction_emoji: payload.reactionEmoji || null,
+        reaction_target_id: payload.reactionTargetId || null,
       }
     })
-    // Also refresh chat list
     win?.webContents.send("db:chats:updated")
-  } catch (err) {
-    console.error("[AuroraChat] DB write error:", err.message)
-  }
+  } catch (err) { console.error("[WaPlus] DB write error:", err.message) }
 }
 
 module.exports.onBaileysChats = function (chats) {
   try {
     const d = getDB()
-    for (const c of chats) {
-      const jid = c.id || ""
-      const isCommunity = jid.endsWith("@newsletter") || (c.isCommunity === true)
-      const isGroup = jid.endsWith("@g.us")
-      d.upsertChat({
-        jid,
-        name: c.name || c.subject || null,
-        isGroup,
-        isCommunity,
-        communityJid: c.linkedParent || null,
-        phone: jid.split("@")[0] || null,
-        lastMsgAt: c.conversationTimestamp ? Number(c.conversationTimestamp) : 0,
-        unreadDelta: c.unreadCount || 0,
-      })
-    }
+    for (const c of chats) d.saveChat(c)
     win?.webContents.send("chats:set", chats)
     win?.webContents.send("db:chats:updated")
-  } catch (err) {
-    console.error("[AuroraChat] DB chats error:", err.message)
-  }
+  } catch (err) { console.error("[WaPlus] DB chats error:", err.message) }
 }
 
 module.exports.onBaileysContacts = function (contacts) {
   try {
-    getDB().bulkUpsertContacts(contacts)
+    getDB().saveContacts(contacts)
     win?.webContents.send("db:contacts:updated")
-  } catch (err) {
-    console.error("[AuroraChat] DB contacts error:", err.message)
-  }
+  } catch (err) { console.error("[WaPlus] DB contacts error:", err.message) }
 }
 
 module.exports.onBaileysSyncStart = function () {
   win?.webContents.send("sync:status", { status: "syncing", isSyncing: true, progress: 0 })
 }
 
-module.exports.onBaileysSyncDone = function () {
-  win?.webContents.send("sync:status", { status: "done", isSyncing: false, progress: 100 })
+module.exports.onBaileysSyncDone = function (stats) {
+  win?.webContents.send("sync:status", {
+    status: "done", isSyncing: false, progress: 100,
+    stats: stats || { chats: 0, messages: 0 }
+  })
   win?.webContents.send("db:chats:updated")
 }
 
-// ── App Lifecycle ─────────────────────────────────────────
+// ════════════════════════════════════════════════════════════
+// APP LIFECYCLE
+// ════════════════════════════════════════════════════════════
 app.whenReady().then(createWindow)
 
 app.on("window-all-closed", () => {
@@ -350,19 +313,4 @@ app.on("will-quit", () => {
 
 app.on("activate", () => {
   if (BrowserWindow.getAllWindows().length === 0) createWindow()
-})
-// ── Session check IPC ────────────────────────────────────
-ipcMain.handle("auth:check-session", () => {
-  return { hasSession: hasExistingSession() }
-})
-
-// ── Profile picture IPC ──────────────────────────────────
-ipcMain.handle("profile:get-pic", async (_e, { jid }) => {
-  try {
-    if (!baileysClient) return { ok: false, url: null }
-    const info = await baileysClient.getContactInfo(jid)
-    return { ok: true, url: info.imgUrl }
-  } catch {
-    return { ok: false, url: null }
-  }
 })

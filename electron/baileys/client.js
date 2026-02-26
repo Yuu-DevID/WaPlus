@@ -46,7 +46,7 @@ const NodeCache = require("node-cache")
 // ════════════════════════════════════════════════════════════
 // DATABASE IMPORT
 // ════════════════════════════════════════════════════════════
-const db = require("./database")
+const db = require("../db/database")
 
 // ════════════════════════════════════════════════════════════
 // CONFIG
@@ -312,6 +312,14 @@ async function handleMessage(msg, type, isHistorySync = false) {
       )
     }
 
+    // Extract media info for renderer
+    const msgObj = msg.message || {}
+    const mediaMsg = msgObj.imageMessage || msgObj.videoMessage || msgObj.audioMessage ||
+      msgObj.documentMessage || msgObj.stickerMessage || null
+    const locMsg = msgObj.locationMessage || msgObj.liveLocationMessage || null
+    const pollMsg = msgObj.pollCreationMessage || msgObj.pollCreationMessageV2 || msgObj.pollCreationMessageV3 || null
+    const reactionMsg = msgObj.reactionMessage || null
+
     // Send to renderer
     send("messages:new", {
       key: msg.key,
@@ -329,6 +337,20 @@ async function handleMessage(msg, type, isHistorySync = false) {
       broadcast: msg.broadcast ?? false,
       hasMedia: saveResult.hasMedia,
       isHistorySync,
+      isViewOnce: saveResult.isViewOnce || false,
+      isEphemeral: saveResult.isEphemeral || false,
+      mediaUrl: mediaMsg?.url || null,
+      mediaMime: mediaMsg?.mimetype || null,
+      mediaFilename: mediaMsg?.fileName || mediaMsg?.title || null,
+      mediaDuration: mediaMsg?.seconds || null,
+      mediaWidth: mediaMsg?.width || null,
+      mediaHeight: mediaMsg?.height || null,
+      locationLat: locMsg?.degreesLatitude || null,
+      locationLng: locMsg?.degreesLongitude || null,
+      locationName: locMsg?.name || null,
+      pollOptions: pollMsg ? (pollMsg.options || []).map(o => o.optionName || o.name) : null,
+      reactionEmoji: reactionMsg?.text || null,
+      reactionTargetId: reactionMsg?.key?.id || null,
     })
   }
 }
@@ -435,7 +457,7 @@ async function connectToWhatsApp(phoneForPairing = null) {
   // ════════════════════════════════════════════════════════
   sock.ev.on("connection.update", async (update) => {
     const { connection, lastDisconnect, qr } = update
-
+    console.log("Nunggu Koneksi")
     if (qr) {
       log("QR Code diterima → kirim ke renderer")
       send("auth:qr", qr)
@@ -540,7 +562,8 @@ async function connectToWhatsApp(phoneForPairing = null) {
 
     // Save contacts
     for (const contact of contacts) {
-      db.saveContact(contact)
+      log(contact)
+      db.saveContacts(contact)
     }
 
     // Save messages (history)

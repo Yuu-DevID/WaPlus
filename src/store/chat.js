@@ -26,12 +26,15 @@ export const useChatStore = create((set, get) => ({
 
     // Progressive sync indicator: "idle" | "syncing" | "done"
     syncStatus: "idle",
+    syncProgress: 0,
+    syncStats: { chats: 0, messages: 0 },
 
     // ── Chat actions ────────────────────────────────
     setChats: (chats, total) => set({ chats, chatsTotal: total }),
     prependChats: (more) => set((s) => ({ chats: [...s.chats, ...more] })),
     setChatsLoading: (v) => set({ chatsLoading: v }),
     setSyncStatus: (v) => set({ syncStatus: v }),
+    setSyncProgress: (progress, stats) => set({ syncProgress: progress, syncStats: stats || { chats: 0, messages: 0 } }),
 
     loadChats: async () => {
         set({ chatsLoading: true })
@@ -112,7 +115,19 @@ export const useChatStore = create((set, get) => ({
     appendMessage: (jid, msg) => set((s) => {
         const existing = s.messages[jid] || []
         if (existing.some(m => m.id === msg.id)) return s
-        return { messages: { ...s.messages, [jid]: [...existing, msg] } }
+        // Re-sort by timestamp to handle out-of-order messages
+        const updated = [...existing, msg].sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0))
+        return { messages: { ...s.messages, [jid]: updated } }
+    }),
+    updateMessageStatus: (jid, msgId, status) => set((s) => {
+        const existing = s.messages[jid] || []
+        const updated = existing.map(m => m.id === msgId ? { ...m, status } : m)
+        return { messages: { ...s.messages, [jid]: updated } }
+    }),
+    markMessageDeleted: (jid, msgId) => set((s) => {
+        const existing = s.messages[jid] || []
+        const updated = existing.map(m => m.id === msgId ? { ...m, is_deleted: 1, body: null } : m)
+        return { messages: { ...s.messages, [jid]: updated } }
     }),
     setMessagesLoading: (v) => set({ messagesLoading: v }),
 

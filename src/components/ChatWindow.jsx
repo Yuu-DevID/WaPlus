@@ -81,7 +81,7 @@ function SkeletonBubble({ isMe }) {
 }
 
 export default function ChatWindow({ jid }) {
-  const { messages, loadMessages, chats } = useChatStore()
+  const { messages, loadMessages, chats, syncStatus } = useChatStore()
   const { setRightPanel } = useAppStore()
   const [loading, setLoading] = useState(true)
   const bottomRef = useRef(null)
@@ -91,6 +91,7 @@ export default function ChatWindow({ jid }) {
   const name = chat?.name || (jid||"").split("@")[0] || "Chat"
   const msgs = messages[jid] || []
   const isGroup = (jid||"").endsWith("@g.us")
+  const isSyncing = syncStatus === "syncing"
 
   useEffect(() => {
     setLoading(true)
@@ -122,6 +123,14 @@ export default function ChatWindow({ jid }) {
           <button className="header-btn" title="Lebih"><DotsIcon/></button>
         </div>
       </div>
+
+      {/* History Sync Banner */}
+      {isSyncing && (
+        <div className="sync-banner">
+          <div className="sync-banner-spinner"/>
+          <span>Menyinkronkan riwayat pesan...</span>
+        </div>
+      )}
 
       {/* Messages */}
       <div className="msg-area" ref={areaRef}>

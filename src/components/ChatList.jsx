@@ -34,18 +34,33 @@ function SkeletonItem() {
   )
 }
 
-function SyncBanner({ syncStatus }) {
-  if (syncStatus !== "syncing") return null
+function SyncBanner({ syncStatus, syncProgress, syncStats }) {
+  if (syncStatus === "idle") return null
+  const isDone = syncStatus === "done"
+  if (isDone) {
+    // Show briefly then hide
+    return (
+      <div className="sync-banner" style={{ background: "rgba(37,211,102,.06)", color: "var(--green)" }}>
+        <span>✓</span>
+        <span>Sinkronisasi selesai</span>
+        {syncStats?.messages > 0 && (
+          <span className="sync-banner-progress">{syncStats.messages.toLocaleString()} pesan</span>
+        )}
+      </div>
+    )
+  }
   return (
-    <div style={{
-      display: "flex", alignItems: "center", gap: 6,
-      padding: "5px 14px", fontSize: 11,
-      background: "rgba(37,211,102,0.06)",
-      color: "var(--text-3)",
-      borderBottom: "1px solid var(--border)",
-    }}>
-      <span className="spinner spinner-sm" style={{ borderTopColor: "var(--green)", borderColor: "rgba(37,211,102,.2)" }} />
-      <span>Menyinkronkan pesan...</span>
+    <div className="sync-banner">
+      <div className="sync-banner-spinner" />
+      <span>Menyinkronkan riwayat...</span>
+      {syncProgress > 0 && (
+        <span className="sync-banner-progress">{syncProgress}%</span>
+      )}
+      {syncStats?.messages > 0 && (
+        <span className="sync-banner-progress" style={{ marginLeft: 4 }}>
+          {syncStats.messages.toLocaleString()} pesan
+        </span>
+      )}
     </div>
   )
 }
@@ -185,7 +200,7 @@ export default function ChatList({ connStatus }) {
       )}
 
       {/* Progressive sync banner */}
-      <SyncBanner syncStatus={syncStatus} />
+      <SyncBanner syncStatus={syncStatus} syncProgress={0} syncStats={null} />
 
       {/* List */}
       <div className="chat-list">

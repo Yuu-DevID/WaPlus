@@ -2131,3 +2131,572 @@ textarea {
   border-bottom: 1px solid var(--border);
   text-align: center;
 }
+/* ════════════════════════════════════════════════════════════
+   WaPlus — Extended Media Styles
+   Support semua jenis pesan WhatsApp
+   ════════════════════════════════════════════════════════════ */
+
+/* ── Deleted message ─────────────────────────────────────── */
+.deleted-msg {
+  color: var(--text-3) !important;
+  font-style: italic;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+}
+
+/* ── Image bubble ────────────────────────────────────────── */
+.media-img-wrap {
+  position: relative;
+}
+.media-img-real {
+  display: block;
+  border-radius: 6px;
+  object-fit: cover;
+}
+.media-img-thumb {
+  border-radius: 6px;
+  background: rgba(255,255,255,.05);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 6px;
+  min-height: 120px;
+}
+.media-img-placeholder {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+}
+.media-status-label {
+  font-size: 11px;
+  color: var(--text-3);
+}
+.lightbox {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,.85);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 9999;
+  cursor: pointer;
+}
+.lightbox-img {
+  max-width: 90vw;
+  max-height: 90vh;
+  border-radius: 8px;
+  box-shadow: 0 24px 64px rgba(0,0,0,.5);
+}
+
+/* ── Video bubble ────────────────────────────────────────── */
+.media-video-player {
+  display: block;
+  border-radius: 6px;
+}
+.media-video-thumb {
+  width: 260px;
+  height: 160px;
+  background: rgba(0,0,0,.4);
+  border-radius: 6px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  cursor: pointer;
+  position: relative;
+}
+.play-btn {
+  font-size: 36px;
+  opacity: .9;
+}
+.video-dur {
+  font-size: 12px;
+  color: rgba(255,255,255,.7);
+  position: absolute;
+  bottom: 8px;
+  right: 10px;
+  background: rgba(0,0,0,.5);
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+
+/* ── Audio bubble ────────────────────────────────────────── */
+.media-audio {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  min-width: 220px;
+}
+.audio-avatar {
+  font-size: 24px;
+  flex-shrink: 0;
+}
+.audio-content {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.audio-play-btn {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: var(--green);
+  border: none;
+  color: white;
+  font-size: 13px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+.audio-track {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.audio-bar {
+  height: 3px;
+  background: rgba(255,255,255,.15);
+  border-radius: 2px;
+  overflow: hidden;
+}
+.audio-fill {
+  height: 100%;
+  background: var(--green);
+  border-radius: 2px;
+}
+.audio-meta {
+  display: flex;
+  justify-content: space-between;
+}
+.audio-label {
+  font-size: 10.5px;
+  color: var(--text-3);
+}
+.audio-dur {
+  font-size: 10.5px;
+  color: var(--text-3);
+}
+
+/* ── Document bubble ─────────────────────────────────────── */
+.media-doc {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  min-width: 200px;
+}
+.doc-icon {
+  font-size: 28px;
+  flex-shrink: 0;
+}
+.doc-info {
+  flex: 1;
+  min-width: 0;
+}
+.doc-name {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-1);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.doc-meta {
+  font-size: 11px;
+  color: var(--text-3);
+  margin-top: 2px;
+}
+.doc-download-btn {
+  font-size: 16px;
+  color: var(--text-3);
+  cursor: pointer;
+  padding: 4px;
+  border-radius: 4px;
+  transition: color .15s;
+  flex-shrink: 0;
+}
+.doc-download-btn:hover {
+  color: var(--text-1);
+}
+
+/* ── Sticker ─────────────────────────────────────────────── */
+.sticker-img {
+  width: 120px;
+  height: 120px;
+  object-fit: contain;
+}
+.sticker-placeholder {
+  font-size: 72px;
+  padding: 4px;
+  line-height: 1;
+}
+
+/* ── Location ────────────────────────────────────────────── */
+.media-location {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  min-width: 220px;
+}
+.location-map-preview {
+  width: 44px;
+  height: 44px;
+  background: rgba(37,211,102,.1);
+  border: 1px solid rgba(37,211,102,.2);
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 22px;
+  flex-shrink: 0;
+}
+.location-info {
+  flex: 1;
+  min-width: 0;
+}
+.location-label {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-1);
+}
+.location-address {
+  font-size: 11px;
+  color: var(--text-3);
+  margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.location-coords {
+  font-size: 10px;
+  color: var(--text-3);
+  font-family: monospace;
+  margin-top: 2px;
+}
+.location-open-btn {
+  font-size: 11px;
+  color: var(--green);
+  text-decoration: none;
+  white-space: nowrap;
+  flex-shrink: 0;
+  padding: 4px 8px;
+  border: 1px solid rgba(37,211,102,.3);
+  border-radius: 6px;
+}
+.location-open-btn:hover {
+  background: rgba(37,211,102,.08);
+}
+
+/* ── Poll ────────────────────────────────────────────────── */
+.poll-wrap {
+  padding: 10px 12px;
+  min-width: 220px;
+}
+.poll-header {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.poll-icon {
+  font-size: 20px;
+  flex-shrink: 0;
+}
+.poll-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-1);
+}
+.poll-sub {
+  font-size: 11px;
+  color: var(--text-3);
+  margin-top: 1px;
+}
+.poll-total {
+  font-size: 11px;
+  color: var(--text-3);
+  margin-top: 8px;
+  text-align: center;
+}
+.poll-option {
+  margin-bottom: 6px;
+}
+.poll-option-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 3px;
+}
+.poll-option-name {
+  font-size: 12.5px;
+  color: var(--text-1);
+}
+.poll-option-pct {
+  font-size: 11px;
+  color: var(--text-3);
+}
+.poll-bar {
+  height: 4px;
+  background: rgba(255,255,255,.1);
+  border-radius: 2px;
+  overflow: hidden;
+}
+.poll-bar-fill {
+  height: 100%;
+  background: var(--green);
+  border-radius: 2px;
+  transition: width .4s ease;
+}
+
+/* ── Contact msg ─────────────────────────────────────────── */
+.contact-msg {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  min-width: 180px;
+}
+.contact-icon {
+  width: 38px;
+  height: 38px;
+  background: rgba(37,211,102,.12);
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
+  flex-shrink: 0;
+}
+.contact-name {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-1);
+}
+.contact-sub {
+  font-size: 11px;
+  color: var(--text-3);
+  margin-top: 2px;
+}
+.contact-add-btn {
+  margin-left: auto;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-2);
+  font-size: 16px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+.contact-add-btn:hover {
+  background: rgba(255,255,255,.06);
+  color: var(--green);
+  border-color: var(--green);
+}
+
+/* ── View once ───────────────────────────────────────────── */
+.viewonce-wrap {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 14px;
+  min-width: 180px;
+  background: rgba(37,211,102,.05);
+  border-radius: 6px;
+}
+.viewonce-eye {
+  font-size: 22px;
+}
+.viewonce-title {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-1);
+}
+.viewonce-sub {
+  font-size: 11px;
+  color: var(--text-3);
+  margin-top: 2px;
+}
+
+/* ── Ephemeral badge ─────────────────────────────────────── */
+.ephemeral-badge {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  color: var(--text-3);
+  margin-bottom: 4px;
+  padding: 2px 6px;
+  background: rgba(255,255,255,.04);
+  border-radius: 4px;
+  width: fit-content;
+}
+
+/* ── Forwarded badge ─────────────────────────────────────── */
+.forwarded-badge {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10.5px;
+  color: var(--text-3);
+  font-style: italic;
+  margin-bottom: 4px;
+}
+
+/* ── Edited badge ────────────────────────────────────────── */
+.edited-badge {
+  font-size: 10px;
+  color: var(--text-3);
+  font-style: italic;
+  margin-right: 4px;
+}
+
+/* ── System message ──────────────────────────────────────── */
+.system-msg {
+  text-align: center;
+  font-size: 11px;
+  color: var(--text-3);
+  font-style: italic;
+  padding: 4px 12px;
+  background: rgba(255,255,255,.03);
+  border-radius: var(--radius-full);
+  margin: 4px auto;
+  width: fit-content;
+  max-width: 80%;
+}
+
+/* ── Group invite ────────────────────────────────────────── */
+.invite-msg {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  min-width: 200px;
+}
+.invite-icon {
+  font-size: 22px;
+}
+.invite-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-1);
+}
+.invite-sub {
+  font-size: 11px;
+  color: var(--text-3);
+  margin-top: 2px;
+}
+.invite-join-btn {
+  margin-left: auto;
+  padding: 5px 12px;
+  background: var(--green);
+  border: none;
+  border-radius: 6px;
+  color: #000;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.invite-join-btn:hover {
+  background: var(--green-light);
+}
+
+/* ── Reaction message ────────────────────────────────────── */
+.reaction-msg-bubble {
+  padding: 4px 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.reaction-emoji-big {
+  font-size: 36px;
+  line-height: 1;
+}
+
+/* ── Payment / Order ─────────────────────────────────────── */
+.payment-msg, .order-msg {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  min-width: 180px;
+}
+.payment-msg span, .order-msg span {
+  font-size: 22px;
+}
+.payment-label, .order-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-1);
+}
+.payment-body, .order-body {
+  font-size: 11px;
+  color: var(--text-3);
+  margin-top: 2px;
+}
+
+/* ── Sync progress banner ────────────────────────────────── */
+.sync-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 16px;
+  background: rgba(37,211,102,.08);
+  border-bottom: 1px solid rgba(37,211,102,.15);
+  font-size: 12px;
+  color: var(--green);
+  font-weight: 500;
+}
+.sync-banner-spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid rgba(37,211,102,.2);
+  border-top-color: var(--green);
+  border-radius: 50%;
+  animation: spin .8s linear infinite;
+}
+.sync-banner-progress {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+/* ── Media caption ───────────────────────────────────────── */
+.media-caption {
+  padding: 6px 10px 4px;
+  font-size: 13px;
+  color: var(--text-1);
+  line-height: 1.5;
+}
+
+/* ── History sync indicator in chat list ─────────────────── */
+.history-sync-indicator {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 8px 12px;
+  margin: 8px;
+  background: rgba(37,211,102,.06);
+  border: 1px solid rgba(37,211,102,.12);
+  border-radius: 8px;
+  font-size: 11.5px;
+  color: var(--green);
+}
+

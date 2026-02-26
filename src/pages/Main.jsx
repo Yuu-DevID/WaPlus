@@ -87,8 +87,11 @@ export default function Main() {
 
     // Sync status (progressive Baileys sync indicator)
     window.api.onSyncStatus?.((d) => {
-      setSyncStatus(d?.status || "idle")
-      if (d?.status === "done") loadChats()
+      const status = d?.isSyncing ? "syncing" : (d?.status || "idle")
+      setSyncStatus(status)
+      if (!d?.isSyncing || d?.status === "done" || d?.isComplete) {
+        setTimeout(() => { loadChats(); setSyncStatus("done") }, 500)
+      }
     })
 
     // Live chat updates — reload from SQLite
@@ -119,6 +122,26 @@ export default function Main() {
       if (!msg?.chat_jid) return
       appendMessage(msg.chat_jid, msg)
       loadChats()
+    })
+
+    // Message status update (delivered, read, etc.)
+    window.api.onMessagesUpdate?.((updates) => {
+      if (!Array.isArray(updates)) return
+      for (const { key, update } of updates) {
+        if (!key?.remoteJid) continue
+        if (update?.status !== undefined) {
+          updateMessageStatus?.(key.remoteJid, key.id, update.status)
+        }
+      }
+    })
+
+    // Message deleted
+    window.api.onMessagesDelete?.((item) => {
+      if (item?.keys) {
+        for (const key of item.keys) {
+          if (key?.remoteJid) markMessageDeleted?.(key.remoteJid, key.id)
+        }
+      }
     })
   }, [])
 
