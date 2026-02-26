@@ -1,0 +1,128 @@
+// ══════════════════════════════════════════════════════════
+// Country list with flag images (from flagcdn.com)
+// Sorted by most commonly used first, then alphabetically
+// ══════════════════════════════════════════════════════════
+
+const flagUrl = (code) => `https://flagcdn.com/w40/${code.toLowerCase()}.png`
+
+const COUNTRIES = [
+  // ── Popular / Most Used ──────────────────────────────
+  { name: "Indonesia",        dial: "+62",   iso: "ID",  flag: flagUrl("id") },
+  { name: "United States",    dial: "+1",    iso: "US",  flag: flagUrl("us") },
+  { name: "Canada",           dial: "+1",    iso: "CA",  flag: flagUrl("ca") },
+  { name: "United Kingdom",   dial: "+44",   iso: "GB",  flag: flagUrl("gb") },
+  { name: "India",            dial: "+91",   iso: "IN",  flag: flagUrl("in") },
+  { name: "Australia",        dial: "+61",   iso: "AU",  flag: flagUrl("au") },
+  { name: "Malaysia",         dial: "+60",   iso: "MY",  flag: flagUrl("my") },
+  { name: "Singapore",        dial: "+65",   iso: "SG",  flag: flagUrl("sg") },
+  { name: "Philippines",      dial: "+63",   iso: "PH",  flag: flagUrl("ph") },
+  { name: "Thailand",         dial: "+66",   iso: "TH",  flag: flagUrl("th") },
+
+  // ── Asia ─────────────────────────────────────────────
+  { name: "Afghanistan",      dial: "+93",   iso: "AF",  flag: flagUrl("af") },
+  { name: "Bangladesh",       dial: "+880",  iso: "BD",  flag: flagUrl("bd") },
+  { name: "Brunei",           dial: "+673",  iso: "BN",  flag: flagUrl("bn") },
+  { name: "Cambodia",         dial: "+855",  iso: "KH",  flag: flagUrl("kh") },
+  { name: "China",            dial: "+86",   iso: "CN",  flag: flagUrl("cn") },
+  { name: "Hong Kong",        dial: "+852",  iso: "HK",  flag: flagUrl("hk") },
+  { name: "Japan",            dial: "+81",   iso: "JP",  flag: flagUrl("jp") },
+  { name: "South Korea",      dial: "+82",   iso: "KR",  flag: flagUrl("kr") },
+  { name: "Laos",             dial: "+856",  iso: "LA",  flag: flagUrl("la") },
+  { name: "Macau",            dial: "+853",  iso: "MO",  flag: flagUrl("mo") },
+  { name: "Maldives",         dial: "+960",  iso: "MV",  flag: flagUrl("mv") },
+  { name: "Mongolia",         dial: "+976",  iso: "MN",  flag: flagUrl("mn") },
+  { name: "Myanmar",          dial: "+95",   iso: "MM",  flag: flagUrl("mm") },
+  { name: "Nepal",            dial: "+977",  iso: "NP",  flag: flagUrl("np") },
+  { name: "Pakistan",         dial: "+92",   iso: "PK",  flag: flagUrl("pk") },
+  { name: "Sri Lanka",        dial: "+94",   iso: "LK",  flag: flagUrl("lk") },
+  { name: "Taiwan",           dial: "+886",  iso: "TW",  flag: flagUrl("tw") },
+  { name: "Timor-Leste",      dial: "+670",  iso: "TL",  flag: flagUrl("tl") },
+  { name: "Vietnam",          dial: "+84",   iso: "VN",  flag: flagUrl("vn") },
+
+  // ── Middle East ──────────────────────────────────────
+  { name: "Bahrain",          dial: "+973",  iso: "BH",  flag: flagUrl("bh") },
+  { name: "Iraq",             dial: "+964",  iso: "IQ",  flag: flagUrl("iq") },
+  { name: "Iran",             dial: "+98",   iso: "IR",  flag: flagUrl("ir") },
+  { name: "Israel",           dial: "+972",  iso: "IL",  flag: flagUrl("il") },
+  { name: "Jordan",           dial: "+962",  iso: "JO",  flag: flagUrl("jo") },
+  { name: "Kuwait",           dial: "+965",  iso: "KW",  flag: flagUrl("kw") },
+  { name: "Lebanon",          dial: "+961",  iso: "LB",  flag: flagUrl("lb") },
+  { name: "Oman",             dial: "+968",  iso: "OM",  flag: flagUrl("om") },
+  { name: "Palestine",        dial: "+970",  iso: "PS",  flag: flagUrl("ps") },
+  { name: "Qatar",            dial: "+974",  iso: "QA",  flag: flagUrl("qa") },
+  { name: "Saudi Arabia",     dial: "+966",  iso: "SA",  flag: flagUrl("sa") },
+  { name: "Syria",            dial: "+963",  iso: "SY",  flag: flagUrl("sy") },
+  { name: "Turkey",           dial: "+90",   iso: "TR",  flag: flagUrl("tr") },
+  { name: "UAE",              dial: "+971",  iso: "AE",  flag: flagUrl("ae") },
+  { name: "Yemen",            dial: "+967",  iso: "YE",  flag: flagUrl("ye") },
+
+  // ── Europe ───────────────────────────────────────────
+  { name: "Austria",          dial: "+43",   iso: "AT",  flag: flagUrl("at") },
+  { name: "Belgium",          dial: "+32",   iso: "BE",  flag: flagUrl("be") },
+  { name: "Bulgaria",         dial: "+359",  iso: "BG",  flag: flagUrl("bg") },
+  { name: "Croatia",          dial: "+385",  iso: "HR",  flag: flagUrl("hr") },
+  { name: "Czech Republic",   dial: "+420",  iso: "CZ",  flag: flagUrl("cz") },
+  { name: "Denmark",          dial: "+45",   iso: "DK",  flag: flagUrl("dk") },
+  { name: "Finland",          dial: "+358",  iso: "FI",  flag: flagUrl("fi") },
+  { name: "France",           dial: "+33",   iso: "FR",  flag: flagUrl("fr") },
+  { name: "Germany",          dial: "+49",   iso: "DE",  flag: flagUrl("de") },
+  { name: "Greece",           dial: "+30",   iso: "GR",  flag: flagUrl("gr") },
+  { name: "Hungary",          dial: "+36",   iso: "HU",  flag: flagUrl("hu") },
+  { name: "Iceland",          dial: "+354",  iso: "IS",  flag: flagUrl("is") },
+  { name: "Ireland",          dial: "+353",  iso: "IE",  flag: flagUrl("ie") },
+  { name: "Italy",            dial: "+39",   iso: "IT",  flag: flagUrl("it") },
+  { name: "Luxembourg",       dial: "+352",  iso: "LU",  flag: flagUrl("lu") },
+  { name: "Netherlands",      dial: "+31",   iso: "NL",  flag: flagUrl("nl") },
+  { name: "Norway",           dial: "+47",   iso: "NO",  flag: flagUrl("no") },
+  { name: "Poland",           dial: "+48",   iso: "PL",  flag: flagUrl("pl") },
+  { name: "Portugal",         dial: "+351",  iso: "PT",  flag: flagUrl("pt") },
+  { name: "Romania",          dial: "+40",   iso: "RO",  flag: flagUrl("ro") },
+  { name: "Russia",           dial: "+7",    iso: "RU",  flag: flagUrl("ru") },
+  { name: "Serbia",           dial: "+381",  iso: "RS",  flag: flagUrl("rs") },
+  { name: "Slovakia",         dial: "+421",  iso: "SK",  flag: flagUrl("sk") },
+  { name: "Spain",            dial: "+34",   iso: "ES",  flag: flagUrl("es") },
+  { name: "Sweden",           dial: "+46",   iso: "SE",  flag: flagUrl("se") },
+  { name: "Switzerland",      dial: "+41",   iso: "CH",  flag: flagUrl("ch") },
+  { name: "Ukraine",          dial: "+380",  iso: "UA",  flag: flagUrl("ua") },
+
+  // ── Africa ───────────────────────────────────────────
+  { name: "Algeria",          dial: "+213",  iso: "DZ",  flag: flagUrl("dz") },
+  { name: "Egypt",            dial: "+20",   iso: "EG",  flag: flagUrl("eg") },
+  { name: "Ethiopia",         dial: "+251",  iso: "ET",  flag: flagUrl("et") },
+  { name: "Ghana",            dial: "+233",  iso: "GH",  flag: flagUrl("gh") },
+  { name: "Kenya",            dial: "+254",  iso: "KE",  flag: flagUrl("ke") },
+  { name: "Libya",            dial: "+218",  iso: "LY",  flag: flagUrl("ly") },
+  { name: "Morocco",          dial: "+212",  iso: "MA",  flag: flagUrl("ma") },
+  { name: "Nigeria",          dial: "+234",  iso: "NG",  flag: flagUrl("ng") },
+  { name: "South Africa",     dial: "+27",   iso: "ZA",  flag: flagUrl("za") },
+  { name: "Tanzania",         dial: "+255",  iso: "TZ",  flag: flagUrl("tz") },
+  { name: "Tunisia",          dial: "+216",  iso: "TN",  flag: flagUrl("tn") },
+  { name: "Uganda",           dial: "+256",  iso: "UG",  flag: flagUrl("ug") },
+
+  // ── Americas ─────────────────────────────────────────
+  { name: "Argentina",        dial: "+54",   iso: "AR",  flag: flagUrl("ar") },
+  { name: "Bolivia",          dial: "+591",  iso: "BO",  flag: flagUrl("bo") },
+  { name: "Brazil",           dial: "+55",   iso: "BR",  flag: flagUrl("br") },
+  { name: "Chile",            dial: "+56",   iso: "CL",  flag: flagUrl("cl") },
+  { name: "Colombia",         dial: "+57",   iso: "CO",  flag: flagUrl("co") },
+  { name: "Costa Rica",       dial: "+506",  iso: "CR",  flag: flagUrl("cr") },
+  { name: "Cuba",             dial: "+53",   iso: "CU",  flag: flagUrl("cu") },
+  { name: "Dominican Rep.",   dial: "+1",    iso: "DO",  flag: flagUrl("do") },
+  { name: "Ecuador",          dial: "+593",  iso: "EC",  flag: flagUrl("ec") },
+  { name: "Guatemala",        dial: "+502",  iso: "GT",  flag: flagUrl("gt") },
+  { name: "Jamaica",          dial: "+1",    iso: "JM",  flag: flagUrl("jm") },
+  { name: "Mexico",           dial: "+52",   iso: "MX",  flag: flagUrl("mx") },
+  { name: "Panama",           dial: "+507",  iso: "PA",  flag: flagUrl("pa") },
+  { name: "Paraguay",         dial: "+595",  iso: "PY",  flag: flagUrl("py") },
+  { name: "Peru",             dial: "+51",   iso: "PE",  flag: flagUrl("pe") },
+  { name: "Puerto Rico",      dial: "+1",    iso: "PR",  flag: flagUrl("pr") },
+  { name: "Uruguay",          dial: "+598",  iso: "UY",  flag: flagUrl("uy") },
+  { name: "Venezuela",        dial: "+58",   iso: "VE",  flag: flagUrl("ve") },
+
+  // ── Oceania ──────────────────────────────────────────
+  { name: "Fiji",             dial: "+679",  iso: "FJ",  flag: flagUrl("fj") },
+  { name: "New Zealand",      dial: "+64",   iso: "NZ",  flag: flagUrl("nz") },
+  { name: "Papua New Guinea", dial: "+675",  iso: "PG",  flag: flagUrl("pg") },
+]
+
+export default COUNTRIES
