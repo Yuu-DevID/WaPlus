@@ -14,7 +14,18 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 import { format } from "date-fns"
-import { useState } from "react"
+import { useState, useRef, useCallback, useEffect } from "react"
+import { prefetchChat } from "../hooks/useMediaPrefetch"
+
+// ─── Reply Icon SVG ───────────────────────────────────────────────────────────
+function ReplyIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+      <polyline points="9 17 4 12 9 7"/>
+      <path d="M20 18v-2a4 4 0 0 0-4-4H4"/>
+    </svg>
+  )
+}
 
 // ════════════════════════════════════════════════════════════
 // [FIX-1] toBool — normalize SQLite 0/1 → JS boolean
@@ -22,14 +33,98 @@ import { useState } from "react"
 // ════════════════════════════════════════════════════════════
 const toBool = (v) => v === 1 || v === true
 
-// ─── Media src resolver ───────────────────────────────────────────────────────
+// ─── Media path → loadable URL ───────────────────────────────────────────────
+// Handles: file:// prefixed paths, Unix /absolute, Windows D:\absolute\path
 function getMediaSrc(msg) {
-  if (msg.media_saved_path) {
-    const p = msg.media_saved_path.replace(/\\/g, "/")
-    return p.startsWith("file://") ? p : `file://${p}`
-  }
+  const p = msg.media_saved_path
+  if (p) return pathToFileUrl(p)
   if (msg.media_url) return msg.media_url
   return null
+}
+
+function pathToFileUrl(rawPath) {
+  if (!rawPath) return null
+  // Already a file:// URL
+  if (rawPath.startsWith("file://")) {
+    // Guard against legacy broken encoding: D%3A → D: (old normalizeMediaPath bug)
+    // If the path contains %3A (encoded colon) right after a drive letter, decode and re-encode correctly
+    if (rawPath.includes("%3A") || rawPath.includes("%3a")) {
+      try {
+        // Decode entire URL, then re-run through pathToFileUrl as a raw path
+        const decoded = decodeURIComponent(rawPath.replace(/^file:\/\/\/?/, ""))
+        return pathToFileUrl(decoded)
+      } catch (_) {}
+    }
+    return rawPath
+  }
+  // Normalize backslashes (Windows)
+  let p = rawPath.replace(/\\/g, "/")
+  // Windows drive letter: "D:/..." → "file:///D:/..."
+  // We must NOT encode the colon in "D:" — only encode path segments
+  const winDrive = /^([A-Za-z]):\//
+  if (winDrive.test(p)) {
+    // e.g. "D:/path/to file/img.webp" → "file:///D:/path/to%20file/img.webp"
+    const encoded = p.replace(winDrive, (_, letter) => `/${letter.toUpperCase()}:/`)
+      .split("/")
+      .map((seg, i) => {
+        // First segment after split("D:/") is empty or drive — don't encode
+        if (i === 0) return seg
+        // Preserve drive-colon segment "D:"
+        if (/^[A-Za-z]:$/.test(seg)) return seg
+        return encodeURIComponent(seg)
+      })
+      .join("/")
+    return `file://${encoded}`
+  }
+  // Unix absolute path
+  const withSlash = p.startsWith("/") ? p : `/${p}`
+  const encoded = withSlash.split("/").map((seg, i) => i === 0 ? seg : encodeURIComponent(seg)).join("/")
+  return `file://${encoded}`
+}
+
+// ─── useMediaSrc — reactive media source with existence check ────────────────
+// 1. Shows src IMMEDIATELY (optimistic) from stored path — no flicker on open
+// 2. Resets error state when path changes (media:updated fires after download)
+// 3. Async existence check: if file is gone (deleted / session change), clears
+//    src so bubble shows "downloading..." and prefetch can re-trigger.
+function useMediaSrc(msg) {
+  const rawPath = msg.media_saved_path || null
+  // Start optimistic: show path immediately, verify async
+  const [verifiedSrc, setVerifiedSrc] = useState(() => rawPath ? pathToFileUrl(rawPath) : null)
+  const [err, setErr] = useState(false)
+  const prevRaw = useRef(rawPath)
+  const checkRef = useRef(false)  // prevent double-check on strict mode
+
+  // When rawPath changes (media:updated arrives), accept immediately + reset error
+  if (prevRaw.current !== rawPath) {
+    prevRaw.current = rawPath
+    const newSrc = rawPath ? pathToFileUrl(rawPath) : null
+    setVerifiedSrc(newSrc)
+    if (err) setErr(false)
+    checkRef.current = false  // allow re-check for new path
+  }
+
+  // Async existence verification — only when we have a path and haven't checked yet
+  useEffect(() => {
+    if (!rawPath || checkRef.current) return
+    if (!window.api?.fsExists) return  // IPC not available (unit tests / dev)
+    checkRef.current = true
+
+    window.api.fsExists({ rawPath }).then(exists => {
+      if (!exists) {
+        // File is gone — clear src (shows "downloading...") and re-trigger download
+        setVerifiedSrc(null)
+        if (msg.chat_jid) prefetchChat(msg.chat_jid, 30, true)
+      }
+      // If exists: already showing correct src, nothing to do
+    }).catch(() => {
+      // IPC error — keep showing current optimistic src
+    })
+  }, [rawPath]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Fallback to media_url if no local file
+  const src = verifiedSrc || (msg.media_url || null)
+  return { src, err, setErr }
 }
 
 // ─── Format phone number ──────────────────────────────────────────────────────
@@ -61,9 +156,9 @@ function BubbleTime({ ts }) {
 
 // ─── [FIX-2] Quoted/reply preview ────────────────────────────────────────────
 // sender is now already resolved to display name by chat.js store
-function QuotedMsg({ body, sender, type, hasMedia, mimetype }) {
+function QuotedMsg({ body, sender, type, hasMedia, mimetype, onClick, quotedFromMe }) {
   // Don't render if both sender and body are empty/null
-  if (!sender && !body && !hasMedia) return null
+  if (!sender && !body && !hasMedia && !quotedFromMe) return null
 
   const mediaIcon = (() => {
     if (!hasMedia) return null
@@ -74,13 +169,24 @@ function QuotedMsg({ body, sender, type, hasMedia, mimetype }) {
     return "📎 "
   })()
 
-  // Resolve sender display: if still looks like a JID, strip it
-  const displaySender = sender
-    ? (sender.includes("@") ? fmtPhone(sender) : sender)
-    : null
+  // [FIX-OWN] sender is null when resolveQuotedSender detected it was our own JID
+  // quotedFromMe = true means the quoted message was sent by us
+  let displaySender
+  if (quotedFromMe || sender === null) {
+    displaySender = "Kamu"
+  } else if (sender) {
+    // Already resolved by chat.js — but strip if it still has @
+    displaySender = sender.includes("@") ? fmtPhone(sender) : sender
+  } else {
+    displaySender = null
+  }
 
   return (
-    <div className="quoted">
+    <div
+      className="quoted"
+      onClick={onClick}
+      style={onClick ? { cursor: "pointer" } : undefined}
+    >
       {displaySender && (
         <div className="quoted-sender">{displaySender}</div>
       )}
@@ -121,8 +227,7 @@ function ForwardBadge({ score }) {
 
 // ─── Image bubble ─────────────────────────────────────────────────────────────
 function ImageBubble({ msg }) {
-  const src = getMediaSrc(msg)
-  const [err, setErr] = useState(false)
+  const { src, err, setErr } = useMediaSrc(msg)
 
   if (!src || err) {
     return (
@@ -161,8 +266,7 @@ function ImageBubble({ msg }) {
 
 // ─── Video bubble ─────────────────────────────────────────────────────────────
 function VideoBubble({ msg }) {
-  const src = getMediaSrc(msg)
-  const [err, setErr] = useState(false)
+  const { src, err, setErr } = useMediaSrc(msg)
   const isGif = toBool(msg.is_gif)
 
   if (!src || err) {
@@ -205,25 +309,279 @@ function VideoBubble({ msg }) {
 }
 
 // ─── Audio / PTT bubble ───────────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════
+// AUDIO PLAYER — Real playback with waveform, scrub, speed
+// ════════════════════════════════════════════════════════════
+
+// ── Global singleton: only one audio plays at a time ────────
+// Uses a module-level ref so any AudioBubble can stop others.
+const _audioRegistry = { current: null }
+
+// ── Deterministic waveform from message id ───────────────────
+// WhatsApp doesn't expose waveform data via Baileys, so we
+// generate a stable-looking waveform seeded from the message id.
+// Same message always shows the same bars (deterministic, no flicker).
+function seedWaveform(id, bars = 40) {
+  const str = id || "x"
+  let h = 0
+  for (let i = 0; i < str.length; i++) {
+    h = (Math.imul(31, h) + str.charCodeAt(i)) | 0
+  }
+  const heights = []
+  for (let i = 0; i < bars; i++) {
+    // LCG: fast, good distribution
+    h = (Math.imul(1664525, h) + 1013904223) | 0
+    // Shape: taller in the middle, quieter at ends (natural voice envelope)
+    const pos = i / bars
+    const envelope = 1 - Math.pow((pos - 0.5) * 2, 4)
+    const raw = ((h >>> 0) / 0xFFFFFFFF)   // 0..1
+    heights.push(0.12 + raw * 0.88 * envelope)
+  }
+  return heights
+}
+
+function fmtTime(s) {
+  if (!s || !isFinite(s)) return "0:00"
+  const m = Math.floor(s / 60)
+  const sec = Math.floor(s % 60)
+  return `${m}:${sec.toString().padStart(2, "0")}`
+}
+
+const SPEED_STEPS = [1, 1.5, 2]
+
 function AudioBubble({ msg }) {
-  const src = getMediaSrc(msg)
-  const [playing, setPlaying] = useState(false)
-  const isPtt = toBool(msg.is_ptt) || msg.msg_type === "pttMessage"
-  const duration = msg.media_duration || msg.duration
-  const fmt = s => s ? `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}` : "0:00"
+  const { src }   = useMediaSrc(msg)
+  const isPtt     = toBool(msg.is_ptt) || msg.msg_type === "pttMessage"
+  const msgId     = msg.id || msg.message_id || ""
+  const waveform  = useRef(seedWaveform(msgId)).current
+
+  const audioRef  = useRef(null)
+  const [playing,    setPlaying]    = useState(false)
+  const [progress,   setProgress]   = useState(0)       // 0..1
+  const [elapsed,    setElapsed]    = useState(0)        // seconds
+  const [duration,   setDuration]   = useState(msg.media_duration || msg.duration || 0)
+  const [speedIdx,   setSpeedIdx]   = useState(0)        // index into SPEED_STEPS
+  const [loadState,  setLoadState]  = useState("idle")   // idle|loading|ready|error
+  const scrubRef  = useRef(null)
+  const rafRef    = useRef(null)
+
+  const speed = SPEED_STEPS[speedIdx]
+
+  // ── Create / manage <audio> element ──────────────────────
+  useEffect(() => {
+    if (!src) return
+    const audio = new Audio()
+    audio.preload = "metadata"
+    audio.src = src
+    audioRef.current = audio
+    setLoadState("loading")
+
+    audio.addEventListener("loadedmetadata", () => {
+      setDuration(audio.duration)
+      setLoadState("ready")
+    })
+    audio.addEventListener("error", () => {
+      setLoadState("error")
+    })
+    audio.addEventListener("ended", () => {
+      setPlaying(false)
+      setProgress(0)
+      setElapsed(0)
+      audio.currentTime = 0
+      if (rafRef.current) cancelAnimationFrame(rafRef.current)
+    })
+
+    // Register for singleton management
+    const cleanup = () => {
+      audio.pause()
+      audio.src = ""
+      if (rafRef.current) cancelAnimationFrame(rafRef.current)
+    }
+    audio._cleanupFn = cleanup
+
+    return () => {
+      if (_audioRegistry.current === audio) _audioRegistry.current = null
+      cleanup()
+    }
+  }, [src])
+
+  // ── Apply speed changes ───────────────────────────────────
+  useEffect(() => {
+    if (audioRef.current) audioRef.current.playbackRate = speed
+  }, [speed])
+
+  // ── RAF loop for progress ─────────────────────────────────
+  const startRaf = useCallback(() => {
+    const tick = () => {
+      const audio = audioRef.current
+      if (!audio) return
+      const t = audio.currentTime
+      const d = audio.duration || 1
+      setProgress(t / d)
+      setElapsed(t)
+      rafRef.current = requestAnimationFrame(tick)
+    }
+    rafRef.current = requestAnimationFrame(tick)
+  }, [])
+
+  const stopRaf = useCallback(() => {
+    if (rafRef.current) cancelAnimationFrame(rafRef.current)
+    rafRef.current = null
+  }, [])
+
+  // ── Play / Pause ──────────────────────────────────────────
+  const togglePlay = useCallback(() => {
+    const audio = audioRef.current
+    if (!audio || loadState === "error") return
+
+    // Stop any other playing audio (singleton)
+    if (_audioRegistry.current && _audioRegistry.current !== audio) {
+      _audioRegistry.current.pause()
+      _audioRegistry.current._setPlaying?.(false)
+      // Stop their RAF via a custom signal
+      _audioRegistry.current._stopRaf?.()
+    }
+    _audioRegistry.current = audio
+    // Expose control hooks for singleton stop
+    audio._setPlaying = setPlaying
+    audio._stopRaf = stopRaf
+
+    if (playing) {
+      audio.pause()
+      stopRaf()
+      setPlaying(false)
+    } else {
+      audio.playbackRate = speed
+      audio.play().then(() => {
+        setPlaying(true)
+        startRaf()
+      }).catch(() => {
+        setLoadState("error")
+      })
+    }
+  }, [playing, loadState, speed, startRaf, stopRaf])
+
+  // ── Scrub bar click / drag ────────────────────────────────
+  const handleScrub = useCallback((e) => {
+    const audio = audioRef.current
+    if (!audio || !audio.duration) return
+    const bar = scrubRef.current
+    if (!bar) return
+    const rect = bar.getBoundingClientRect()
+    const frac = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width))
+    audio.currentTime = frac * audio.duration
+    setProgress(frac)
+    setElapsed(audio.currentTime)
+  }, [])
+
+  // ── Speed cycle ───────────────────────────────────────────
+  const cycleSpeed = useCallback((e) => {
+    e.stopPropagation()
+    setSpeedIdx(i => (i + 1) % SPEED_STEPS.length)
+  }, [])
+
+  // ── Render helpers ────────────────────────────────────────
+  const isLoading = !src || loadState === "loading" || loadState === "idle"
+  const isError   = loadState === "error"
+  const displayDur = duration ? fmtTime(playing ? elapsed : duration) : fmtTime(elapsed || 0)
+
+  // Play/pause icon — SVG for crispness
+  const PlayIcon = () => (
+    <svg viewBox="0 0 24 24" fill="currentColor" width="18" height="18">
+      <polygon points="6,4 20,12 6,20" />
+    </svg>
+  )
+  const PauseIcon = () => (
+    <svg viewBox="0 0 24 24" fill="currentColor" width="18" height="18">
+      <rect x="5" y="4" width="4" height="16" rx="1"/>
+      <rect x="15" y="4" width="4" height="16" rx="1"/>
+    </svg>
+  )
+  const MicIcon = () => (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="13" height="13"
+      strokeLinecap="round" strokeLinejoin="round">
+      <rect x="9" y="2" width="6" height="11" rx="3"/>
+      <path d="M5 10a7 7 0 0 0 14 0"/>
+      <line x1="12" y1="19" x2="12" y2="23"/>
+      <line x1="8" y1="23" x2="16" y2="23"/>
+    </svg>
+  )
+  const MusicIcon = () => (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="13" height="13"
+      strokeLinecap="round" strokeLinejoin="round">
+      <path d="M9 18V5l12-2v13"/>
+      <circle cx="6" cy="18" r="3"/>
+      <circle cx="18" cy="16" r="3"/>
+    </svg>
+  )
 
   return (
-    <div className="media-audio">
-      <button className="audio-play-btn" onClick={() => setPlaying(!playing)}>
-        {playing ? "⏸" : "▶"}
+    <div className={`audio-player${playing ? " audio-playing" : ""}${isError ? " audio-error" : ""}`}>
+
+      {/* Play/Pause button */}
+      <button
+        className="audio-btn-play"
+        onClick={togglePlay}
+        disabled={isError}
+        title={isLoading ? "Mengunduh..." : isError ? "Gagal memuat audio" : playing ? "Jeda" : "Putar"}
+      >
+        {isLoading ? (
+          <div className="audio-spinner" />
+        ) : isError ? (
+          <span style={{ fontSize: 14 }}>⚠</span>
+        ) : playing ? (
+          <PauseIcon />
+        ) : (
+          <PlayIcon />
+        )}
       </button>
-      <div className="audio-track">
-        <div className="audio-bar">
-          <div className="audio-fill" style={{ width: playing ? "35%" : "0%", transition: "width .3s" }} />
+
+      {/* Track area */}
+      <div className="audio-track-area">
+
+        {/* Waveform bars + scrub overlay */}
+        <div
+          ref={scrubRef}
+          className="audio-waveform"
+          onClick={handleScrub}
+          title="Klik untuk loncat ke posisi"
+        >
+          {waveform.map((h, i) => {
+            const barProgress = i / waveform.length
+            const filled = barProgress <= progress
+            const isActive = Math.abs(barProgress - progress) < 0.04
+            return (
+              <div
+                key={i}
+                className="audio-bar-seg"
+                style={{
+                  height: `${Math.round(h * 100)}%`,
+                  background: filled
+                    ? isActive
+                      ? "var(--green)"
+                      : "var(--green-dim)"
+                    : "rgba(255,255,255,0.12)",
+                  transform: isActive && playing ? "scaleY(1.3)" : "scaleY(1)",
+                }}
+              />
+            )
+          })}
         </div>
-        <div className="audio-meta">
-          <span className="audio-label">{isPtt ? "Pesan Suara" : "Audio"}</span>
-          <span className="audio-dur">{fmt(duration)}</span>
+
+        {/* Bottom row: type label + time + speed */}
+        <div className="audio-info-row">
+          <span className="audio-type-badge">
+            {isPtt ? <MicIcon /> : <MusicIcon />}
+            <span>{isPtt ? "Pesan Suara" : "Audio"}</span>
+          </span>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <span className="audio-time">{displayDur}</span>
+            {!isLoading && !isError && (
+              <button className="audio-speed-btn" onClick={cycleSpeed} title="Ubah kecepatan">
+                {speed}×
+              </button>
+            )}
+          </div>
         </div>
       </div>
     </div>
@@ -256,19 +614,84 @@ function DocBubble({ msg }) {
 }
 
 // ─── Sticker bubble ───────────────────────────────────────────────────────────
+// Stickers are WebP (static or animated). Electron/Chromium handles animated
+// WebP natively via <img>. We try <img> first; if it fails (e.g. corrupt file
+// or CORS on remote URL), fall back to <video autoPlay loop muted>.
+// useMediaSrc() auto-resets `err` when media:updated fires a new path.
 function StickerBubble({ msg }) {
-  const src = getMediaSrc(msg)
-  const [err, setErr] = useState(false)
+  const { src, err, setErr } = useMediaSrc(msg)
+  const [imgFailed, setImgFailed] = useState(false)
+  const [videoFailed, setVideoFailed] = useState(false)
+  const isAnimated = toBool(msg.is_animated)
 
-  if (!src || err) {
-    return <div style={{ fontSize: 72, padding: 4, lineHeight: 1 }}>🎭</div>
+  // Reset fallback states when src changes (new download arrived)
+  const prevSrcRef = useRef(src)
+  if (prevSrcRef.current !== src) {
+    prevSrcRef.current = src
+    setImgFailed(false)
+    setVideoFailed(false)
   }
+
+  // No source yet — still downloading
+  if (!src) {
+    return (
+      <div style={{
+        width: 150, height: 150,
+        display: "flex", alignItems: "center", justifyContent: "center",
+        flexDirection: "column", gap: 6,
+        background: "rgba(255,255,255,0.04)", borderRadius: 12,
+      }}>
+        <span style={{ fontSize: 32 }}>🎭</span>
+        <span style={{ fontSize: 10, color: "var(--text-3)", textAlign: "center" }}>
+          Mengunduh stiker...
+        </span>
+        <div className="spinner spinner-sm" style={{ borderTopColor: "var(--green)", borderColor: "rgba(37,211,102,.2)" }} />
+      </div>
+    )
+  }
+
+  // Both img and video failed — show error with retry hint
+  if (imgFailed && videoFailed) {
+    return (
+      <div style={{
+        width: 150, height: 150,
+        display: "flex", alignItems: "center", justifyContent: "center",
+        flexDirection: "column", gap: 6,
+        background: "rgba(255,255,255,0.04)", borderRadius: 12,
+      }}>
+        <span style={{ fontSize: 32 }}>🎭</span>
+        <span style={{ fontSize: 10, color: "var(--text-3)", textAlign: "center" }}>
+          Gagal memuat stiker
+        </span>
+      </div>
+    )
+  }
+
+  const stickerStyle = {
+    width: 150, height: 150,
+    objectFit: "contain", display: "block",
+    borderRadius: 4,
+  }
+
+  // If img failed (e.g. video/webm sticker), try video element
+  if (imgFailed) {
+    return (
+      <video
+        src={src}
+        autoPlay loop muted playsInline
+        onError={() => setVideoFailed(true)}
+        style={stickerStyle}
+      />
+    )
+  }
+
+  // Default: <img> — Electron Chromium renders animated WebP natively
   return (
     <img
       src={src}
       alt="Stiker"
-      onError={() => setErr(true)}
-      style={{ width: 150, height: 150, objectFit: "contain", display: "block" }}
+      onError={() => setImgFailed(true)}
+      style={stickerStyle}
     />
   )
 }
@@ -594,10 +1017,55 @@ function renderContent(msg) {
 }
 
 // ════════════════════════════════════════════════════════════
+// CONTEXT MENU
+// ════════════════════════════════════════════════════════════
+
+function ContextMenu({ x, y, items, onClose }) {
+  const ref = useRef(null)
+
+  useEffect(() => {
+    const close = (e) => {
+      if (ref.current && !ref.current.contains(e.target)) onClose()
+    }
+    document.addEventListener("mousedown", close)
+    document.addEventListener("contextmenu", close)
+    return () => {
+      document.removeEventListener("mousedown", close)
+      document.removeEventListener("contextmenu", close)
+    }
+  }, [onClose])
+
+  // Ensure menu doesn't go off-screen
+  const style = {
+    left: Math.min(x, window.innerWidth - 180),
+    top: Math.min(y, window.innerHeight - items.length * 38 - 20),
+  }
+
+  return (
+    <div ref={ref} className="ctx-menu" style={{ position: "fixed", ...style }}>
+      {items.map((item, i) =>
+        item === "divider" ? (
+          <div key={i} className="ctx-menu-divider" />
+        ) : (
+          <div
+            key={i}
+            className={`ctx-menu-item${item.danger ? " danger" : ""}`}
+            onMouseDown={(e) => { e.stopPropagation(); item.action(); onClose() }}
+          >
+            {item.icon && <span style={{ fontSize: 15 }}>{item.icon}</span>}
+            {item.label}
+          </div>
+        )
+      )}
+    </div>
+  )
+}
+
+// ════════════════════════════════════════════════════════════
 // MAIN COMPONENT
 // ════════════════════════════════════════════════════════════
 
-export default function MessageBubble({ msg }) {
+export default function MessageBubble({ msg, onReply, onScrollToMsg }) {
   // ── [FIX-1+FIX-5] Normalize ALL SQLite integer booleans ──────────────────
   const isMe        = toBool(msg.from_me)
   const isGroup     = toBool(msg.is_group)
@@ -632,69 +1100,210 @@ export default function MessageBubble({ msg }) {
   // [FIX-3] Null-safe sender initial
   const senderInitial = (msg.sender_name || msg.sender_jid || "?")[0].toUpperCase()
 
+  // ── Reply via swipe state ──────────────────────────────────────────────
+  const [swiping, setSwiping] = useState(false)
+  const [highlighted, setHighlighted] = useState(false)
+  const swipeStartX = useRef(null)
+  const swipeTriggered = useRef(false)
+  const wrapRef = useRef(null)
+
+  // ── Context menu state ─────────────────────────────────────────────────
+  const [ctxMenu, setCtxMenu] = useState(null) // { x, y }
+
+  const handleReply = useCallback(() => {
+    if (onReply) onReply(msg)
+  }, [msg, onReply])
+
+  // Touch swipe handlers
+  const onTouchStart = useCallback((e) => {
+    swipeStartX.current = e.touches[0].clientX
+    swipeTriggered.current = false
+  }, [])
+
+  const onTouchMove = useCallback((e) => {
+    if (swipeStartX.current === null) return
+    const dx = e.touches[0].clientX - swipeStartX.current
+    // Swipe right = positive dx (for both me and them)
+    // For "me" messages: swipe left (dx < -40)
+    // For "them" messages: swipe right (dx > 40)
+    const threshold = 40
+    const triggered = isMe ? dx < -threshold : dx > threshold
+    if (triggered && !swipeTriggered.current) {
+      swipeTriggered.current = true
+      setSwiping(true)
+      handleReply()
+      setTimeout(() => setSwiping(false), 400)
+    }
+  }, [isMe, handleReply])
+
+  const onTouchEnd = useCallback(() => {
+    swipeStartX.current = null
+  }, [])
+
+  // Mouse drag for swipe simulation on desktop
+  const mouseStartX = useRef(null)
+  const mouseDown = useRef(false)
+
+  const onMouseDown = useCallback((e) => {
+    if (e.button !== 0) return
+    mouseStartX.current = e.clientX
+    mouseDown.current = true
+    swipeTriggered.current = false
+  }, [])
+
+  const onMouseMove = useCallback((e) => {
+    if (!mouseDown.current || mouseStartX.current === null) return
+    const dx = e.clientX - mouseStartX.current
+    const threshold = 50
+    const triggered = isMe ? dx < -threshold : dx > threshold
+    if (triggered && !swipeTriggered.current) {
+      swipeTriggered.current = true
+      setSwiping(true)
+      handleReply()
+      setTimeout(() => setSwiping(false), 400)
+    }
+  }, [isMe, handleReply])
+
+  const onMouseUp = useCallback(() => {
+    mouseDown.current = false
+    mouseStartX.current = null
+  }, [])
+
+  // Right-click context menu
+  const onContextMenu = useCallback((e) => {
+    e.preventDefault()
+    setCtxMenu({ x: e.clientX, y: e.clientY })
+  }, [])
+
+  // Highlight when scrolled to
+  useEffect(() => {
+    if (!wrapRef.current) return
+    const el = wrapRef.current
+    const handler = () => {
+      setHighlighted(true)
+      setTimeout(() => setHighlighted(false), 1800)
+    }
+    el.addEventListener("msg-highlight", handler)
+    return () => el.removeEventListener("msg-highlight", handler)
+  }, [])
+
+  const getPreviewText = () => {
+    if (t === "imageMessage") return "📷 Foto"
+    if (t === "videoMessage") return "🎬 Video"
+    if (t === "audioMessage" || t === "pttMessage") return "🎵 Audio"
+    if (t === "stickerMessage") return "🎭 Stiker"
+    if (t === "documentMessage") return `📄 ${msg.media_filename || "Dokumen"}`
+    return msg.body || "Pesan"
+  }
+
+  const ctxItems = [
+    { icon: "↩", label: "Balas", action: handleReply },
+    "divider",
+    {
+      icon: "📋", label: "Salin", action: () => {
+        const text = msg.body || getPreviewText()
+        navigator.clipboard?.writeText(text)
+      }
+    },
+    ...(hasQuoted && onScrollToMsg ? [{
+      icon: "⬆", label: "Lihat pesan dikutip",
+      action: () => onScrollToMsg(msg.quoted_id)
+    }] : []),
+  ]
+
   // ── [FIX-3] LAYOUT: msg-row structure ────────────────────────────────────
-  // Structure:
-  //   .msg-row.me   → flex-end, my messages on right
-  //   .msg-row.them → flex-start, their messages on left
-  //
-  //   Inside .msg-inner:
-  //     [mini-avatar] [bubble-wrap > .bubble]
-  //
-  // CRITICAL: No text nodes should ever appear between .msg-row children.
-  // All conditionals MUST use toBool() so 0 stays 0, not "0".
-
   return (
-    <div className={"msg-row" + (isMe ? " me" : " them")}>
-
-      {/* Sender name — group chats only, opponent only */}
-      {/* [FIX-3] was: {!isMe && msg.is_group && ...} → "0" text node */}
-      {!isMe && isGroup && msg.sender_name && (
-        <div className="msg-sender-name">{msg.sender_name}</div>
+    <div
+      ref={wrapRef}
+      className={`msg-row-wrap ${isMe ? "me" : "them"}${swiping ? " swiping" : ""}`}
+      style={{ position: "relative", display: "flex", alignItems: "center" }}
+      onTouchStart={onTouchStart}
+      onTouchMove={onTouchMove}
+      onTouchEnd={onTouchEnd}
+      onMouseDown={onMouseDown}
+      onMouseMove={onMouseMove}
+      onMouseUp={onMouseUp}
+      onMouseLeave={onMouseUp}
+    >
+      {/* Reply quick button — appears on hover */}
+      {!isReaction && (
+        <button
+          className="reply-btn"
+          title="Balas"
+          onMouseDown={(e) => { e.stopPropagation(); handleReply() }}
+        >
+          <ReplyIcon />
+        </button>
       )}
 
-      {/* Inner row: [avatar?] [bubble] */}
-      <div className={"msg-inner" + (isMe ? " me" : "")}>
+      {/* Context menu */}
+      {ctxMenu && (
+        <ContextMenu
+          x={ctxMenu.x}
+          y={ctxMenu.y}
+          items={ctxItems}
+          onClose={() => setCtxMenu(null)}
+        />
+      )}
 
-        {/* Group mini-avatar — opponent only */}
-        {/* [FIX-3] was: {msg.is_group && <div>} → rendered "0" */}
-        {!isMe && isGroup && (
-          <div className="msg-mini-avatar" style={{ background: "#1565c0", flexShrink: 0 }}>
-            {senderInitial}
-          </div>
+      <div
+        className={"msg-row" + (isMe ? " me" : " them") + (highlighted ? " highlighted" : "")}
+        onContextMenu={onContextMenu}
+        style={{ flex: 1, minWidth: 0 }}
+      >
+        {/* Sender name — group chats only, opponent only */}
+        {!isMe && isGroup && msg.sender_name && (
+          <div className="msg-sender-name">{msg.sender_name}</div>
         )}
 
-        {/* Bubble wrapper */}
-        <div className="bubble-wrap">
-          <div className={bubbleClass}>
+        {/* Inner row: [avatar?] [bubble] */}
+        <div className={"msg-inner" + (isMe ? " me" : "")}>
 
-            {/* Forward indicator */}
-            {isForwarded && <ForwardBadge score={msg.forwarding_score} />}
+          {/* Group mini-avatar — opponent only */}
+          {!isMe && isGroup && (
+            <div className="msg-mini-avatar" style={{ background: "#1565c0", flexShrink: 0 }}>
+              {senderInitial}
+            </div>
+          )}
 
-            {/* [FIX-2+FIX-4] Quoted/reply preview */}
-            {hasQuoted && (
-              <QuotedMsg
-                body={msg.quoted_body}
-                sender={msg.quoted_sender}
-                type={msg.quoted_type}
-                hasMedia={toBool(msg.quoted_has_media)}
-                mimetype={msg.quoted_mimetype}
-              />
-            )}
+          {/* Bubble wrapper */}
+          <div className="bubble-wrap">
+            <div className={bubbleClass}>
 
-            {/* Main message content */}
-            {content}
+              {/* Forward indicator */}
+              {isForwarded && <ForwardBadge score={msg.forwarding_score} />}
 
-            {/* Footer: timestamp + delivery ticks */}
-            {!isReaction && !isSticker && (
-              <div className={"bubble-footer" + (isMe ? " me" : "")}>
-                <BubbleTime ts={msg.timestamp} />
-                {isMe && <Ticks status={msg.status} />}
-              </div>
-            )}
+              {/* [FIX-2+FIX-4] Quoted/reply preview */}
+              {hasQuoted && (
+                <QuotedMsg
+                  body={msg.quoted_body}
+                  sender={msg.quoted_sender}
+                  type={msg.quoted_type}
+                  hasMedia={toBool(msg.quoted_has_media)}
+                  mimetype={msg.quoted_mimetype}
+                  onClick={() => onScrollToMsg && msg.quoted_id && onScrollToMsg(msg.quoted_id)}
+                  quotedFromMe={
+                    // quoted_sender is null when resolveQuotedSender detected own JID
+                    msg.quoted_sender === null && !!(msg.quoted_id || msg.quoted_body)
+                  }
+                />
+              )}
+
+              {/* Main message content */}
+              {content}
+
+              {/* Footer: timestamp + delivery ticks */}
+              {!isReaction && !isSticker && (
+                <div className={"bubble-footer" + (isMe ? " me" : "")}>
+                  <BubbleTime ts={msg.timestamp} />
+                  {isMe && <Ticks status={msg.status} />}
+                </div>
+              )}
+            </div>
+
+            {/* Emoji reactions overlay */}
+            {msg.reactions && <ReactionOverlay reactions={msg.reactions} />}
           </div>
-
-          {/* Emoji reactions overlay */}
-          {msg.reactions && <ReactionOverlay reactions={msg.reactions} />}
         </div>
       </div>
     </div>

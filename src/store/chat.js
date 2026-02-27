@@ -1,21 +1,52 @@
 // src/store/chat.js
 // ═══════════════════════════════════════════════════════════════════════════
-// PRODUCTION GRADE v3 — AuroraChat Chat Store
-//
-// FIXES:
-// [FIX-1] normalizeMsg() — SQLite 0/1 integers → proper types
-// [FIX-2] normalizeQuotedSender() — strip @s.whatsapp.net from JIDs,
-//         show display name instead of raw JID in reply preview
-// [FIX-3] Chat isolation — loadMessages() cancels stale requests via seq
-//         AND clears previous chat messages immediately on switch to prevent
-//         stale messages from prior chat bleeding into new chat view
-// [FIX-4] Auto-refresh — activeJid tracked in store, "db:chats:updated"
-//         event triggers reload of active chat messages automatically
-// [FIX-5] appendMessage dedup — also dedup by chat_jid to prevent
-//         cross-chat contamination from IPC events
+// PRODUCTION GRADE v4 — AuroraChat Chat Store
 // ═══════════════════════════════════════════════════════════════════════════
 
 import { create } from "zustand"
+import { useAuthStore } from "./auth"
+
+// Helper: get own JID from auth store without subscribing
+function getOwnJid() {
+  try { return useAuthStore.getState().connectedUser?.jid || null } catch { return null }
+}
+
+// ════════════════════════════════════════════════════════════
+// [FIX-DEDUP] Smart chat merge — prevents undefined/null from
+// overwriting existing values when IPC payload has partial fields.
+//
+// Problem: { ...existingChat, ...{ name: undefined, last_msg: 'hi' } }
+//           → name gets wiped to undefined even though existing had 'Budi'
+//
+// Rule: incoming value wins ONLY if it is not undefined.
+//       'name' and 'profile_pic_url' are additionally protected:
+//       they are NEVER overwritten by null — only a real string value wins.
+// ════════════════════════════════════════════════════════════
+function mergeChat(existing, incoming) {
+  const PROTECT_FROM_NULL = new Set(['name', 'profile_pic_url'])
+  const result = { ...existing }
+  for (const [k, v] of Object.entries(incoming)) {
+    if (v === undefined) continue                          // never overwrite with undefined
+    if (v === null && PROTECT_FROM_NULL.has(k)) continue  // protect name from null wipe
+    result[k] = v
+  }
+  return result
+}
+// Mirrors the server-side normalizeJid in messageParser.js.
+// Prevents store key mismatches when JIDs arrive from different
+// IPC events in different formats (@c.us, :device suffix, etc.)
+// ════════════════════════════════════════════════════════════
+function normalizeJid(jid) {
+  if (!jid || typeof jid !== "string") return ""
+  const atIdx = jid.lastIndexOf("@")
+  if (atIdx === -1) return jid
+  let user   = jid.slice(0, atIdx)
+  let server = jid.slice(atIdx + 1)
+  const colonIdx = user.indexOf(":")
+  if (colonIdx !== -1) user = user.slice(0, colonIdx)
+  if (server === "c.us") server = "s.whatsapp.net"
+  return `${user}@${server}`
+}
 
 // ════════════════════════════════════════════════════════════
 // HELPERS
@@ -24,24 +55,49 @@ import { create } from "zustand"
 // [FIX-2] Resolve a quoted sender: raw JID → human-readable name
 // DB stores quoted_sender as JID like "6285770017326@s.whatsapp.net"
 // We want to show just the number or contact name, not the raw JID.
-function resolveQuotedSender(sender, contacts) {
+// [FIX-LID] @lid JIDs must be resolved — they look like "175784908046590@lid"
+// [FIX-OWN] If sender JID matches our own JID, return null (caller shows "Kamu")
+function resolveQuotedSender(sender, contacts, ownJid) {
   if (!sender) return null
   // If it's already a name (no @), return as-is
   if (!sender.includes("@")) return sender
-  // Strip @domain
-  const number = sender.split("@")[0]
-  // Try to find in contacts store
-  if (contacts && contacts.length) {
-    const c = contacts.find(c => c.jid === sender || c.number === number || (c.jid || "").startsWith(number))
-    if (c) return c.name || c.push_name || `+${number}`
-  }
-  // Format number nicely: +628xxxx
-  if (/^\d{6,}$/.test(number)) return `+${number}`
-  return number
-}
 
+  const atIdx  = sender.lastIndexOf("@")
+  const user   = sender.slice(0, atIdx)
+  const server = sender.slice(atIdx + 1)
+
+  // [FIX-LID] @lid JIDs are opaque device identifiers — not meaningful to show
+  // Try to resolve via contacts, otherwise show as unknown number
+  const isLid = server === "lid"
+
+  // [FIX-OWN] Check if this is our own JID
+  if (ownJid) {
+    const ownUser = ownJid.split("@")[0].split(":")[0]
+    const senderUser = user.split(":")[0]
+    if (ownUser === senderUser) return null // caller renders "Kamu"
+  }
+
+  // Try to find in contacts store — also try to match @lid via number
+  if (contacts && contacts.length) {
+    const cleanUser = user.split(":")[0]
+    const c = contacts.find(c => {
+      if (!c.jid) return false
+      const cUser = c.jid.split("@")[0].split(":")[0]
+      return cUser === cleanUser || c.number === cleanUser
+    })
+    if (c) return c.name || c.push_name || `+${cleanUser}`
+  }
+
+  // @lid with no contact match — show as unknown
+  if (isLid) return null
+
+  // Format number nicely: +628xxxx
+  const cleanUser = user.split(":")[0]
+  if (/^\d{6,}$/.test(cleanUser)) return `+${cleanUser}`
+  return cleanUser
+}
 // [FIX-1] Normalize a DB row message — SQLite integers → JS types
-function normalizeMsg(m, contacts) {
+function normalizeMsg(m, contacts, ownJid) {
   if (!m) return m
   return {
     ...m,
@@ -58,7 +114,8 @@ function normalizeMsg(m, contacts) {
     // Normalize media path
     media_saved_path: normalizeMediaPath(m.media_saved_path),
     // [FIX-2] Resolve quoted sender JID → display name
-    quoted_sender: resolveQuotedSender(m.quoted_sender, contacts),
+    // [FIX-OWN] Pass ownJid so we can detect "Kamu" (own message quoted)
+    quoted_sender: resolveQuotedSender(m.quoted_sender, contacts, ownJid),
     // Parse JSON fields that may be strings from DB
     poll_options:   parseJson(m.poll_options, null),
     contacts_json:  parseJson(m.contacts_json, null),
@@ -72,11 +129,14 @@ function parseJson(v, fallback) {
   try { return JSON.parse(v) } catch { return fallback }
 }
 
+// ── normalizeMediaPath ────────────────────────────────────────────────────────
+// IMPORTANT: Store raw paths as-is from SQLite. Do NOT convert to file:// here.
+// Conversion to file:// URL happens exactly once in MessageBubble.pathToFileUrl()
+// which correctly handles Windows drive letters, Unix paths, and already-encoded URLs.
+// Pre-converting here caused D: → D%3A corruption on Windows.
 function normalizeMediaPath(p) {
   if (!p) return null
-  if (p.startsWith("file://")) return p
-  const forward = p.replace(/\\/g, "/")
-  return `file://${forward.startsWith("/") ? "" : "/"}${forward}`
+  return p  // pass through raw — MessageBubble.pathToFileUrl handles conversion
 }
 
 // ════════════════════════════════════════════════════════════
@@ -126,10 +186,32 @@ export const useChatStore = create((set, get) => ({
     try {
       const result = await window.api?.dbChats?.({ limit: 100, offset: 0 })
       if (result?.ok) {
-        const data        = result.data || []
-        const allChats    = data.filter(c => !c.is_community)
+        const raw = result.data || []
+
+        // [FIX-DEDUP] Deduplicate by jid before storing.
+        // The DB query should never return duplicates (jid is PRIMARY KEY),
+        // but defend against any gap in the migration window or future schema changes.
+        // When duplicate jids appear, keep the one with the most recent timestamp.
+        const byJid = {}
+        for (const c of raw) {
+          let jid = normalizeJid(c.jid)
+          // [FIX-LID] Jika JID masih @lid, strip ke format angka saja agar
+          // tidak double dengan entry @s.whatsapp.net dari kontak yang sama.
+          // Kita TIDAK bisa resolve @lid di sini tanpa lidMap, jadi kita
+          // simpan apa adanya tapi pastikan tidak ada duplikat string berbeda.
+          if (!jid) continue
+          const norm = { ...c, jid }
+          const prev = byJid[jid]
+          if (!prev || (norm.last_msg_at || 0) >= (prev.last_msg_at || 0)) {
+            byJid[jid] = prev ? mergeChat(prev, norm) : norm
+          }
+        }
+        const allChats    = Object.values(byJid)
+          .filter(c => !c.is_community)
+          .map(c => ({ ...c, from_me: c.from_me != null ? Number(c.from_me) : 0 }))
         const groups      = allChats.filter(c => c.is_group)
-        const communities = data.filter(c => c.is_community)
+        const communities = Object.values(byJid).filter(c => c.is_community)
+
         set({
           chats:            allChats,
           chatsTotal:       result.total || allChats.length,
@@ -160,16 +242,26 @@ export const useChatStore = create((set, get) => ({
   },
 
   upsertChat: (chat) => set((s) => {
-    const idx = s.chats.findIndex(c => c.jid === chat.jid)
+    // [FIX-SPLIT-CHAT] Normalize JID before any store operation
+    const normalJid = normalizeJid(chat.jid)
+    if (!normalJid) return s
+    const normalizedChat = { ...chat, jid: normalJid }
+
+    const idx = s.chats.findIndex(c => c.jid === normalJid)
     let newChats
     if (idx >= 0) {
       newChats = [...s.chats]
-      newChats[idx] = { ...newChats[idx], ...chat }
+      // [FIX-DEDUP] Use mergeChat — never let undefined/null wipe existing name or pic.
+      // Raw spread ({ ...old, ...new }) would set name=undefined if IPC payload
+      // omits the name field, erasing the contact name from the chat list.
+      newChats[idx] = mergeChat(newChats[idx], normalizedChat)
     } else {
-      newChats = [chat, ...s.chats]
+      newChats = [normalizedChat, ...s.chats]
     }
+    // [FIX-SORT] Pinned always first, then by timestamp (check both field names)
+    const getTs = c => c.last_msg_at || c.last_message_timestamp || 0
     newChats = newChats.sort(
-      (a, b) => (b.pinned - a.pinned) || (b.last_msg_at - a.last_msg_at)
+      (a, b) => (b.pinned - a.pinned) || (getTs(b) - getTs(a))
     )
     return { chats: newChats, groups: newChats.filter(c => c.is_group) }
   }),
@@ -179,37 +271,37 @@ export const useChatStore = create((set, get) => ({
   // ════════════════════════════════════════════════════════════
 
   // [FIX-4] Set active JID — called by ChatWindow on mount
-  setActiveJid: (jid) => set({ activeJid: jid }),
+  setActiveJid: (jid) => set({ activeJid: normalizeJid(jid) }),
 
   loadMessages: async (jid, limit = 50, offset = 0) => {
     if (!jid) return []
+    // [FIX-SPLIT-CHAT] Normalize before using as store key and IPC arg
+    const cleanJid = normalizeJid(jid)
 
     // [FIX-3] Increment sequence — any prior in-flight request for this JID
     // will see seq mismatch and discard its result (prevents chat mismatch)
-    const seq = (get()._seq[jid] || 0) + 1
+    const seq = (get()._seq[cleanJid] || 0) + 1
     set(s => ({
-      _seq:            { ...s._seq, [jid]: seq },
+      _seq:            { ...s._seq, [cleanJid]: seq },
       messagesLoading: true,
-      // [FIX-3] Clear immediately so stale messages don't show while loading
-      messages:        { ...s.messages, [jid]: [] },
+      messages:        { ...s.messages, [cleanJid]: [] },
     }))
 
     try {
-      const result = await window.api?.dbMessages?.({ jid, limit, offset })
+      const result = await window.api?.dbMessages?.({ jid: cleanJid, limit, offset })
 
-      // [FIX-3] Stale — another loadMessages() was called for same JID
-      if (get()._seq[jid] !== seq) {
-        console.log(`[AuroraChat] loadMessages stale for ${jid}, discarding`)
+      if (get()._seq[cleanJid] !== seq) {
+        console.log(`[AuroraChat] loadMessages stale for ${cleanJid}, discarding`)
         return []
       }
 
       if (result?.ok) {
         const contacts = get().contacts
-        // Reverse: DB returns newest first, we want oldest first
-        const msgs = (result.data || []).slice().reverse().map(m => normalizeMsg(m, contacts))
+        const ownJid = getOwnJid()
+        const msgs = (result.data || []).slice().reverse().map(m => normalizeMsg(m, contacts, ownJid))
 
         set(s => ({
-          messages:        { ...s.messages, [jid]: msgs },
+          messages:        { ...s.messages, [cleanJid]: msgs },
           messagesLoading: false,
         }))
         return msgs
@@ -218,7 +310,7 @@ export const useChatStore = create((set, get) => ({
       console.error("[AuroraChat] loadMessages error:", err)
     }
 
-    if (get()._seq[jid] === seq) set({ messagesLoading: false })
+    if (get()._seq[cleanJid] === seq) set({ messagesLoading: false })
     return []
   },
 
@@ -235,7 +327,8 @@ export const useChatStore = create((set, get) => ({
       // Check we're still on the same chat
       if (get().activeJid !== activeJid) return
 
-      const msgs = (result.data || []).slice().reverse().map(m => normalizeMsg(m, contacts))
+      const ownJid = getOwnJid()
+        const msgs = (result.data || []).slice().reverse().map(m => normalizeMsg(m, contacts, ownJid))
       const existing = get().messages[activeJid] || []
 
       // Smart merge: only update if we got MORE messages or content changed
@@ -249,16 +342,22 @@ export const useChatStore = create((set, get) => ({
     }
   },
 
-  setMessages: (jid, msgs) => set(s => ({
-    messages: { ...s.messages, [jid]: msgs }
-  })),
+  setMessages: (jid, msgs) => set(s => {
+    const cleanJid = normalizeJid(jid)
+    if (!cleanJid) return s
+    return { messages: { ...s.messages, [cleanJid]: msgs } }
+  }),
 
   // [FIX-5] appendMessage — normalized + cross-chat dedup guard
   appendMessage: (jid, msg) => set((s) => {
-    // Guard: don't append to wrong chat
-    if (msg.chat_jid && msg.chat_jid !== jid) return s
+    // [FIX-SPLIT-CHAT] Normalize store key — IPC may deliver different JID forms
+    const cleanJid = normalizeJid(jid)
+    if (!cleanJid) return s
 
-    const existing = s.messages[jid] || []
+    // Guard: don't append to wrong chat
+    if (msg.chat_jid && normalizeJid(msg.chat_jid) !== cleanJid) return s
+
+    const existing = s.messages[cleanJid] || []
     // Dedup by message ID
     if (existing.some(m => m.id === msg.id)) return s
 
@@ -266,7 +365,7 @@ export const useChatStore = create((set, get) => ({
     return {
       messages: {
         ...s.messages,
-        [jid]: [...existing, normalizeMsg(msg, contacts)],
+        [cleanJid]: [...existing, normalizeMsg(msg, contacts, getOwnJid())],
       }
     }
   }),
@@ -275,13 +374,15 @@ export const useChatStore = create((set, get) => ({
 
   // Update media_saved_path after download completes
   updateMessageMedia: ({ id, chat_jid, media_saved_path }) => set(s => {
-    const msgs = s.messages[chat_jid]
+    const cleanJid = normalizeJid(chat_jid)
+    if (!cleanJid) return s
+    const msgs = s.messages[cleanJid]
     if (!msgs) return s
     const idx = msgs.findIndex(m => m.id === id)
     if (idx < 0) return s
     const updated = [...msgs]
     updated[idx] = { ...updated[idx], media_saved_path: normalizeMediaPath(media_saved_path) }
-    return { messages: { ...s.messages, [chat_jid]: updated } }
+    return { messages: { ...s.messages, [cleanJid]: updated } }
   }),
 
   // ── Contact actions ─────────────────────────────────────────────────────

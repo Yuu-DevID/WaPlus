@@ -16,7 +16,7 @@
 // [FIX-6]  Group icon on avatar for group chats.
 // ═══════════════════════════════════════════════════════════════════════════
 
-import { useState, useEffect, memo } from "react"
+import { useState, useEffect, useRef, memo } from "react"
 import { format, isToday, isYesterday } from "date-fns"
 
 // ─── Colors for avatar background ────────────────────────────────────────────
@@ -36,13 +36,16 @@ function seedColor(s) {
 }
 
 // [FIX-4] Build initials from DISPLAY NAME — never from JID
-// "Budi Santoso" → "BS"
-// "+628 577-0017-3260" → "BS" (can't do, so use icon instead)
-// "Grup Keluarga" → "GK"
+// "Budi Santoso"   → "BS"
+// "+6285770017326" → "73"  (last 2 digits — lebih unik tiap kontak)
+// "Grup Keluarga"  → "GK"
 function buildInitials(name) {
   if (!name) return "?"
-  // If name looks like a phone number, use 📱 icon
-  if (/^\+?[\d\s\-().]+$/.test(name.trim())) return "📱"
+  // Jika nama adalah nomor telepon → pakai 2 digit terakhir
+  const stripped = name.replace(/[\s\-+().]/g, "")
+  if (/^\d{6,}$/.test(stripped)) {
+    return stripped.slice(-2)
+  }
   const words = name.trim().split(/\s+/)
   if (words.length === 1) return words[0].slice(0, 2).toUpperCase()
   return (words[0][0] + words[1][0]).toUpperCase()
@@ -98,7 +101,7 @@ const ChatAvatar = memo(function ChatAvatar({ jid, name, isGroup, size = 46 }) {
         alignItems:      "center",
         justifyContent:  "center",
         overflow:        "hidden",
-        fontSize:        initials === "📱" ? 20 : Math.round(size * 0.35),
+        fontSize:        Math.round(size * 0.35),
         fontWeight:      700,
         color:           "#fff",
         position:        "relative",
@@ -182,20 +185,38 @@ function PreviewText({ chat }) {
 // MAIN COMPONENT
 // ════════════════════════════════════════════════════════════
 
-const ChatItem = memo(function ChatItem({ chat, isActive, onClick }) {
+const ChatItem = memo(function ChatItem({ chat, isActive, onClick, observe, unobserve }) {
   const jid     = chat.jid     || ""
   const isGroup = !!(chat.is_group)
   const isMuted = chat.muted_until > (Date.now() / 1000)
 
+  // [PREFETCH] Register this DOM node with the parent's IntersectionObserver
+  const itemRef = useRef(null)
+  useEffect(() => {
+    const el = itemRef.current
+    if (!el || !observe) return
+    observe(el)
+    return () => unobserve?.(el)
+  }, [jid, observe, unobserve])
+
   // [FIX-1] chat.name is already resolved by store normalizeChat().
-  // Final safety: if it still contains "@", it's a raw JID — strip to phone.
+  // Final safety: handle @lid, @s.whatsapp.net, raw JID, and unsaved contacts.
   let displayName = chat.name || ""
   if (!displayName || displayName.includes("@")) {
-    const num = jid.split("@")[0]
-    if (/^\d{6,}$/.test(num)) {
-      displayName = `+${num}`
+    const atIdx = jid.lastIndexOf("@")
+    const server = atIdx !== -1 ? jid.slice(atIdx + 1) : ""
+    const user   = atIdx !== -1 ? jid.slice(0, atIdx) : jid
+    const cleanUser = user.split(":")[0]
+    if (server === "g.us" || server === "newsletter") {
+      // Group/newsletter: pakai name dari DB atau fallback
+      displayName = chat.subject || cleanUser || "Grup"
+    } else if (server === "lid") {
+      // @lid belum ter-resolve → tampilkan sebagai nomor saja tanpa "@lid"
+      displayName = /^\d{6,}$/.test(cleanUser) ? `+${cleanUser}` : cleanUser || "Unknown"
+    } else if (/^\d{6,}$/.test(cleanUser)) {
+      displayName = `+${cleanUser}`
     } else {
-      displayName = num || "Unknown"
+      displayName = cleanUser || "Unknown"
     }
   }
 
@@ -204,6 +225,8 @@ const ChatItem = memo(function ChatItem({ chat, isActive, onClick }) {
 
   return (
     <div
+      ref={itemRef}
+      data-jid={jid}
       className={`chat-item${isActive ? " active" : ""}`}
       onClick={() => onClick?.(jid)}
       style={{
