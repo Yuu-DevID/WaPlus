@@ -98,19 +98,10 @@ export default function Main() {
     window.api.onContactsUpdated?.(() => loadContacts())
 
     // New messages — append immediately for real-time feel
+    // payload is buildRendererPayload output — fields: chat_jid, from_me, body, msg_type, etc.
     window.api.onMessagesNew?.((payload) => {
-      if (!payload?.jid) return
-      appendMessage(payload.jid, {
-        id:        payload.key?.id || Date.now().toString(),
-        chat_jid:  payload.jid,
-        body:      payload.body || "",
-        msg_type:  payload.msgType || "conversation",
-        timestamp: payload.timestamp || Math.floor(Date.now()/1000),
-        from_me:   payload.isMe ? 1 : 0,
-        status:    payload.isMe ? 1 : 0,
-        is_group:  payload.jid.endsWith("@g.us") ? 1 : 0,
-        sender_name: payload.senderName || "",
-      })
+      if (!payload?.chat_jid) return
+      appendMessage(payload.chat_jid, payload)
       loadChats()
     })
 

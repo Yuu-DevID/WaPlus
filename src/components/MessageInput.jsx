@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback } from "react"
+import { useState, useRef, useCallback, useEffect } from "react"
 import { useChatStore } from "../store/chat"
 
 const EmojiIcon = () => (
@@ -25,12 +25,61 @@ const SendIcon = () => (
   </svg>
 )
 
-export default function MessageInput({ chatJid }) {
+// ─── Reply preview bar ────────────────────────────────────────────────────────────────────────────────
+function ReplyPreviewBar({ replyTo, onCancel, chatName }) {
+  if (!replyTo) return null
+
+  const isMe = replyTo.from_me === 1 || replyTo.from_me === true
+  // [FIX-OWN] For own messages: always "Kamu"
+  // For others in DM: use chatName (the contact's display name from header)
+  // For others in group: use sender_name (group member name)
+  const isGroup = replyTo.is_group === 1 || replyTo.is_group === true
+  const senderName = isMe
+    ? "Kamu"
+    : (isGroup
+        ? (replyTo.sender_name || chatName || "Anggota")
+        : (chatName || replyTo.sender_name || "Mereka"))
+
+  const getPreviewText = () => {
+    const t = replyTo.msg_type
+    if (t === "imageMessage")  return "\u{1F4F7} Foto"
+    if (t === "videoMessage")  return "\u{1F3AC} Video"
+    if (t === "audioMessage" || t === "pttMessage") return "\u{1F3B5} Audio"
+    if (t === "stickerMessage") return "\u{1F3AD} Stiker"
+    if (t === "documentMessage") return "\u{1F4C4} " + (replyTo.media_filename || "Dokumen")
+    return replyTo.body || "Pesan"
+  }
+
+  return (
+    <div className="reply-preview-bar">
+      <span className="reply-preview-icon">\u21A9</span>
+      <div className="reply-preview-content">
+        <div className="reply-preview-name">{senderName}</div>
+        <div className="reply-preview-text">{getPreviewText()}</div>
+      </div>
+      <button className="reply-preview-close" onClick={onCancel} title="Batalkan balasan">\u00D7</button>
+    </div>
+  )
+}
+
+export default function MessageInput({ chatJid, chatName, replyTo, onCancelReply }) {
   const [text, setText] = useState("")
   const [sending, setSending] = useState(false)
   const ref = useRef(null)
   const { appendMessage } = useChatStore()
   const hasText = text.trim().length > 0
+
+  useEffect(() => {
+    if (replyTo) ref.current?.focus()
+  }, [replyTo])
+
+  useEffect(() => {
+    const handler = (e) => {
+      if (e.key === "Escape" && replyTo) onCancelReply?.()
+    }
+    document.addEventListener("keydown", handler)
+    return () => document.removeEventListener("keydown", handler)
+  }, [replyTo, onCancelReply])
 
   const handleChange = (e) => {
     setText(e.target.value)
@@ -43,25 +92,26 @@ export default function MessageInput({ chatJid }) {
     const body = text.trim()
     if (!body || sending) return
 
+    const quotedMsg = replyTo || null
+
     setText("")
     if (ref.current) ref.current.style.height = "42px"
     setSending(true)
+    onCancelReply?.()
 
     try {
       if (window.api?.sendMessage) {
-        // sendMessage returns WAMessage dari Baileys
-        // ID ada di result.key.id — ini SAMA dengan yang di-emit lewat messages:new
-        const res = await window.api.sendMessage({ jid: chatJid, body })
+        const res = await window.api.sendMessage({
+          jid: chatJid,
+          body,
+          quotedMsgId: quotedMsg?.id || null,
+        })
 
         if (res?.ok) {
-          // Baileys result bisa berupa WAMessage langsung atau { key, ... }
-          const msgId = res.message?.key?.id   // WAMessage key.id
-            ?? res.message?.id                  // shortcut dari main.js
-            ?? `local-${Date.now()}`
+          const msgId = res.message?.key?.id
+            ?? res.message?.id
+            ?? "local-" + Date.now()
 
-          // Append dengan ID yang benar.
-          // Saat messages:new datang dari client.js (emitOwnEvents:true),
-          // appendMessage() di chat.js akan skip karena ID sudah ada (dedup).
           appendMessage(chatJid, {
             id: msgId,
             chat_jid: chatJid,
@@ -70,20 +120,27 @@ export default function MessageInput({ chatJid }) {
             timestamp: Math.floor(Date.now() / 1000),
             from_me: 1,
             status: 1,
+            quoted_id:     quotedMsg?.id || null,
+            quoted_body:   quotedMsg?.body || null,
+            quoted_sender: quotedMsg?.sender_name || quotedMsg?.sender_jid || null,
+            quoted_type:   quotedMsg?.msg_type || null,
+            quoted_has_media: quotedMsg?.has_media || 0,
           })
         }
-        // Jika !res.ok → pesan gagal dikirim, jangan append
-
       } else {
-        // Dev mode / no api
         appendMessage(chatJid, {
-          id: `dev-${Date.now()}`,
+          id: "dev-" + Date.now(),
           chat_jid: chatJid,
           body,
           msg_type: "conversation",
           timestamp: Math.floor(Date.now() / 1000),
           from_me: 1,
           status: 1,
+          quoted_id:     quotedMsg?.id || null,
+          quoted_body:   quotedMsg?.body || null,
+          quoted_sender: quotedMsg?.sender_name || quotedMsg?.sender_jid || null,
+          quoted_type:   quotedMsg?.msg_type || null,
+          quoted_has_media: quotedMsg?.has_media || 0,
         })
       }
     } catch(e) {
@@ -92,29 +149,32 @@ export default function MessageInput({ chatJid }) {
       setSending(false)
       ref.current?.focus()
     }
-  }, [text, chatJid, sending])
+  }, [text, chatJid, sending, replyTo, onCancelReply])
 
   return (
-    <div className="input-area">
-      <button className="input-action-btn" title="Emoji"><EmojiIcon/></button>
-      <button className="input-action-btn" title="Lampiran"><AttachIcon/></button>
-      <textarea
-        ref={ref}
-        className="msg-textarea"
-        rows={1}
-        value={text}
-        onChange={handleChange}
-        onKeyDown={e => { if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();send()} }}
-        placeholder="Ketik pesan..."
-        disabled={sending}
-      />
-      {hasText ? (
-        <button className="send-btn" onClick={send} disabled={sending} title="Kirim">
-          {sending ? <span className="spinner spinner-black spinner-sm"/> : <SendIcon/>}
-        </button>
-      ) : (
-        <button className="input-action-btn" title="Rekam Suara"><MicIcon/></button>
-      )}
+    <div className="input-area-wrap">
+      <ReplyPreviewBar replyTo={replyTo} onCancel={onCancelReply} chatName={chatName} />
+      <div className="input-area">
+        <button className="input-action-btn" title="Emoji"><EmojiIcon/></button>
+        <button className="input-action-btn" title="Lampiran"><AttachIcon/></button>
+        <textarea
+          ref={ref}
+          className="msg-textarea"
+          rows={1}
+          value={text}
+          onChange={handleChange}
+          onKeyDown={e => { if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();send()} }}
+          placeholder={replyTo ? "Ketik balasan..." : "Ketik pesan..."}
+          disabled={sending}
+        />
+        {hasText ? (
+          <button className="send-btn" onClick={send} disabled={sending} title="Kirim">
+            {sending ? <span className="spinner spinner-black spinner-sm"/> : <SendIcon/>}
+          </button>
+        ) : (
+          <button className="input-action-btn" title="Rekam Suara"><MicIcon/></button>
+        )}
+      </div>
     </div>
   )
 }

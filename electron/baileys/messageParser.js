@@ -18,6 +18,145 @@
 const { getContentType, jidNormalizedUser, isJidGroup } = require("baileys")
 
 // ════════════════════════════════════════════════════════════
+// JID NORMALIZATION — single gate for ALL JIDs entering the system
+// ════════════════════════════════════════════════════════════
+
+/**
+ * normalizeJid — canonical JID form used throughout DB and store.
+ *
+ * Handles every variant WhatsApp/Baileys can produce:
+ *   @c.us        → @s.whatsapp.net   (legacy format from old history sync)
+ *   :device      → stripped           (multi-device suffix, e.g. 628xxx:5@s.whatsapp.net)
+ *   @lid         → kept as-is        (WhatsApp new Linked Identity — DO NOT convert here,
+ *                                     use resolveLid() with a contacts map instead)
+ *   @g.us        → kept as-is        (groups must not be changed)
+ *   @newsletter  → kept as-is        (communities)
+ *   null/""      → ""                (safe fallback)
+ *
+ * This function MUST be called on every JID before it touches the DB.
+ * One normalization gate = zero split-chat bugs.
+ */
+function normalizeJid(jid) {
+  if (!jid || typeof jid !== "string") return ""
+
+  // Split into user part and server part
+  const atIdx = jid.lastIndexOf("@")
+  if (atIdx === -1) return jid // no @ — return as-is (shouldn't happen)
+
+  let user   = jid.slice(0, atIdx)
+  let server = jid.slice(atIdx + 1)
+
+  // 1. Strip multi-device suffix from user part (e.g. "6281234:5" → "6281234")
+  const colonIdx = user.indexOf(":")
+  if (colonIdx !== -1) user = user.slice(0, colonIdx)
+
+  // 2. Normalize legacy @c.us → @s.whatsapp.net
+  if (server === "c.us") server = "s.whatsapp.net"
+
+  // 3. @lid stays as-is — use resolveLid() to get real JID when contacts map available
+  return `${user}@${server}`
+}
+
+/**
+ * isLidJid — returns true if this is a WhatsApp Linked Identity JID.
+ * @lid JIDs are used by WA for privacy — they map to real phone JIDs
+ * only via the contacts/lid store Baileys provides.
+ */
+function isLidJid(jid) {
+  return typeof jid === "string" && jid.endsWith("@lid")
+}
+
+/**
+ * resolveLid — try to resolve a @lid JID to a real @s.whatsapp.net JID.
+ *
+ * @param {string} lidJid   - e.g. "12345678901234567@lid"
+ * @param {object} lidMap   - Map<lid_user_string, real_jid_string> built from
+ *                            Baileys contacts where contact.lid is present.
+ *                            Pass null / undefined to skip resolution.
+ * @returns {string}        - Resolved JID or original lidJid if not found.
+ */
+function resolveLid(lidJid, lidMap) {
+  if (!lidJid || !lidMap) return lidJid || ""
+  const user = lidJid.split("@")[0]
+  // Try multiple key forms: numeric user part, full @lid JID
+  return lidMap.get(user) || lidMap.get(lidJid) || lidJid
+}
+
+/**
+ * tryResolveLid — resolve @lid if possible, return original if not in map.
+ * Safe no-op when lidMap is empty or doesn't contain this JID.
+ */
+function tryResolveLid(jid, lidMap) {
+  if (!isLidJid(jid)) return jid
+  if (!lidMap || lidMap.size === 0) return jid
+  const resolved = resolveLid(jid, lidMap)
+  return resolved !== jid ? resolved : jid
+}
+
+/**
+ * buildLidMap — build a lid → real JID lookup map from Baileys contacts array.
+ *
+ * Baileys contacts can have a `lid` field: { id: "628xxx@s.whatsapp.net", lid: "123@lid" }
+ * We build a reverse map so we can resolve @lid → @s.whatsapp.net at parse time.
+ *
+ * Call this once when contacts are received and pass the result as `opts.lidMap`
+ * to parseMessage().
+ *
+ * @param {Array} contacts - Array of Baileys contact objects
+ * @returns {Map<string, string>} lid_user → real_jid
+ */
+function buildLidMap(contacts) {
+  const map = new Map()
+  if (!Array.isArray(contacts)) return map
+  for (const c of contacts) {
+    if (!c.id) continue
+    const realJid = normalizeJid(c.id)
+    if (!realJid) continue
+
+    if (c.lid) {
+      const lid = c.lid.split("@")[0]
+      if (lid) {
+        map.set(lid, realJid)
+        map.set(c.lid, realJid) // also map full JID form
+      }
+    }
+
+    // Also map phone number → realJid as secondary lookup key
+    // so contacts arriving without .lid but with phone can be cross-matched
+    const phone = realJid.split("@")[0]
+    if (phone && /^\d+$/.test(phone)) {
+      map.set(`phone:${phone}`, realJid)
+    }
+  }
+  return map
+}
+
+/**
+ * formatJidAsPhone — convert a JID or @lid to a human-readable phone number.
+ *
+ * Examples:
+ *   "6281234567890@s.whatsapp.net" → "+62 812-3456-7890"
+ *   "628xxx@lid"                   → "+628xxx (lid)"   ← fallback when unresolved
+ *   "120363xxx@g.us"               → null              ← groups: return null
+ */
+function formatJidAsPhone(jid) {
+  if (!jid) return null
+  const [user, server] = jid.split("@")
+  if (!user) return null
+  if (server === "g.us" || server === "newsletter") return null // groups/newsletters
+
+  // If still @lid and unresolved, show something readable
+  if (server === "lid") return `+${user}`
+
+  // Pure digits → format as phone with leading +
+  if (/^\d+$/.test(user)) return `+${user}`
+
+  return user
+}
+
+// normalizeJid is exported at the bottom with all other exports
+
+// ════════════════════════════════════════════════════════════
 // TYPE DETECTION
 // ════════════════════════════════════════════════════════════
 
@@ -421,8 +560,12 @@ function extractMediaInfo(message, msgType) {
 /**
  * Extract quoted/reply message dari contextInfo.
  * Terinspirasi dari pattern quoted di case.js (baris 74-75).
+ *
+ * @param {object} message  - Raw WA message object
+ * @param {string} msgType  - Normalized message type
+ * @param {Map}    lidMap   - Optional lid → real JID map for resolving @lid senders
  */
-function extractQuoted(message, msgType) {
+function extractQuoted(message, msgType, lidMap) {
   if (!message) return null
 
   const m = message.ephemeralMessage?.message
@@ -455,10 +598,18 @@ function extractQuoted(message, msgType) {
   const qMsgTypeNorm = normalizeMsgType(qType)
   const qBody = extractBody(qMsg, qMsgTypeNorm)
 
-  // Sender quoted
-  const qSender = contextInfo.participant
+  // Sender quoted — normalize JID and resolve @lid
+  let qSender = contextInfo.participant
     || contextInfo.remoteJid
     || null
+
+  if (qSender) {
+    qSender = normalizeJid(qSender)
+    // Resolve @lid → real @s.whatsapp.net JID using lidMap
+    if (isLidJid(qSender) && lidMap) {
+      qSender = resolveLid(qSender, lidMap)
+    }
+  }
 
   return {
     id: contextInfo.stanzaId || null,
@@ -619,24 +770,45 @@ function extractForwardInfo(message, msgType) {
  *
  * @param {object} msg - WAMessage dari Baileys (msg.message harus ada)
  * @param {object} opts - Opsi tambahan
- * @param {string} opts.jid - Chat JID (override dari msg.key.remoteJid)
- * @param {string} opts.pushname - Display name pengirim
+ * @param {string}  opts.jid          - Chat JID (override dari msg.key.remoteJid)
+ * @param {string}  opts.pushname     - Display name pengirim
  * @param {boolean} opts.isHistorySync - Dari history sync atau live
- * @param {string} opts.myJid - JID kita sendiri
+ * @param {string}  opts.myJid        - JID kita sendiri
+ * @param {Map}     opts.lidMap       - lid → real JID map dari buildLidMap(contacts).
+ *                                      Wajib diisi agar @lid tidak bocor ke DB/renderer.
  * @returns {ParsedMessage|null}
  */
 function parseMessage(msg, opts = {}) {
   if (!msg?.message) return null
 
   const key = msg.key || {}
-  const jid = opts.jid || key.remoteJid || ""
-  const isGroup = isJidGroup(jid)
-  const isMe = !!key.fromMe
+  const lidMap = opts.lidMap || null
 
-  // Sender JID
-  const sender = isMe
-    ? jidNormalizedUser(opts.myJid || jid)
-    : jidNormalizedUser(key.participant || jid)
+  // ── [FIX-SPLIT-CHAT] Normalize chat JID at entry — single gate ──────────
+  // raw remoteJid can be @c.us (legacy) or have :device suffix (multi-device)
+  // Both create duplicate chat rows in DB → split chat bug
+  let jid = normalizeJid(opts.jid || key.remoteJid || "")
+
+  // ── [FIX-LID] Resolve @lid chat JID → real @s.whatsapp.net / @g.us ──────
+  // WA uses @lid for privacy in some cases. We resolve eagerly here so the
+  // rest of the system never sees @lid in chat_jid / sender_jid fields.
+  if (isLidJid(jid) && lidMap) {
+    jid = resolveLid(jid, lidMap)
+  }
+
+  const isGroup = isJidGroup(jid)
+  const isMe    = !!key.fromMe
+
+  // Sender JID — also normalized and lid-resolved
+  // For groups fromMe: participant may be undefined → fall back to myJid
+  // For DMs fromMe: sender = our own JID (normalized, device suffix stripped)
+  const rawSender = isMe
+    ? (opts.myJid || key.remoteJid || jid)
+    : (key.participant || jid)
+  let sender = normalizeJid(rawSender)
+  if (isLidJid(sender) && lidMap) {
+    sender = resolveLid(sender, lidMap)
+  }
 
   // ── Unwrap ephemeral dulu ──────────────────────────────
   let rawMessage = msg.message
@@ -656,7 +828,7 @@ function parseMessage(msg, opts = {}) {
   // ── Extract semua info ─────────────────────────────────
   const body = extractBody(rawMessage, msgType)
   const mediaInfo = extractMediaInfo(rawMessage, msgType)
-  const quoted = extractQuoted(rawMessage, msgType)
+  const quoted = extractQuoted(rawMessage, msgType, lidMap)
   const mentions = extractMentions(rawMessage, msgType)
   const pollOptions = msgType === "pollCreationMessage"
     ? extractPollOptions(rawMessage)
@@ -862,6 +1034,14 @@ module.exports = {
   parseMessage,
   buildRendererPayload,
   dbRowToRendererMsg,
+  normalizeJid,        // [FIX-SPLIT-CHAT] exported for use in database.js and client.js
+
+  // [FIX-LID] WhatsApp Linked Identity resolution
+  isLidJid,
+  resolveLid,
+  tryResolveLid,
+  buildLidMap,
+  formatJidAsPhone,
 
   // Utils yang mungkin dibutuhkan di tempat lain
   getRealContentType,

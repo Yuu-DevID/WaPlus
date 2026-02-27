@@ -99,11 +99,16 @@ contextBridge.exposeInMainWorld("api", {
   // Renderer listen ini untuk update image bubble secara realtime
   onMediaUpdated: createListener("media:updated"),
 
+  // [PREFETCH] Trigger background media download for a chat (fire-and-forget)
+  // Call this when a chat scrolls into view or is clicked.
+  mediaPrefetch: ({ jid, limit = 20 }) =>
+    ipcRenderer.invoke("media:prefetch", { jid, limit }),
+
   // ═══════════════════════════════════════════════════════════
   // MESSAGING
   // ═══════════════════════════════════════════════════════════
-  sendMessage: ({ jid, body, type = "text", mediaPath = null }) =>
-    ipcRenderer.invoke("msg:send", { jid, body, type, mediaPath }),
+  sendMessage: ({ jid, body, type = "text", mediaPath = null, quotedMsgId = null }) =>
+    ipcRenderer.invoke("msg:send", { jid, body, type, mediaPath, quotedMsgId }),
 
   // ═══════════════════════════════════════════════════════════
   // PRESENCE
@@ -114,6 +119,13 @@ contextBridge.exposeInMainWorld("api", {
   // PROFILE
   // ═══════════════════════════════════════════════════════════
   getProfilePic: ({ jid }) => ipcRenderer.invoke("profile:get-pic", { jid }),
+
+  // ═══════════════════════════════════════════════════════════
+  // FILESYSTEM
+  // ═══════════════════════════════════════════════════════════
+  // Check if a media file actually exists on disk (raw path or file:// URL).
+  // Used by MessageBubble to show "downloading..." vs broken-image icon.
+  fsExists: ({ rawPath }) => ipcRenderer.invoke("fs:exists", { rawPath }),
 
   // ═══════════════════════════════════════════════════════════
   // GROUP EVENTS

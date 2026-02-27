@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useRef } from "react"
 import { useChatStore } from "../store/chat"
 import { useAppStore } from "../store/app"
 import ChatItem from "./ChatItem"
+import { useChatListPrefetch } from "../hooks/useMediaPrefetch"
 
 const SearchIcon = () => (
   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -102,6 +103,11 @@ export default function ChatList({ connStatus }) {
   }
 
   const handleClick = useCallback((jid) => { setActiveJid(jid) }, [])
+
+  // [PREFETCH] Set up IntersectionObserver for scroll-based media prefetch
+  // Each ChatItem registers its DOM node; observer fires debounced prefetch
+  // when the item enters the viewport (with 200px rootMargin lookahead)
+  const { observe, unobserve } = useChatListPrefetch()
 
   const isContacts = navTab === "contacts"
   const isCommunities = navTab === "communities"
@@ -206,6 +212,8 @@ export default function ChatList({ connStatus }) {
               onClick={() => handleClick(item.jid)}
               isContact={isContacts}
               isCommunity={isCommunities}
+              observe={observe}
+              unobserve={unobserve}
             />
           ))
         )}

@@ -52,7 +52,7 @@ const {
 } = require("baileys")
 
 // ADD MessageParser by Towartz
-const { parseMessage, buildRendererPayload } = require("./messageParser")
+const { parseMessage, buildRendererPayload, normalizeJid, buildLidMap, isLidJid, resolveLid, tryResolveLid } = require("./messageParser")
 const { Boom } = require("@hapi/boom")
 const pino = require("pino")
 const chalk = require("chalk")
@@ -100,6 +100,38 @@ let isSyncing = false
 let historySyncBuffer = []
 let syncStats = { chats: 0, messages: 0 }
 
+// [FIX-LID] Persistent lid → real JID map.
+// Built incrementally as contacts arrive from Baileys.
+// Passed to parseMessage() so @lid is never stored in DB or sent to renderer.
+//
+// PERSISTENCE: saved to disk so it's available on reconnect BEFORE
+// contacts.set fires. Without this, messages arriving before contacts.set
+// (which can be seconds into a reconnect) leak @lid into the DB.
+let lidMap = new Map()
+
+const LID_MAP_PATH = path.resolve(CONFIG.SESSION_DIR, "../lid_map.json")
+
+function loadLidMapFromDisk() {
+  try {
+    if (fs.existsSync(LID_MAP_PATH)) {
+      const raw = JSON.parse(fs.readFileSync(LID_MAP_PATH, "utf8"))
+      for (const [k, v] of Object.entries(raw)) lidMap.set(k, v)
+      if (lidMap.size > 0) log(`[LID] Loaded ${lidMap.size} mappings from disk`)
+    }
+  } catch (_) {}
+}
+
+function saveLidMapToDisk() {
+  try {
+    const obj = {}
+    for (const [k, v] of lidMap) obj[k] = v
+    fs.writeFileSync(LID_MAP_PATH, JSON.stringify(obj), "utf8")
+  } catch (_) {}
+}
+
+// Load persisted lid map immediately (before any connection)
+loadLidMapFromDisk()
+
 const msgRetryCache = new NodeCache({
   stdTTL: CONFIG.MSG_CACHE_TTL,
   maxKeys: CONFIG.MSG_CACHE_MAX,
@@ -109,6 +141,56 @@ const msgRetryCache = new NodeCache({
 if (!fs.existsSync(CONFIG.MEDIA_DIR)) {
   fs.mkdirSync(CONFIG.MEDIA_DIR, { recursive: true })
 }
+
+// ════════════════════════════════════════════════════════════
+// LID UTILITIES — persist, merge, and retroactively fix @lid rows
+// ════════════════════════════════════════════════════════════
+
+/**
+ * mergeLidBatch — merge new lid→JID entries into the global lidMap,
+ * persist to disk, and schedule a DB cleanup pass (2s debounce).
+ * Always call this instead of mutating lidMap directly.
+ */
+function mergeLidBatch(batch) {
+  if (!batch || batch.size === 0) return
+  let newEntries = 0
+  for (const [k, v] of batch) {
+    if (!lidMap.has(k)) newEntries++
+    lidMap.set(k, v)
+  }
+  if (newEntries > 0) {
+    saveLidMapToDisk()
+    scheduleResolveLidInDB()
+  }
+}
+
+let _resolveLidTimer = null
+function scheduleResolveLidInDB(delayMs = 2000) {
+  if (_resolveLidTimer) clearTimeout(_resolveLidTimer)
+  _resolveLidTimer = setTimeout(() => {
+    _resolveLidTimer = null
+    resolveLidInDB()
+  }, delayMs)
+}
+
+/**
+ * resolveLidInDB — retroactively fix any @lid JIDs that leaked into the DB
+ * because lidMap was empty when the message/chat was first processed.
+ * Runs in the DB layer which does it all in one SQLite transaction.
+ */
+function resolveLidInDB() {
+  if (lidMap.size === 0) return
+  try {
+    const fixed = db.resolveLidRows(lidMap)
+    if (fixed > 0) {
+      console.log(`[LID] resolveLidInDB: fixed ${fixed} stale @lid rows`)
+      send("db:chats:updated")
+    }
+  } catch (err) {
+    console.warn(`[LID] resolveLidInDB error: ${err.message}`)
+  }
+}
+
 
 // ════════════════════════════════════════════════════════════
 // LOGGER
@@ -334,6 +416,21 @@ function resolveMediaTypeKey(msgType, message) {
 
 async function handleMessage(msg, type, isHistorySync = false) {
   if (!msg.message) return
+  // [FIX-SPLIT-CHAT] Normalize remoteJid before ANY processing.
+  // @c.us legacy and :device multi-device suffixes both cause duplicate chat rows.
+  // Mutate key.remoteJid so all downstream code (parseMessage, db.*) see the clean form.
+  if (msg.key?.remoteJid) {
+    let rjid = normalizeJid(msg.key.remoteJid)
+    // [FIX-LID] Resolve @lid remoteJid → real JID before anything else
+    if (isLidJid(rjid)) rjid = resolveLid(rjid, lidMap)
+    msg.key.remoteJid = rjid
+  }
+  // [FIX-LID] Also resolve @lid in participant field (group sender)
+  if (msg.key?.participant) {
+    let p = normalizeJid(msg.key.participant)
+    if (isLidJid(p)) p = resolveLid(p, lidMap)
+    msg.key.participant = p
+  }
   if (isJidStatusBroadcast(msg.key.remoteJid || "")) return
   if (isJidBroadcast(msg.key.remoteJid || "")) return
 
@@ -343,6 +440,7 @@ async function handleMessage(msg, type, isHistorySync = false) {
     pushname: msg.pushName || null,
     isHistorySync,
     myJid: sock?.user?.id || null,
+    lidMap,  // [FIX-LID] pass lid→JID map so quoted senders are resolved
   })
   if (!parsed?.id) return
 
@@ -369,14 +467,21 @@ async function handleMessage(msg, type, isHistorySync = false) {
 
   // ── Update chat last message di DB ────────────────────────
   if (!isHistorySync && parsed.chat_jid) {
-    try {
-      db.statements?.updateChatLastMessage?.run({
-        jid: parsed.chat_jid,
-        timestamp: parsed.timestamp,
-        message_id: parsed.id,
-        body: parsed.body || null,
-      })
-    } catch (_) {}
+    // [FIX-PREVIEW] Use full statement with msg_type so chat list preview is always current.
+    // Also pass from_me so getChats SQL JOIN on messages.from_me reflects actual sender.
+    db.updateChatLastMsg?.(parsed.chat_jid, {
+      timestamp:  parsed.timestamp,
+      message_id: parsed.id,
+      body:       parsed.body || `[${parsed.msg_type}]`,
+      msg_type:   parsed.msg_type,
+    })
+  }
+
+  // ── [FIX-PUSHNAME] Persist sender pushname → contacts table ──
+  // This is the source of truth for display names in chat list.
+  // Without this, getChats() JOIN returns null and raw JID is shown.
+  if (!isHistorySync && parsed.pushname && parsed.sender_jid) {
+    db.upsertContactPushname?.(parsed.sender_jid, parsed.pushname)
   }
 
   // History sync: hanya save ke DB, tidak push ke renderer
@@ -539,6 +644,30 @@ async function connectToWhatsApp(phoneForPairing = null) {
       // Start sync status
       db.startSync()
       send("sync:status", { isSyncing: true, progress: 0 })
+
+      // [FIX-GROUP-NAME] Fetch group subjects for groups that have no name yet.
+      // Run after a short delay to not block initial sync.
+      setTimeout(async () => {
+        try {
+          const missingJids = db.getGroupsWithoutName?.() || []
+          if (missingJids.length === 0) return
+          log(`[FIX-GROUP-NAME] Fetching metadata for ${missingJids.length} groups...`)
+          for (const jid of missingJids) {
+            try {
+              const meta = await sock.groupMetadata(jid)
+              if (meta?.subject) {
+                db.updateGroupSubject(jid, meta.subject)
+                log(`[FIX-GROUP-NAME] ${jid} → "${meta.subject}"`)
+              }
+            } catch (_) {}
+            // Small delay to avoid rate limit
+            await new Promise(r => setTimeout(r, 300))
+          }
+          send("db:chats:updated")
+        } catch (e) {
+          logW(`[FIX-GROUP-NAME] fetch error: ${e.message}`)
+        }
+      }, 5000)
     }
 
     // ── CLOSE ────────────────────────────────────────
@@ -614,14 +743,47 @@ async function connectToWhatsApp(phoneForPairing = null) {
     syncStats.chats += chats.length
     syncStats.messages += messages.length
 
-    // Save chats
-    for (const chat of chats) {
-      db.saveChat(chat)
-    }
-
-    // Save contacts
+    // Save chats — resolve @lid in chat.id before touching DB
+    // [FIX-LID] Contacts arrive BEFORE chats in the same history sync batch,
+    // so lidMap should already have mappings by the time we process chats.
+    // We save contacts first, build lidMap, THEN save chats.
+    // But for safety, we also resolve @lid here even if lidMap is partial.
     for (const contact of contacts) {
       db.saveContact(contact)
+      if (contact.id && (contact.notify || contact.pushname)) {
+        db.upsertContactPushname?.(contact.id, contact.notify || contact.pushname)
+      }
+    }
+
+    // [FIX-LID] Build lidMap BEFORE saving chats so chat.id @lid can be resolved
+    if (contacts.length > 0) {
+      const batch = buildLidMap(contacts)
+      mergeLidBatch(batch)
+
+      // [FIX-LID-NAME] Save name under resolved real JID for @lid contacts
+      for (const contact of contacts) {
+        if (!contact.id) continue
+        const rawJid = normalizeJid(contact.id)
+        if (isLidJid(rawJid)) {
+          const resolved = tryResolveLid(rawJid, lidMap)
+          if (resolved !== rawJid && (contact.notify || contact.pushname || contact.name)) {
+            db.upsertContactPushname?.(resolved, contact.notify || contact.pushname || contact.name)
+          }
+        }
+      }
+    }
+
+    // Save chats — now lidMap is populated, resolve @lid in chat.id
+    for (const chat of chats) {
+      // Resolve @lid chat JID → real JID
+      if (chat.id && isLidJid(chat.id)) {
+        const resolved = resolveLid(chat.id, lidMap)
+        if (resolved !== chat.id) {
+          log(`[LID] Chat id resolved: ${chat.id} → ${resolved}`)
+          chat.id = resolved
+        }
+      }
+      db.saveChat(chat)
     }
 
     // Save messages (history)
@@ -640,6 +802,18 @@ async function connectToWhatsApp(phoneForPairing = null) {
     if (isLatest) {
       isSyncing = false
       db.endSync(syncStats.chats, syncStats.messages)
+
+      // [FIX-PUSHNAME-BACKFILL] Populate contacts table from messages.push_name
+      // for all DM contacts that don't have a contacts row yet (unsaved contacts).
+      // This runs in background after sync so it doesn't block the UI.
+      setImmediate(() => {
+        try {
+          db.backfillChatLastMessages?.()
+          db.backfillContactPushnames?.()
+          send("db:chats:updated")
+          send("db:contacts:updated")
+        } catch (_) {}
+      })
       send("sync:status", {
         isSyncing: false,
         progress: 100,
@@ -737,18 +911,25 @@ async function connectToWhatsApp(phoneForPairing = null) {
   // Chats events
   sock.ev.on("chats.set", ({ chats, isLatest }) => {
     log(`Loaded ${chats.length} chats (isLatest: ${isLatest})`)
-    send("chats:set", chats)
-
     for (const chat of chats) {
+      // [FIX-LID] Resolve @lid in chat.id before saving
+      if (chat.id && isLidJid(chat.id)) {
+        chat.id = resolveLid(chat.id, lidMap)
+      }
       db.saveChat(chat)
     }
+    send("chats:set", chats)
   })
 
   sock.ev.on("chats.upsert", (c) => {
-    send("chats:upsert", c)
     for (const chat of c) {
+      // [FIX-LID] Resolve @lid in chat.id before saving
+      if (chat.id && isLidJid(chat.id)) {
+        chat.id = resolveLid(chat.id, lidMap)
+      }
       db.saveChat(chat)
     }
+    send("chats:upsert", c)
   })
 
   sock.ev.on("chats.update", (u) => {
@@ -767,18 +948,90 @@ async function connectToWhatsApp(phoneForPairing = null) {
     log(`Loaded ${contacts.length} contacts`)
     send("contacts:set", contacts)
     db.saveContacts(contacts)
+
+    // [FIX-PUSHNAME] contacts.set contains notify field = WA display name.
+    // saveContact() already handles this via push_name = contact.pushname || contact.notify
+    // But upsert it explicitly for safety so no name is ever dropped.
+    for (const c of contacts) {
+      if (c.id && (c.notify || c.pushname)) {
+        db.upsertContactPushname?.(c.id, c.notify || c.pushname)
+      }
+    }
+
+    // [FIX-LID] Build lid map from full contacts snapshot
+    const batch = buildLidMap(contacts)
+    mergeLidBatch(batch)
+
+    // [FIX-LID-NAME] For contacts that have a @lid JID (c.id is @lid-like),
+    // also save the pushname under the real resolved JID so getChats COALESCE finds it.
+    // This handles the case where WA sends contacts with lid-based IDs.
+    for (const c of contacts) {
+      if (!c.id) continue
+      const realJid = normalizeJid(c.id)
+      if (isLidJid(realJid)) {
+        const resolved = tryResolveLid(realJid, lidMap)
+        if (resolved !== realJid && (c.notify || c.pushname || c.name)) {
+          db.upsertContactPushname?.(resolved, c.notify || c.pushname || c.name)
+          log(`[LID-NAME] contacts.set: ${realJid} → ${resolved}, name saved`)
+        }
+      }
+    }
   })
 
   sock.ev.on("contacts.upsert", (c) => {
     send("contacts:upsert", c)
-    db.saveContacts(Array.isArray(c) ? c : [c])
+    const arr = Array.isArray(c) ? c : [c]
+    db.saveContacts(arr)
+    // [FIX-PUSHNAME] Same as contacts.set — also upsert notify
+    for (const contact of arr) {
+      if (contact.id && (contact.notify || contact.pushname)) {
+        db.upsertContactPushname?.(contact.id, contact.notify || contact.pushname)
+      }
+    }
+    // [FIX-LID] Merge new lid mappings
+    const batch = buildLidMap(arr)
+    mergeLidBatch(batch)
+
+    // [FIX-LID-NAME] Also save name under resolved real JID
+    for (const contact of arr) {
+      if (!contact.id) continue
+      const realJid = normalizeJid(contact.id)
+      if (isLidJid(realJid)) {
+        const resolved = tryResolveLid(realJid, lidMap)
+        if (resolved !== realJid && (contact.notify || contact.pushname || contact.name)) {
+          db.upsertContactPushname?.(resolved, contact.notify || contact.pushname || contact.name)
+        }
+      }
+    }
   })
 
   sock.ev.on("contacts.update", (u) => send("contacts:update", u))
 
   // Other events
   sock.ev.on("presence.update", ({ id, presences }) => send("presence:update", { id, presences }))
-  sock.ev.on("groups.update", (u) => send("groups:update", u))
+  sock.ev.on("groups.update", (u) => {
+    // [FIX-GROUP-NAME] Update group subjects when they change
+    for (const update of u) {
+      if (update.id && update.subject) {
+        db.updateGroupSubject(normalizeJid(update.id), update.subject)
+      }
+    }
+    send("groups:update", u)
+  })
+
+  // [FIX-GROUP-NAME] groups.upsert fires when groups are loaded by Baileys
+  sock.ev.on("groups.upsert", (groups) => {
+    for (const group of groups) {
+      if (group.id && group.subject) {
+        const jid = normalizeJid(group.id)
+        db.updateGroupSubject(jid, group.subject)
+        // Also ensure chat row exists
+        db.saveChat({ id: group.id, name: group.subject, isGroup: true })
+        log(`[FIX-GROUP-NAME] groups.upsert: ${jid} → "${group.subject}"`)
+      }
+    }
+    if (groups.length > 0) send("db:chats:updated")
+  })
   sock.ev.on("group-participants.update", ({ id, participants, action }) => {
     send("groups:participants", { id, participants, action })
   })
@@ -914,8 +1167,44 @@ async function startQRMode() {
 }
 
 // ════════════════════════════════════════════════════════════
-// PUBLIC: SEND MESSAGES
+// PUBLIC: MEDIA PREFETCH
+// Download a single media message by its DB row.
+// Called from main.js media:prefetch IPC handler.
+// Re-uses the same downloadAndSaveMedia pipeline.
 // ════════════════════════════════════════════════════════════
+
+async function downloadMediaForMsg(row) {
+  if (!row?.id || !row?.message_json) return null
+  if (!sock) return null
+
+  try {
+    const message = JSON.parse(row.message_json)
+    const msgType = row.message_type
+
+    // Build a minimal WAMessage compatible with downloadAndSaveMedia
+    const fakeMsg = {
+      key: {
+        id: row.id,
+        remoteJid: row.chat_jid,
+        fromMe: false,
+      },
+      message,
+    }
+
+    const mediaTypeKey = resolveMediaTypeKey(msgType, message)
+    if (!mediaTypeKey) return null
+
+    // Check not already downloaded (race condition guard)
+    const already = db.getMessageById(row.id)
+    if (already?.media_is_downloaded) return null
+
+    return await downloadAndSaveMedia(fakeMsg, mediaTypeKey, false)
+  } catch (err) {
+    // Silent — prefetch is best-effort
+    logW(`[PREFETCH] downloadMediaForMsg ${row.id}: ${err.message?.slice(0, 60)}`)
+    return null
+  }
+}
 
 async function sendTextMessage(jid, text, opts = {}) {
   assertConnected()
@@ -1105,6 +1394,55 @@ async function getContactInfo(jid) {
   return {
     status: statusRes.status === "fulfilled" ? statusRes.value?.status || "" : "",
     imgUrl: imgRes.status === "fulfilled" ? imgRes.value : null,
+  }
+}
+
+// [FIX-PROFILE-PIC] getProfilePic — called by ChatItem via IPC
+// Strategy:
+//   1. Return DB-cached URL immediately if available (fast path)
+//   2. Fetch fresh from WA network, cache to DB, return URL
+//   3. On any error (including 404 / no pic), cache null so we don't retry
+const _picFetchInProgress = new Set()
+const _picFetchCooldown   = new Map() // jid → timestamp of last fetch
+
+async function getProfilePic(jid) {
+  if (!jid) return { url: null }
+  // [FIX-SPLIT-CHAT] Normalize so cache key is always canonical form
+  const cleanJid = normalizeJid(jid)
+  if (!cleanJid) return { url: null }
+
+  // 1. Check DB cache first — avoid network if already fetched
+  const cached = db.getCachedProfilePic?.(cleanJid)
+  if (cached !== null && cached !== undefined) {
+    return { url: cached || null }
+  }
+
+  // 2. Debounce: don't fetch same JID more than once per 30 minutes
+  const now = Date.now()
+  const lastFetch = _picFetchCooldown.get(cleanJid) || 0
+  if (now - lastFetch < 30 * 60 * 1000) {
+    return { url: null }
+  }
+
+  // 3. Guard concurrent fetches for same JID
+  if (_picFetchInProgress.has(cleanJid)) {
+    return { url: null }
+  }
+
+  _picFetchInProgress.add(cleanJid)
+  _picFetchCooldown.set(cleanJid, now)
+
+  try {
+    if (!sock) return { url: null }
+    const url = await sock.profilePictureUrl(cleanJid, "image")
+    db.cacheProfilePic?.(cleanJid, url || null)
+    return { url: url || null }
+  } catch (err) {
+    // 404 = no profile pic set — cache null to stop retrying
+    db.cacheProfilePic?.(cleanJid, null)
+    return { url: null }
+  } finally {
+    _picFetchInProgress.delete(cleanJid)
   }
 }
 
@@ -1298,6 +1636,7 @@ module.exports = {
   subscribePresence,
 
   getContactInfo,
+  getProfilePic,
   updateMyStatus,
   updateMyName,
 
@@ -1312,6 +1651,7 @@ module.exports = {
   getGroupInviteLink,
 
   downloadMedia,
+  downloadMediaForMsg,
 
   blockContact,
   checkNumberExists,

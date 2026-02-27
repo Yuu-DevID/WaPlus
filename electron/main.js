@@ -56,6 +56,8 @@ function createWindow() {
       nodeIntegration: false,
       // ── FIX 1: Allow file:// protocol dari renderer ──
       webSecurity: false,
+      // ── FIX-MEDIA: Allow mixed content & local media files ──
+      allowRunningInsecureContent: true,
     },
   })
 
@@ -68,15 +70,29 @@ function createWindow() {
   }
 
   // ── FIX 2: Register custom "media://" protocol sebagai alternatif ──
-  // Renderer bisa pakai: media:///absolute/path/to/file.jpg
-  // Lebih aman daripada file:// langsung
+  // Renderer bisa pakai: media:///absolute/path/to/file.webp
+  // Menangani webp/sticker/gambar dengan mime type yang benar
   win.webContents.session.protocol.registerFileProtocol("media", (request, callback) => {
     try {
       // Strip "media://" prefix
       const url = request.url.replace("media://", "")
       // Decode URL encoding
       const filePath = decodeURIComponent(url)
-      callback({ path: filePath })
+      // Deteksi mime type dari ekstensi untuk webp/sticker
+      const ext = path.extname(filePath).toLowerCase().slice(1)
+      const mimeMap = {
+        webp: "image/webp",
+        jpg: "image/jpeg",
+        jpeg: "image/jpeg",
+        png: "image/png",
+        gif: "image/gif",
+        mp4: "video/mp4",
+        ogg: "audio/ogg",
+        mp3: "audio/mpeg",
+        m4a: "audio/mp4",
+      }
+      const mimeType = mimeMap[ext] || "application/octet-stream"
+      callback({ path: filePath, mimeType })
     } catch (err) {
       console.error("[AuroraChat] Protocol error:", err.message)
       callback({ error: -2 }) // net::ERR_FAILED
@@ -123,15 +139,69 @@ ipcMain.on("auth:start-qr", async () => {
 })
 
 // ── Send Message ────────────────────────────────────────────
-ipcMain.handle("msg:send", async (_e, { jid, body, type = "text" }) => {
+ipcMain.handle("msg:send", async (_e, { jid, body, type = "text", quotedMsgId = null }) => {
   try {
     if (!baileysClient) return { ok: false, error: "Client belum siap." }
-    const result = await baileysClient.sendTextMessage(jid, body)
+
+    let quotedWAMsg = null
+
+    // [REPLY] Rebuild proper WAMessage object dari DB untuk Baileys quoted param.
+    // Persis seperti cara case.js: { quoted: m } dimana m adalah full WAMessage
+    // dengan key, message, messageTimestamp, pushName, participant.
+    // Baileys butuh ini untuk membangun contextInfo yang benar di pesan terkirim.
+    if (quotedMsgId) {
+      try {
+        const d = getDB()
+        const row = d.getMessageById?.(quotedMsgId)
+        if (row) {
+          // Parse raw message JSON yang disimpan saat receive
+          let rawMessage = null
+          if (row.message_json) {
+            try { rawMessage = JSON.parse(row.message_json) } catch (_) {}
+          }
+
+          // Fallback: buat minimal message object dari field DB
+          if (!rawMessage) {
+            rawMessage = row.body
+              ? { conversation: row.body }
+              : { conversation: "" }
+          }
+
+          // Build WAMessage object — format yang sama dengan apa yang Baileys emit
+          // key.participant hanya diisi untuk pesan di group (bukan from_me)
+          const isGroup = (row.remote_jid || "").endsWith("@g.us")
+          const participant = isGroup && !row.from_me && row.participant
+            ? row.participant
+            : undefined
+
+          quotedWAMsg = {
+            key: {
+              remoteJid:  row.remote_jid,
+              fromMe:     row.from_me === 1,
+              id:         row.id,
+              ...(participant ? { participant } : {}),
+            },
+            message:          rawMessage,
+            messageTimestamp: row.message_timestamp || Math.floor(Date.now() / 1000),
+            pushName:         row.push_name || null,
+          }
+        }
+      } catch (qErr) {
+        console.warn("[AuroraChat] Could not fetch quoted message:", qErr.message)
+      }
+    }
+
+    const result = await baileysClient.sendTextMessage(
+      jid,
+      body,
+      quotedWAMsg ? { quoted: quotedWAMsg } : {}
+    )
+
     return {
       ok: true,
       message: {
         key: result?.key || {},
-        id: result?.key?.id || null,
+        id:  result?.key?.id || null,
       }
     }
   } catch (err) {
@@ -239,6 +309,33 @@ ipcMain.handle("db:stats", () => {
   catch (err) { return { ok: false, error: err.message } }
 })
 
+// ── Media prefetch IPC ────────────────────────────────────
+// Called by renderer when a chat scrolls into view or is clicked.
+// Triggers background download of all pending media for a chat.
+// Fire-and-forget: returns immediately, downloads happen in background.
+// Each downloaded file emits a "media:updated" event to the renderer.
+ipcMain.handle("media:prefetch", async (_e, { jid, limit = 20 }) => {
+  try {
+    if (!baileysClient) return { ok: false, queued: 0 }
+    const db = getDB()
+    const pending = db.getMediaPendingForChat?.(jid, limit) || []
+    if (pending.length === 0) return { ok: true, queued: 0 }
+
+    // Kick off downloads in background — do NOT await
+    setImmediate(async () => {
+      for (const row of pending) {
+        try {
+          await baileysClient.downloadMediaForMsg?.(row)
+        } catch (_) {}
+      }
+    })
+
+    return { ok: true, queued: pending.length }
+  } catch (err) {
+    return { ok: false, error: err.message }
+  }
+})
+
 ipcMain.handle("db:sync:status", () => {
   try {
     if (!baileysClient) return { ok: false, error: "Client not ready" }
@@ -310,14 +407,15 @@ module.exports.onBaileysMessage = function (payload) {
 module.exports.onMediaDownloaded = function ({ msgId, chatJid, localPath }) {
   try {
     if (!msgId || !localPath) return
-    // Normalize path jadi forward slash dan pastikan ada file:// prefix
-    const normalized = localPath.replace(/\\/g, "/")
-    const fileUrl = normalized.startsWith("file://") ? normalized : `file://${normalized}`
 
+    // Send the RAW local path to the renderer.
+    // MessageBubble.pathToFileUrl() is the single conversion point —
+    // it correctly handles Windows drive letters (D:\), Unix paths, and spaces.
+    // Pre-converting to file:// here caused D: → D%3A corruption on Windows.
     win?.webContents.send("media:updated", {
       id: msgId,
       chat_jid: chatJid,
-      media_saved_path: fileUrl,
+      media_saved_path: localPath,   // raw path — renderer converts via pathToFileUrl
     })
 
     console.log(`[AuroraChat] Media ready → renderer: ${msgId}`)
@@ -397,5 +495,25 @@ ipcMain.handle("profile:get-pic", async (_e, { jid }) => {
     return { ok: true, url: info.imgUrl }
   } catch {
     return { ok: false, url: null }
+  }
+})
+
+// ── File existence check — renderer uses this to detect missing/deleted media ─
+// Accepts raw paths (D:\path\file) or file:// URLs.
+ipcMain.handle("fs:exists", (_e, { rawPath }) => {
+  try {
+    if (!rawPath) return false
+    let p = rawPath
+    if (p.startsWith("file://")) {
+      p = decodeURIComponent(p.replace(/^file:\/\/\/?/, ""))
+      p = p.replace(/^([A-Za-z])%3A/i, "$1:")
+      if (process.platform !== "win32" && !p.startsWith("/")) p = "/" + p
+    } else {
+      // Raw Windows path: D:\path → normalize
+      p = p.replace(/\\/g, "/")
+    }
+    return require("fs").existsSync(p)
+  } catch {
+    return false
   }
 })

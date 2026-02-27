@@ -34,6 +34,10 @@ const Database = require('better-sqlite3');
 const path     = require('path');
 const fs       = require('fs');
 
+// [FIX-SPLIT-CHAT] Import single JID normalization gate
+// All JIDs must pass through this before touching the DB
+const { normalizeJid } = require('./messageParser');
+
 // ════════════════════════════════════════════════════════════
 // [FIX-1] DB PATH — persisten di production Electron build
 // ════════════════════════════════════════════════════════════
@@ -268,7 +272,7 @@ db.exec(`
 // [FIX-15] AUTO MIGRATION
 // ════════════════════════════════════════════════════════════
 
-const DB_VERSION = 3;
+const DB_VERSION = 7;
 
 function runMigrations() {
     const row = db.prepare('SELECT MAX(version) as v FROM schema_version').get();
@@ -278,9 +282,8 @@ function runMigrations() {
     console.log(`[AuroraDB] Migrating schema v${current} → v${DB_VERSION}`);
 
     const migrations = {
-        1: () => { /* initial — schema sudah di-create di db.exec atas */ },
+        1: () => { /* initial */ },
         2: () => {
-            // Tambah kolom flag media yang mungkin belum ada pada install lama
             const cols = db.pragma('table_info(messages)').map(c => c.name);
             if (!cols.includes('is_ptt'))       db.exec('ALTER TABLE messages ADD COLUMN is_ptt INTEGER NOT NULL DEFAULT 0');
             if (!cols.includes('is_gif'))       db.exec('ALTER TABLE messages ADD COLUMN is_gif INTEGER NOT NULL DEFAULT 0');
@@ -295,7 +298,6 @@ function runMigrations() {
             if (!chatCols.includes('muted_until'))        db.exec("ALTER TABLE chats ADD COLUMN muted_until INTEGER NOT NULL DEFAULT 0");
         },
         3: () => {
-            // Fix poll_votes kolom jika masih punya schema lama (message_id/sender_jid/vote)
             const pvcols = db.pragma('table_info(poll_votes)').map(c => c.name);
             if (pvcols.includes('message_id') && !pvcols.includes('poll_message_id')) {
                 db.exec(`
@@ -318,6 +320,193 @@ function runMigrations() {
                     ALTER TABLE poll_votes_v3 RENAME TO poll_votes;
                 `);
             }
+        },
+
+        // ── v4: FIX SPLIT-CHAT — normalize @c.us and :device JIDs in existing data ──
+        4: () => {
+            console.log('[AuroraDB] v4: Merging split-chat rows (@c.us → @s.whatsapp.net)...');
+
+            // Helper: canonical form of a raw JID string (SQL-level)
+            // We do this in JS because SQLite has no regex replace built in.
+
+            // 1. Find all @c.us rows in messages and remap to @s.whatsapp.net
+            const legacyMsgJids = db.prepare(`
+                SELECT DISTINCT remote_jid FROM messages WHERE remote_jid LIKE '%@c.us'
+            `).all().map(r => r.remote_jid);
+
+            for (const oldJid of legacyMsgJids) {
+                const newJid = oldJid.replace('@c.us', '@s.whatsapp.net');
+                // Move messages to canonical JID
+                db.prepare(`UPDATE messages SET remote_jid = ? WHERE remote_jid = ?`).run(newJid, oldJid);
+                // Ensure the canonical chat row exists
+                db.prepare(`
+                    INSERT OR IGNORE INTO chats (jid, is_group, last_message_timestamp)
+                    VALUES (?, 0, 0)
+                `).run(newJid);
+                // Merge old @c.us chat row data into canonical row (take the better values)
+                db.prepare(`
+                    UPDATE chats SET
+                        name                   = COALESCE(name, (SELECT name FROM chats WHERE jid = ?)),
+                        unread_count           = MAX(unread_count, (SELECT unread_count FROM chats WHERE jid = ?)),
+                        last_message_timestamp = MAX(last_message_timestamp, (SELECT last_message_timestamp FROM chats WHERE jid = ?)),
+                        last_message_id        = COALESCE(last_message_id, (SELECT last_message_id FROM chats WHERE jid = ?)),
+                        last_message_body      = COALESCE(last_message_body, (SELECT last_message_body FROM chats WHERE jid = ?)),
+                        pinned                 = MAX(pinned, (SELECT COALESCE(pinned,0) FROM chats WHERE jid = ?)),
+                        profile_pic_url        = COALESCE(profile_pic_url, (SELECT profile_pic_url FROM chats WHERE jid = ?))
+                    WHERE jid = ?
+                `).run(oldJid, oldJid, oldJid, oldJid, oldJid, oldJid, oldJid, newJid);
+                // Delete the old @c.us orphan row
+                db.prepare(`DELETE FROM chats WHERE jid = ?`).run(oldJid);
+            }
+
+            // 2. Find all @c.us rows in contacts and remap
+            const legacyContactJids = db.prepare(`
+                SELECT DISTINCT jid FROM contacts WHERE jid LIKE '%@c.us'
+            `).all().map(r => r.jid);
+
+            for (const oldJid of legacyContactJids) {
+                const newJid = oldJid.replace('@c.us', '@s.whatsapp.net');
+                // Merge into canonical contact row
+                db.prepare(`
+                    INSERT INTO contacts (jid, name, push_name, short_name, number, profile_pic_url, is_user)
+                    SELECT ?, name, push_name, short_name, number, profile_pic_url, is_user
+                    FROM contacts WHERE jid = ?
+                    ON CONFLICT(jid) DO UPDATE SET
+                        name            = COALESCE(excluded.name, contacts.name),
+                        push_name       = COALESCE(excluded.push_name, contacts.push_name),
+                        profile_pic_url = COALESCE(excluded.profile_pic_url, contacts.profile_pic_url)
+                `).run(newJid, oldJid);
+                db.prepare(`DELETE FROM contacts WHERE jid = ?`).run(oldJid);
+            }
+
+            // 3. Strip :device suffix from JIDs in messages.participant
+            // e.g. "6281234:5@s.whatsapp.net" → "6281234@s.whatsapp.net"
+            // SQLite doesn't have regex, so we fetch and update in JS
+            const deviceSuffixRows = db.prepare(`
+                SELECT DISTINCT participant FROM messages
+                WHERE participant LIKE '%:%@%'
+            `).all();
+
+            const stripDevice = db.prepare(`UPDATE messages SET participant = ? WHERE participant = ?`);
+            for (const { participant } of deviceSuffixRows) {
+                if (!participant) continue;
+                const [user, server] = participant.split('@');
+                const cleanUser = user.split(':')[0];
+                const cleanJid = `${cleanUser}@${server}`;
+                if (cleanJid !== participant) stripDevice.run(cleanJid, participant);
+            }
+
+            const affected = legacyMsgJids.length + legacyContactJids.length + deviceSuffixRows.length;
+            console.log(`[AuroraDB] v4 complete: fixed ${affected} split-chat entries`);
+        },
+
+        // ── v5: FIX-DEDUP-NAME — Bersihkan chats.name untuk DM yang terisi push_name ──
+        5: () => {
+            console.log('[AuroraDB] v5: Cleaning DM chats.name push_name pollution...');
+
+            // 1. Pindahkan chats.name DM ke contacts.push_name (jaga data tetap ada)
+            //    Lalu null-kan chats.name untuk DM supaya getChats COALESCE jatuh ke
+            //    contacts.name (phonebook) dengan benar.
+            //
+            // Hanya DM (bukan group, bukan community) yang terdampak.
+            const dmChatsWithName = db.prepare(`
+                SELECT jid, name FROM chats
+                WHERE is_group = 0
+                  AND is_community = 0
+                  AND name IS NOT NULL
+                  AND name != ''
+            `).all();
+
+            const upsertPN = db.prepare(`
+                INSERT INTO contacts (jid, push_name, number, is_user, is_group)
+                VALUES (?, ?, ?, 1, 0)
+                ON CONFLICT(jid) DO UPDATE SET
+                    push_name = CASE
+                        WHEN contacts.push_name IS NULL THEN excluded.push_name
+                        WHEN contacts.name IS NOT NULL THEN contacts.push_name
+                        ELSE excluded.push_name
+                    END,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE excluded.push_name IS NOT NULL
+            `);
+
+            const nullifyDMName = db.prepare(`
+                UPDATE chats SET name = NULL, updated_at = CURRENT_TIMESTAMP
+                WHERE jid = ? AND is_group = 0 AND is_community = 0
+            `);
+
+            db.transaction(() => {
+                for (const { jid, name } of dmChatsWithName) {
+                    const number = jid.split('@')[0] || null;
+                    // Simpan ke contacts.push_name (fallback kalau tidak ada di phonebook)
+                    upsertPN.run(jid, name, number);
+                    // Null-kan chats.name supaya phonebook name bisa muncul
+                    nullifyDMName.run(jid);
+                }
+            })();
+
+            console.log(`[AuroraDB] v5 complete: cleaned ${dmChatsWithName.length} DM chat names`);
+
+            // 2. One-time dedup: merge rows yang mungkin double karena push_name vs phonebook name
+            //    Tidak ada dedup yang dibutuhkan di DB level karena PRIMARY KEY = jid sudah unique.
+            //    Duplikasi visual sudah fixed dengan COALESCE fix di getChats.
+        },
+
+        // ── v6: FIX-PREVIEW — Backfill last_message_body/type from messages table ──
+        // Fixes chats where saveChat() stored last_message_body: null during history sync.
+        // Without this, chat list preview is blank until user sends/receives a new message.
+        6: () => {
+            console.log('[AuroraDB] v6: Backfilling chat last_message_body from messages table...');
+            const result = db.prepare(`
+                UPDATE chats
+                SET
+                    last_message_body = (
+                        SELECT COALESCE(body, '[' || message_type || ']')
+                        FROM messages
+                        WHERE id = chats.last_message_id
+                        LIMIT 1
+                    ),
+                    last_message_type = COALESCE(
+                        last_message_type,
+                        (SELECT message_type FROM messages WHERE id = chats.last_message_id LIMIT 1)
+                    ),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE last_message_id IS NOT NULL
+                  AND (last_message_body IS NULL OR last_message_body = '')
+            `).run();
+            console.log(`[AuroraDB] v6 complete: updated ${result.changes} chat preview rows`);
+        },
+
+        // v7: Fix broken media_saved_path from old normalizeMediaPath bug.
+        // Old code encoded "D:\path" as "file:///D%3A/path" (colon encoded).
+        // New code stores raw paths ("D:\path") and converts correctly in the renderer.
+        // This migration strips the broken file:// prefix so raw paths are stored.
+        7: () => {
+            // Find all messages with a broken file:///X%3A/ path
+            const broken = db.prepare(`
+                SELECT id, media_saved_path FROM messages
+                WHERE media_saved_path IS NOT NULL
+                  AND (media_saved_path LIKE 'file:///%3A/%'
+                    OR media_saved_path LIKE 'file:///%3a/%')
+            `).all();
+            const fix = db.prepare(`UPDATE messages SET media_saved_path = ? WHERE id = ?`);
+            let fixed = 0;
+            for (const row of broken) {
+                try {
+                    // Decode the broken URL back to a usable raw path
+                    // e.g. "file:///D%3A/path/file.webp" → "D:/path/file.webp"
+                    let raw = row.media_saved_path
+                        .replace(/^file:\/\/\//i, '')   // strip file:///
+                        .replace(/%3A/gi, ':')           // D%3A → D:
+                        .replace(/%20/g, ' ')            // spaces
+                        .replace(/%2F/gi, '/')           // slashes (shouldn't happen but be safe)
+                    // Decode any remaining percent-encoding
+                    try { raw = decodeURIComponent(raw) } catch (_) {}
+                    fix.run(raw, row.id);
+                    fixed++;
+                } catch (_) {}
+            }
+            console.log(`[AuroraDB] v7 complete: fixed ${fixed} broken media paths`);
         },
     };
 
@@ -388,7 +577,10 @@ const statements = {
             msg.remote_jid              AS chat_jid,
             msg.from_me,
             msg.participant             AS sender_jid,
-            COALESCE(msg.push_name, c.name, c.push_name) AS sender_name,
+            -- [FIX-SENDER-NAME] For group msgs: prefer phonebook name > push_name
+            -- For DM from_me=1: c is NULL (participant=NULL), so sender_name = push_name = ours
+            -- For DM from_me=0: c.name = their phonebook name
+            COALESCE(c.name, c.push_name, msg.push_name) AS sender_name,
             msg.message_type            AS msg_type,
             msg.body,
             msg.message_timestamp       AS timestamp,
@@ -404,6 +596,7 @@ const statements = {
             msg.poll_options,
             msg.poll_votes,
             msg.context_stanza_id       AS quoted_id,
+            -- [FIX-QUOTED-SENDER] Return the raw JID — chat.js resolveQuotedSender handles display
             msg.context_participant     AS quoted_sender,
             msg.context_quoted_message  AS quoted_body,
             msg.context_mentioned_jids  AS mentioned_jids,
@@ -414,7 +607,11 @@ const statements = {
             msg.reaction_target_id,
             CASE WHEN msg.remote_jid LIKE '%@g.us' THEN 1 ELSE 0 END AS is_group
         FROM messages msg
-        LEFT JOIN contacts c ON c.jid = msg.participant
+        -- Sender contact join (group member or DM opponent)
+        LEFT JOIN contacts c    ON c.jid = msg.participant
+        -- [FIX-LID] Also try matching participant @lid via number
+        LEFT JOIN contacts clid ON msg.participant LIKE '%@lid'
+                                AND clid.jid = SUBSTR(msg.participant, 1, INSTR(msg.participant, '@') - 1) || '@s.whatsapp.net'
         WHERE msg.remote_jid = ? AND msg.is_deleted = 0
         ORDER BY msg.message_timestamp DESC
         LIMIT ? OFFSET ?
@@ -450,7 +647,17 @@ const statements = {
 
     updatePollVotes: db.prepare('UPDATE messages SET poll_votes = ? WHERE id = ?'),
 
+    // [FIX-PREVIEW] @msg_type was never passed from client.js handleMessage() → silent UPDATE fail
+    // Fix: remove @msg_type from the statement used by handleMessage; keep full version for saveMessage
     updateChatLastMessage: db.prepare(`
+        UPDATE chats SET
+            last_message_timestamp = @timestamp,
+            last_message_id        = @message_id,
+            last_message_body      = @body
+        WHERE jid = @jid
+    `),
+
+    updateChatLastMessageFull: db.prepare(`
         UPDATE chats SET
             last_message_timestamp = @timestamp,
             last_message_id        = @message_id,
@@ -458,6 +665,29 @@ const statements = {
             last_message_type      = @msg_type
         WHERE jid = @jid
     `),
+
+    // [FIX-PUSHNAME] Upsert pushname into contacts from live messages
+    upsertContactPushname: db.prepare(`
+        INSERT INTO contacts (jid, push_name, number, is_user, is_group)
+        VALUES (@jid, @push_name, @number, 1, 0)
+        ON CONFLICT(jid) DO UPDATE SET
+            -- [FIX-DEDUP] Only update push_name if:
+            --   1. We have no push_name yet (first time seeing this contact), OR
+            --   2. The new push_name is longer (prefer fuller names over abbreviations).
+            -- Never touch contacts that already have a phone-book name — it takes priority
+            -- in the getChats COALESCE anyway, so this only affects contacts.push_name display.
+            push_name  = CASE
+                WHEN contacts.push_name IS NULL THEN excluded.push_name
+                WHEN LENGTH(excluded.push_name) > LENGTH(contacts.push_name) THEN excluded.push_name
+                ELSE contacts.push_name
+            END,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE excluded.push_name IS NOT NULL AND excluded.push_name != ''
+    `),
+
+    // [FIX-PROFILE-PIC] Update profile_pic_url in chats and contacts
+    updateChatProfilePic:    db.prepare('UPDATE chats    SET profile_pic_url = ? WHERE jid = ?'),
+    updateContactProfilePic: db.prepare('UPDATE contacts SET profile_pic_url = ? WHERE jid = ?'),
 
     // ── Chats ─────────────────────────────────────────────────────────────────
 
@@ -473,7 +703,17 @@ const statements = {
             @pinned, @archived, @muted_until, @profile_pic_url, @status, @presence
         )
         ON CONFLICT(jid) DO UPDATE SET
-            name                   = COALESCE(excluded.name, chats.name),
+            -- [FIX-DEDUP-NAME] Only update name if:
+            --   1. New value is not null (we have something to set)
+            --   2. Current name is null (first time, safe to set)
+            --   3. is_group = 1 (group subject always wins)
+            -- For DM: if chats.name already null (correct state), keep it null.
+            --         If incoming name is null (correct from our JS fix), keep existing.
+            -- This prevents push_name from re-polluting chats.name on future upserts.
+            name                   = CASE
+                                        WHEN excluded.is_group = 1 THEN COALESCE(excluded.name, chats.name)
+                                        ELSE NULL
+                                     END,
             is_group               = excluded.is_group,
             is_community           = excluded.is_community,
             community_jid          = COALESCE(excluded.community_jid, chats.community_jid),
@@ -483,12 +723,16 @@ const statements = {
                                      END,
             last_message_timestamp = MAX(excluded.last_message_timestamp, chats.last_message_timestamp),
             last_message_id        = CASE
-                                        WHEN excluded.last_message_timestamp >= chats.last_message_timestamp
+                                        WHEN excluded.last_message_timestamp > chats.last_message_timestamp
                                         THEN excluded.last_message_id
                                         ELSE chats.last_message_id
                                      END,
+            -- [FIX-PREVIEW] NEVER overwrite with NULL — live messages always provide body.
+            -- History sync passes null (body is in messages table, not chat row), so we
+            -- keep whatever was there. backfillChatLastMessages() fills gaps after sync.
             last_message_body      = CASE
-                                        WHEN excluded.last_message_timestamp >= chats.last_message_timestamp
+                                        WHEN excluded.last_message_body IS NOT NULL
+                                         AND excluded.last_message_timestamp >= chats.last_message_timestamp
                                         THEN excluded.last_message_body
                                         ELSE chats.last_message_body
                                      END,
@@ -504,25 +748,73 @@ const statements = {
         VALUES (?, ?, ?)
     `),
 
-    // [FIX-4] Ganti @limit/@offset → positional ? ?
+    // [FIX-NAME] COALESCE priority untuk DM vs Group:
+    //
+    // PROBLEM: Baileys set chats.name = push_name ("DCE") untuk DM saat history sync.
+    //          contacts.name = phonebook name ("BAS"). COALESCE(c.name, ct.name) = "DCE" ← SALAH.
+    //          Phonebook name harus menang atas push_name.
+    //
+    // FIX: Pakai CASE untuk pisah logika Group vs DM:
+    //   GROUP: c.name selalu valid (group subject) → prioritas tertinggi
+    //   DM:    ct.name (phonebook) > ct.push_name > c.name (push_name) > m.push_name
+    //
+    // Dengan ini:
+    //   - Kontak tersimpan "BAS" tetap tampil "BAS" meskipun push_name WA = "DCE"
+    //   - Kontak tidak tersimpan tetap tampil push_name-nya
+    //   - Grup tetap tampil nama grup
     getChats: db.prepare(`
         SELECT
             c.jid,
-            COALESCE(c.name, ct.name, ct.push_name, ct.short_name) AS name,
+            CASE
+                WHEN c.is_group = 1
+                    -- Group: group subject always wins
+                    THEN COALESCE(c.name, ct.name, ct.push_name)
+                WHEN c.jid LIKE '%@lid'
+                    -- [FIX-LID] @lid DM: resolve via contacts number match
+                    THEN COALESCE(
+                        ctlid.name, ctlid.push_name,
+                        ct.name, ct.push_name,
+                        '+' || SUBSTR(c.jid, 1, INSTR(c.jid, '@') - 1)
+                    )
+                ELSE
+                    -- DM: phonebook name beats push_name
+                    COALESCE(ct.name, ct.push_name, ct.short_name, c.name, m.push_name, '+' || SUBSTR(c.jid, 1, INSTR(c.jid, '@') - 1))
+            END AS name,
             c.is_group, c.is_community, c.unread_count, c.pinned, c.archived,
             c.muted_until,
-            COALESCE(c.profile_pic_url, ct.profile_pic_url) AS profile_pic_url,
+            COALESCE(c.profile_pic_url, ct.profile_pic_url, ctlid.profile_pic_url) AS profile_pic_url,
             c.status, c.presence,
             c.last_message_timestamp    AS last_msg_at,
-            c.last_message_body         AS last_msg,
+            -- [FIX-PREVIEW] Fallback: if chats.last_message_body is NULL (history sync gap),
+            -- pull body directly from the last message row.
+            COALESCE(c.last_message_body, m.body)   AS last_msg,
             c.last_message_id           AS last_msg_id,
-            c.last_message_type         AS last_msg_type,
-            COALESCE(m.push_name, msender.name, msender.push_name) AS last_sender_name,
-            m.from_me                   AS from_me
+            COALESCE(c.last_message_type, m.message_type) AS last_msg_type,
+            -- [FIX-FROM-ME] from_me comes from the actual last message row.
+            -- COALESCE with 0 so it's never NULL (NULL = unknown, treat as received).
+            COALESCE(m.from_me, 0)      AS from_me,
+            -- [FIX-SENDER-NAME] For group msgs: show sender name of last message
+            CASE
+                WHEN COALESCE(m.from_me, 0) = 1 THEN NULL
+                WHEN c.is_group = 1 THEN COALESCE(msender.name, msender.push_name, m.push_name)
+                ELSE NULL
+            END AS last_sender_name
         FROM chats c
         LEFT JOIN contacts ct      ON ct.jid = c.jid
+        -- [FIX-LID] For @lid chats, also match contact by numeric user part + @s.whatsapp.net
+        LEFT JOIN contacts ctlid   ON c.jid LIKE '%@lid'
+                                   AND ctlid.jid = SUBSTR(c.jid, 1, INSTR(c.jid, '@') - 1) || '@s.whatsapp.net'
         LEFT JOIN messages m       ON m.id   = c.last_message_id
         LEFT JOIN contacts msender ON msender.jid = m.participant
+        WHERE
+            -- [FIX-DEDUP-LID] Exclude @lid rows when @s.whatsapp.net row exists
+            NOT (
+                c.jid LIKE '%@lid'
+                AND EXISTS (
+                    SELECT 1 FROM chats c2
+                    WHERE c2.jid = SUBSTR(c.jid, 1, INSTR(c.jid, '@') - 1) || '@s.whatsapp.net'
+                )
+            )
         ORDER BY c.pinned DESC, c.last_message_timestamp DESC
         LIMIT ? OFFSET ?
     `),
@@ -585,6 +877,40 @@ const statements = {
     getPendingMediaDownloads: db.prepare(`
         SELECT * FROM media_downloads WHERE download_status = 'pending' ORDER BY download_attempts ASC LIMIT 10
     `),
+
+    // [PREFETCH] Get messages with undownloaded media for a specific chat
+    // Used by media:prefetch IPC to know what to download in background.
+    // Orders by timestamp DESC so newest media (most likely to be viewed) downloads first.
+    getMediaPendingForChatStmt: db.prepare(`
+        SELECT
+            m.id,
+            m.remote_jid AS chat_jid,
+            m.message_type,
+            m.message_json,
+            m.media_url,
+            m.media_direct_path,
+            m.media_key,
+            m.media_mimetype
+        FROM messages m
+        WHERE m.remote_jid = ?
+          AND m.media_is_downloaded = 0
+          AND m.is_deleted = 0
+          AND m.message_type IN (
+              'imageMessage','videoMessage','audioMessage','pttMessage',
+              'documentMessage','stickerMessage','viewOnceMessage','viewOnceMessageV2'
+          )
+          AND m.message_json IS NOT NULL
+        ORDER BY m.message_timestamp DESC
+        LIMIT ?
+    `),
+
+    // ── LID retroactive fix — pre-compiled for performance ───────────────────
+    // These run inside resolveLidRows() transaction, once per lidMap entry.
+    // Compiled once here so they're not re-prepared on every call.
+    lidFixMessages:  db.prepare(`UPDATE messages SET remote_jid = ? WHERE remote_jid = ?`),
+    lidFixParticipant: db.prepare(`UPDATE messages SET participant = ? WHERE participant = ?`),
+    lidFixChats:     db.prepare(`UPDATE chats SET jid = ? WHERE jid = ?`),
+    lidFixContacts:  db.prepare(`UPDATE contacts SET jid = ? WHERE jid = ?`),
 
     // ── Sync status ───────────────────────────────────────────────────────────
     // [FIX-10] Pisah jadi 2 statement dedicated
@@ -894,9 +1220,10 @@ const database = {
 
             const params = {
                 id:           toStr(msg.key.id),
-                remote_jid:   toStr(msg.key.remoteJid),
+                // [FIX-SPLIT-CHAT] Normalize remote_jid — can be @c.us or have :device suffix
+                remote_jid:   normalizeJid(toStr(msg.key.remoteJid)),
                 from_me:      toBool(msg.key.fromMe),
-                participant:  toStr(msg.participant || (!msg.key.fromMe ? msg.key.remoteJid : null)),
+                participant:  normalizeJid(toStr(msg.participant || (!msg.key.fromMe ? msg.key.remoteJid : null))),
                 push_name:    toStr(msg.pushName),
                 message_type: type,
                 body:         toStr(content.body),
@@ -965,7 +1292,7 @@ const database = {
 
             // Update chat last message (only live messages)
             if (!isHistorySync) {
-                statements.updateChatLastMessage.run({
+                statements.updateChatLastMessageFull.run({
                     jid:        params.remote_jid,
                     timestamp:  params.message_timestamp,
                     message_id: params.id,
@@ -994,19 +1321,26 @@ const database = {
             try { return JSON.stringify(v); } catch { return null; }
         };
 
+        // [FIX-SPLIT-CHAT] Normalize JIDs — parsed comes from messageParser which
+        // already normalizes, but defend in depth here too (direct insertMessage callers)
+        const chatJid   = normalizeJid(parsed.chat_jid);
+        const senderJid = normalizeJid(parsed.sender_jid);
+
+        if (!chatJid) throw new Error('insertMessage: invalid chat_jid');
+
         // Ensure chat row (FK safety)
-        const isGroup = (parsed.chat_jid || '').endsWith('@g.us');
+        const isGroup = chatJid.endsWith('@g.us');
         statements.ensureChat.run(
-            parsed.chat_jid,
+            chatJid,
             parsed.is_group ?? (isGroup ? 1 : 0),
             parsed.timestamp || Math.floor(Date.now() / 1000)
         );
 
         statements.insertMessage.run({
             id:                       parsed.id,
-            remote_jid:               parsed.chat_jid,
+            remote_jid:               chatJid,
             from_me:                  parsed.from_me ?? 0,
-            participant:              parsed.sender_jid || null,
+            participant:              senderJid || null,
             push_name:                parsed.pushname || parsed.sender_name || null,
             message_type:             parsed.msg_type || 'conversation',
             body:                     parsed.body || null,
@@ -1071,11 +1405,11 @@ const database = {
     getMessageById:       id                => statements.getMessageById.get(id) || null,
 
     // [FIX-3] Positional params
-    getMessages:          (jid, limit = 50, offset = 0) => statements.getMessagesByJid.all(jid, limit, offset),
-    getMessageCount:      jid               => (db.prepare('SELECT COUNT(*) as n FROM messages WHERE remote_jid = ? AND is_deleted = 0').get(jid)?.n) || 0,
+    getMessages:          (jid, limit = 50, offset = 0) => statements.getMessagesByJid.all(normalizeJid(jid), limit, offset),
+    getMessageCount:      jid               => (db.prepare('SELECT COUNT(*) as n FROM messages WHERE remote_jid = ? AND is_deleted = 0').get(normalizeJid(jid))?.n) || 0,
 
     // [FIX-6] Positional params
-    searchMessages:       (jid, query)      => statements.searchMessages.all(jid, `%${query}%`),
+    searchMessages:       (jid, query)      => statements.searchMessages.all(normalizeJid(jid), `%${query}%`),
     searchMessagesGlobal: query             => statements.searchMessagesGlobal.all(`%${query}%`),
 
     updateMessageStatus(id, status) {
@@ -1152,13 +1486,27 @@ const database = {
     saveChat(chat) {
         if (!chat?.id) return { success: false };
         try {
-            const jid = chat.id;
+            // [FIX-SPLIT-CHAT] Normalize JID — chat.id from Baileys can be @c.us (legacy)
+            // or have :device suffix. Without normalization, same chat gets 2+ rows.
+            const jid = normalizeJid(chat.id);
+            if (!jid) return { success: false };
+
+            const isGroup = jid.endsWith('@g.us') || jid.endsWith('@newsletter');
+
+            // [FIX-DEDUP-NAME] Baileys DM chat.name = push_name (e.g. "DCE"), NOT phonebook name.
+            // If we store it in chats.name, it wins over contacts.name ("BAS") in getChats COALESCE.
+            // Fix: only store chats.name for GROUPS (where it = group subject, always valid).
+            // For DM: store null → getChats COALESCE will fall through to contacts.name (phonebook).
+            // Side effect: if contact is NOT in phonebook, push_name still shows via contacts.push_name
+            // which is populated from contacts.set/upsert event.
+            const chatName = isGroup ? (chat.name || chat.subject || null) : null;
+
             statements.upsertChat.run({
                 jid,
-                name:                   chat.name || chat.subject || null,
-                is_group:               jid.endsWith('@g.us') ? 1 : 0,
+                name:                   chatName,
+                is_group:               isGroup ? 1 : 0,
                 is_community:           jid.endsWith('@newsletter') || chat.isCommunity ? 1 : 0,
-                community_jid:          chat.linkedParent || null,
+                community_jid:          chat.linkedParent ? normalizeJid(chat.linkedParent) : null,
                 unread_count:           chat.unreadCount ?? 0,
                 last_message_timestamp: chat.conversationTimestamp ? Number(chat.conversationTimestamp) : 0,
                 last_message_id:        chat.lastMessageKey?.id || null,
@@ -1170,6 +1518,18 @@ const database = {
                 status:                 null,
                 presence:               null,
             });
+
+            // [FIX-DEDUP-NAME] For DM: push_name from chat.name → save to contacts.push_name,
+            // NOT to chats.name. This way phonebook name still wins in getChats.
+            if (!isGroup && chat.name) {
+                const number = jid.split('@')[0] || null;
+                statements.upsertContactPushname.run({
+                    jid,
+                    push_name: chat.name,
+                    number,
+                });
+            }
+
             return { success: true };
         } catch (err) {
             console.error('[AuroraDB] saveChat:', err.message);
@@ -1179,12 +1539,22 @@ const database = {
 
     upsertChat({ jid, name, isGroup, isCommunity, communityJid, lastMsgAt, unreadDelta }) {
         if (!jid) return;
+        // [FIX-SPLIT-CHAT] Normalize jid — this method is called from various paths
+        const cleanJid = normalizeJid(jid);
+        if (!cleanJid) return;
+
+        // [FIX-DEDUP-NAME] Same as saveChat: don't write push_name into chats.name for DM.
+        // For groups, name = group subject (always valid).
+        // For DM, name from Baileys is push_name — redirect it to contacts.push_name instead.
+        const actualIsGroup = isGroup || cleanJid.endsWith('@g.us') || cleanJid.endsWith('@newsletter');
+        const chatName = actualIsGroup ? (name || null) : null;
+
         statements.upsertChat.run({
-            jid,
-            name:                   name || null,
-            is_group:               isGroup    ? 1 : 0,
+            jid:                    cleanJid,
+            name:                   chatName,
+            is_group:               actualIsGroup ? 1 : 0,
             is_community:           isCommunity ? 1 : 0,
-            community_jid:          communityJid || null,
+            community_jid:          communityJid ? normalizeJid(communityJid) : null,
             unread_count:           unreadDelta || 0,
             last_message_timestamp: lastMsgAt  || 0,
             last_message_id:        null,
@@ -1196,6 +1566,17 @@ const database = {
             status:                 null,
             presence:               null,
         });
+
+        // Redirect DM push_name to contacts table so getChats COALESCE works correctly
+        if (!actualIsGroup && name) {
+            try {
+                statements.upsertContactPushname.run({
+                    jid: cleanJid,
+                    push_name: name,
+                    number: cleanJid.split('@')[0] || null,
+                });
+            } catch (_) {}
+        }
     },
 
     // [FIX-4] Positional params
@@ -1208,16 +1589,147 @@ const database = {
 
     searchChats(query) {
         const q = `%${query}%`;
-        return db.prepare(`SELECT c.jid, COALESCE(c.name, ct.name, ct.push_name) AS name, c.is_group, c.is_community, c.unread_count, c.pinned, c.last_message_timestamp AS last_msg_at FROM chats c LEFT JOIN contacts ct ON ct.jid = c.jid WHERE c.name LIKE ? OR ct.name LIKE ? OR ct.push_name LIKE ? OR c.jid LIKE ? ORDER BY c.last_message_timestamp DESC LIMIT 30`).all(q, q, q, q);
+        return db.prepare(`
+            SELECT
+                c.jid,
+                CASE
+                    WHEN c.is_group = 1
+                        THEN COALESCE(c.name, ct.name, ct.push_name)
+                    ELSE
+                        -- DM: phonebook (ct.name) wins over push_name (c.name)
+                        COALESCE(ct.name, ct.push_name, ct.short_name, c.name, c.jid)
+                END AS name,
+                c.is_group, c.is_community, c.unread_count, c.pinned,
+                c.last_message_timestamp AS last_msg_at
+            FROM chats c
+            LEFT JOIN contacts ct ON ct.jid = c.jid
+            WHERE c.name LIKE ? OR ct.name LIKE ? OR ct.push_name LIKE ? OR c.jid LIKE ?
+            ORDER BY c.last_message_timestamp DESC
+            LIMIT 30
+        `).all(q, q, q, q);
     },
 
-    markChatRead:       jid     => jid && statements.markChatRead.run(jid),
-    updateChatRead:     jid     => jid && statements.markChatRead.run(jid),
-    pinChat:            (jid,v) => jid && statements.updateChatPinned.run(v ? 1 : 0, jid),
-    updateChatPinned:   (jid,v) => jid && statements.updateChatPinned.run(v ? 1 : 0, jid),
-    archiveChat:        (jid,v) => jid && statements.updateChatArchived.run(v ? 1 : 0, jid),
-    updateChatArchived: (jid,v) => jid && statements.updateChatArchived.run(v ? 1 : 0, jid),
-    updateChatUnread:   (jid,c) => jid && statements.updateChatUnread.run(c ?? 0, jid),
+    // [FIX-PREVIEW] Called once after history sync completes.
+    // For all chats that have last_message_id but no last_message_body,
+    // pull the body + type from the messages table.
+    // Also fixes from_me by ensuring the message row exists for the JOIN.
+    backfillChatLastMessages() {
+        try {
+            const count = db.prepare(`
+                UPDATE chats
+                SET
+                    last_message_body = (
+                        SELECT COALESCE(body, '[' || message_type || ']')
+                        FROM messages
+                        WHERE id = chats.last_message_id
+                        LIMIT 1
+                    ),
+                    last_message_type = (
+                        SELECT message_type FROM messages WHERE id = chats.last_message_id LIMIT 1
+                    ),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE last_message_id IS NOT NULL
+                  AND (last_message_body IS NULL OR last_message_body = '')
+            `).run();
+            console.log(`[AuroraDB] backfillChatLastMessages: ${count.changes} chats updated`);
+        } catch (err) {
+            console.error('[AuroraDB] backfillChatLastMessages error:', err.message);
+        }
+    },
+    // Pulls all distinct (jid, push_name) from messages → upserts into contacts.
+    // Covers DM contacts that never sent a live message and only exist in history.
+    //
+    // FIX-DEDUP: Use most recent push_name (highest message_timestamp), not random GROUP BY.
+    // SQLite GROUP BY without ORDER BY is non-deterministic — could pick any push_name.
+    backfillContactPushnames() {
+        try {
+            // Pick the push_name from the most recent message per sender JID.
+            // CASE: only DM senders (not own messages, not raw group JIDs).
+            const rows = db.prepare(`
+                SELECT
+                    CASE
+                        WHEN from_me = 0 AND remote_jid NOT LIKE '%@g.us' THEN remote_jid
+                        WHEN participant IS NOT NULL AND participant != '' THEN participant
+                        ELSE NULL
+                    END AS jid,
+                    push_name,
+                    MAX(message_timestamp) AS ts
+                FROM messages
+                WHERE push_name IS NOT NULL AND push_name != ''
+                GROUP BY jid
+                HAVING jid IS NOT NULL
+                ORDER BY ts DESC
+            `).all();
+
+            const upsert = db.prepare(`
+                INSERT INTO contacts (jid, push_name, number, is_user, is_group)
+                VALUES (?, ?, ?, 1, 0)
+                ON CONFLICT(jid) DO UPDATE SET
+                    push_name  = CASE
+                        WHEN contacts.name IS NOT NULL THEN contacts.push_name
+                        ELSE COALESCE(excluded.push_name, contacts.push_name)
+                    END,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE contacts.push_name IS NULL AND excluded.push_name IS NOT NULL
+            `);
+
+            db.transaction((list) => {
+                for (const row of list) {
+                    if (!row.jid || !row.push_name) continue;
+                    const jid = normalizeJid(row.jid);
+                    if (!jid) continue;
+                    upsert.run(jid, row.push_name, jid.split('@')[0] || null);
+                }
+            })(rows);
+
+            console.log(`[AuroraDB] backfillContactPushnames: ${rows.length} rows processed`);
+        } catch (err) {
+            console.error('[AuroraDB] backfillContactPushnames error:', err.message);
+        }
+    },
+
+    // [FIX-PUSHNAME] Save pushname from live messages into contacts table
+    upsertContactPushname(senderJid, pushName) {
+        if (!senderJid || !pushName) return;
+        try {
+            const jid    = normalizeJid(senderJid);
+            const number = jid.split('@')[0] || null;
+            statements.upsertContactPushname.run({ jid, push_name: pushName, number });
+        } catch (err) { /* ignore */ }
+    },
+
+    // [FIX-PROFILE-PIC] Persist fetched profile pic URL so we don't fetch every time
+    cacheProfilePic(jid, url) {
+        if (!jid) return;
+        const nJid = normalizeJid(jid); // [FIX-SPLIT-CHAT]
+        try {
+            statements.updateChatProfilePic.run(url || null, nJid);
+            statements.updateContactProfilePic.run(url || null, nJid);
+        } catch (err) { /* ignore */ }
+    },
+
+    // Get cached profile pic URL without making a network call
+    getCachedProfilePic(jid) {
+        if (!jid) return null;
+        const nJid = normalizeJid(jid); // [FIX-SPLIT-CHAT]
+        try {
+            const row = db.prepare(
+                'SELECT COALESCE(c.profile_pic_url, ct.profile_pic_url) AS url ' +
+                'FROM chats c LEFT JOIN contacts ct ON ct.jid = c.jid ' +
+                'WHERE c.jid = ?'
+            ).get(nJid);
+            return row?.url || null;
+        } catch { return null; }
+    },
+
+    // [FIX-SPLIT-CHAT] All JID-keyed operations go through normalizeJid
+    markChatRead:       jid     => { const n=normalizeJid(jid); return n && statements.markChatRead.run(n); },
+    updateChatRead:     jid     => { const n=normalizeJid(jid); return n && statements.markChatRead.run(n); },
+    pinChat:            (jid,v) => { const n=normalizeJid(jid); return n && statements.updateChatPinned.run(v ? 1 : 0, n); },
+    updateChatPinned:   (jid,v) => { const n=normalizeJid(jid); return n && statements.updateChatPinned.run(v ? 1 : 0, n); },
+    archiveChat:        (jid,v) => { const n=normalizeJid(jid); return n && statements.updateChatArchived.run(v ? 1 : 0, n); },
+    updateChatArchived: (jid,v) => { const n=normalizeJid(jid); return n && statements.updateChatArchived.run(v ? 1 : 0, n); },
+    updateChatUnread:   (jid,c) => { const n=normalizeJid(jid); return n && statements.updateChatUnread.run(c ?? 0, n); },
 
     // ════════════════════════════════════════════════════════════
     // CONTACTS
@@ -1226,12 +1738,15 @@ const database = {
     saveContact(contact) {
         if (!contact?.id) return { success: false };
         try {
+            // [FIX-SPLIT-CHAT] Normalize contact JID — @c.us legacy format
+            const jid = normalizeJid(contact.id);
+            if (!jid) return { success: false };
             statements.insertContact.run({
-                jid:             contact.id,
+                jid,
                 name:            contact.name || contact.verifiedName || null,
                 push_name:       contact.pushname || contact.notify || null,
                 short_name:      contact.shortName || null,
-                number:          contact.number || contact.id.split('@')[0] || null,
+                number:          contact.number || jid.split('@')[0] || null,
                 status:          contact.status || null,
                 profile_pic_url: contact.profilePicUrl || null,
                 is_group:        contact.isGroup    ? 1 : 0,
@@ -1279,8 +1794,60 @@ const database = {
 
     getPendingMediaDownloads: () => statements.getPendingMediaDownloads.all(),
 
+    // [PREFETCH] Get pending media rows for a specific chat JID
+    getMediaPendingForChat(jid, limit = 20) {
+        if (!jid) return [];
+        try {
+            return statements.getMediaPendingForChatStmt.all(normalizeJid(jid), limit);
+        } catch (err) {
+            console.error('[AuroraDB] getMediaPendingForChat:', err.message);
+            return [];
+        }
+    },
+
+    // ════════════════════════════════════════════════════════════
+    // [LID] Retroactively fix @lid JIDs that leaked into DB before
+    // lidMap was populated. Scans messages + chats tables and replaces
+    // any remote_jid / chat_jid ending in @lid with the resolved real JID.
+    // Runs in a single fast SQLite transaction. Returns count of rows fixed.
+    // ════════════════════════════════════════════════════════════
+    resolveLidRows(lidMap) {
+        if (!lidMap || lidMap.size === 0) return 0;
+        let totalFixed = 0;
+        const fixAll = db.transaction(() => {
+            for (const [lidJid, realJid] of lidMap) {
+                if (!lidJid || !realJid || lidJid === realJid) continue;
+                totalFixed += statements.lidFixMessages.run(realJid, lidJid).changes;
+                totalFixed += statements.lidFixParticipant.run(realJid, lidJid).changes;
+                totalFixed += statements.lidFixChats.run(realJid, lidJid).changes;
+                totalFixed += statements.lidFixContacts.run(realJid, lidJid).changes;
+            }
+        });
+        try {
+            fixAll();
+        } catch (err) {
+            console.error('[AuroraDB] resolveLidRows error:', err.message);
+        }
+        return totalFixed;
+    },
+
     // ════════════════════════════════════════════════════════════
     // SYNC STATUS
+    // [FIX-PREVIEW] Public method for updating chat last message — always uses full statement
+    // so last_message_type is also updated (needed for chat list preview icons)
+    updateChatLastMsg(jid, { timestamp, message_id, body, msg_type }) {
+        if (!jid) return;
+        try {
+            statements.updateChatLastMessageFull.run({
+                jid:        normalizeJid(jid),
+                timestamp,
+                message_id,
+                body:       body || null,
+                msg_type:   msg_type || null,
+            });
+        } catch (err) { console.error('[AuroraDB] updateChatLastMsg:', err.message); }
+    },
+
     // [FIX-10] Statement terpisah, tidak pakai updateSyncStatus
     // ════════════════════════════════════════════════════════════
 
@@ -1311,6 +1878,30 @@ const database = {
     getMessagesFromDB:  (jid, limit, offset) => database.getMessages(jid, limit, offset),
     searchMessagesInDB: (jid, query)         => database.searchMessages(jid, query),
     getDBStats:         ()                   => database.getStats(),
+
+    // ── [FIX-GROUP-NAME] Update group chat name/subject from groupMetadata ──
+    // Called after connection:open to backfill group names that were missing.
+    updateGroupSubject(jid, subject) {
+        if (!jid || !subject) return
+        try {
+            db.prepare(`
+                UPDATE chats SET name = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE jid = ? AND is_group = 1
+            `).run(subject, jid)
+        } catch (_) {}
+    },
+
+    // ── [FIX-GROUP-NAME] Bulk: get all group JIDs that have no name ──────────
+    getGroupsWithoutName() {
+        try {
+            return db.prepare(`
+                SELECT jid FROM chats
+                WHERE is_group = 1 AND is_community = 0
+                AND (name IS NULL OR name = '' OR name GLOB '[0-9]*')
+                LIMIT 50
+            `).all().map(r => r.jid)
+        } catch (_) { return [] }
+    },
 };
 
 module.exports = database;

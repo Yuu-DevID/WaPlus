@@ -17,6 +17,7 @@ import { useAppStore } from "../store/app"
 import { format, isToday, isYesterday } from "date-fns"
 import MessageBubble from "./MessageBubble"
 import MessageInput from "./MessageInput"
+import { useMediaPrefetch } from "../hooks/useMediaPrefetch"
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 const toBool = (v) => v === 1 || v === true
@@ -32,7 +33,48 @@ function getColor(s) {
 }
 function initials(n) {
   if (!n) return "?"
+  const stripped = n.replace(/[\s\-+().]/g, "")
+  if (/^\d{6,}$/.test(stripped)) return stripped.slice(-2)
   return n.trim().split(/\s+/).slice(0, 2).map(w => w[0]).join("").toUpperCase()
+}
+
+/**
+ * resolveDisplayName — single function that converts ANY JID or raw name into
+ * a human-readable display name. Handles every ugly variant WA can produce:
+ *
+ *   @lid JID            → "+175784908046590"  (unknown, not in contacts)
+ *   @s.whatsapp.net     → "+628xxxx"          (unsaved contact)
+ *   @g.us               → group name as-is
+ *   raw digits only     → "+628xxxx" formatted
+ *   normal saved name   → returned as-is
+ *
+ * Priority: saved name → phone from JID → safe fallback
+ */
+function resolveDisplayName(jid, savedName) {
+  // 1. If savedName exists and is NOT a raw JID (no "@"), use it
+  if (savedName && !savedName.includes("@") && !/^\d{6,}$/.test(savedName.trim())) {
+    return savedName
+  }
+
+  // 2. Extract parts from JID
+  if (!jid) return savedName || "Unknown"
+  const atIdx = jid.lastIndexOf("@")
+  const server = atIdx !== -1 ? jid.slice(atIdx + 1) : ""
+  const user   = atIdx !== -1 ? jid.slice(0, atIdx) : jid
+
+  // Groups / newsletters → saved name or strip to group ID fragment
+  if (server === "g.us" || server === "newsletter") {
+    return savedName || user.slice(-6) || "Grup"
+  }
+
+  // @lid, @s.whatsapp.net, @c.us — user part should be pure digits
+  // Strip any device suffix (colon) just in case
+  const cleanUser = user.split(":")[0]
+  if (/^\d{6,}$/.test(cleanUser)) {
+    return `+${cleanUser}`
+  }
+
+  return savedName || cleanUser || "Unknown"
 }
 
 // ── Avatar ────────────────────────────────────────────────────────────────────
@@ -147,24 +189,30 @@ export default function ChatWindow({ jid }) {
   const { setRightPanel } = useAppStore()
 
   const [loading, setLoading] = useState(true)
+  const [replyTo, setReplyTo] = useState(null)   // [REPLY] message being replied to
   const bottomRef  = useRef(null)
   const areaRef    = useRef(null)
   const prevJidRef = useRef(null)
+  // [REPLY] Map msgId → DOM element ref for scroll-to-message
+  const msgRefsMap = useRef({})
 
   // Resolve chat info
   const chat = chats.find(c => c.jid === jid)
-  const rawName = chat?.name || ""
-  const name = (rawName && !/^\d{6,}$/.test(rawName.trim()))
-    ? rawName
-    : formatPhone((jid || "").split("@")[0])
+  // [FIX-LID] resolveDisplayName handles @lid, @s.whatsapp.net, unsaved contacts
+  const name = resolveDisplayName(jid, chat?.name || "")
 
   const msgs = messages[jid] || []
   const isGroup = (jid || "").endsWith("@g.us")
+
+  // [PREFETCH] Fire high-priority media prefetch when this chat opens.
+  // Downloads pending images/videos/stickers in background before user scrolls.
+  useMediaPrefetch(jid)
 
   // ── [FIX-1 + FIX-5] On JID change: clear old, load new, register active ──
   useEffect(() => {
     if (!jid) return
     prevJidRef.current = jid
+    setReplyTo(null)  // [REPLY] clear reply state on chat switch
 
     // Tell store which chat is active (enables store-level auto-refresh)
     setActiveJid(jid)
@@ -315,6 +363,17 @@ export default function ChatWindow({ jid }) {
 
   const grouped = groupByDate(msgs)
 
+  // [REPLY] Scroll to a message by ID and flash highlight it
+  const scrollToMsg = useCallback((msgId) => {
+    if (!msgId) return
+    const el = document.querySelector(`[data-msgid="${msgId}"]`)
+    if (el) {
+      el.scrollIntoView({ behavior: "smooth", block: "center" })
+      // Trigger highlight animation via custom event
+      setTimeout(() => el.dispatchEvent(new CustomEvent("msg-highlight")), 350)
+    }
+  }, [])
+
   // ════════════════════════════════════════════════════════════
   // RENDER
   // ════════════════════════════════════════════════════════════
@@ -366,14 +425,27 @@ export default function ChatWindow({ jid }) {
             if (item.type === "date") {
               return <DateSep key={item.key} date={item.ts} />
             }
-            return <MessageBubble key={item.key} msg={item.msg} />
+            return (
+              <div key={item.key} data-msgid={item.msg?.id}>
+                <MessageBubble
+                  msg={item.msg}
+                  onReply={setReplyTo}
+                  onScrollToMsg={scrollToMsg}
+                />
+              </div>
+            )
           })
         )}
         <div ref={bottomRef} />
       </div>
 
       {/* ── Input ── */}
-      <MessageInput chatJid={jid} />
+      <MessageInput
+        chatJid={jid}
+        chatName={name}
+        replyTo={replyTo}
+        onCancelReply={() => setReplyTo(null)}
+      />
     </div>
   )
 }
