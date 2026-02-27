@@ -93,6 +93,13 @@ contextBridge.exposeInMainWorld("api", {
   onMessagesReceipt: createListener("messages:receipt"),
 
   // ═══════════════════════════════════════════════════════════
+  // MEDIA
+  // ═══════════════════════════════════════════════════════════
+  // FIX: Event baru — dipanggil main.js setelah media berhasil didownload
+  // Renderer listen ini untuk update image bubble secara realtime
+  onMediaUpdated: createListener("media:updated"),
+
+  // ═══════════════════════════════════════════════════════════
   // MESSAGING
   // ═══════════════════════════════════════════════════════════
   sendMessage: ({ jid, body, type = "text", mediaPath = null }) =>

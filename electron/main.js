@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain } = require("electron")
+const { app, BrowserWindow, ipcMain, protocol } = require("electron")
 const path = require("path")
 const fs = require("fs")
 
@@ -27,6 +27,20 @@ function getDB() {
   return db
 }
 
+// ── Register custom protocol BEFORE app is ready ──────────────────
+// Ini wajib agar file:// bisa diakses dari renderer (Electron security)
+protocol.registerSchemesAsPrivileged([
+  {
+    scheme: "media",
+    privileges: {
+      secure: true,
+      standard: true,
+      supportFetchAPI: true,
+      bypassCSP: true,
+    },
+  },
+])
+
 function createWindow() {
   win = new BrowserWindow({
     width: 1280,
@@ -40,6 +54,8 @@ function createWindow() {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
       nodeIntegration: false,
+      // ── FIX 1: Allow file:// protocol dari renderer ──
+      webSecurity: false,
     },
   })
 
@@ -50,6 +66,22 @@ function createWindow() {
   } else {
     win.loadFile(path.join(__dirname, "../dist/index.html"))
   }
+
+  // ── FIX 2: Register custom "media://" protocol sebagai alternatif ──
+  // Renderer bisa pakai: media:///absolute/path/to/file.jpg
+  // Lebih aman daripada file:// langsung
+  win.webContents.session.protocol.registerFileProtocol("media", (request, callback) => {
+    try {
+      // Strip "media://" prefix
+      const url = request.url.replace("media://", "")
+      // Decode URL encoding
+      const filePath = decodeURIComponent(url)
+      callback({ path: filePath })
+    } catch (err) {
+      console.error("[AuroraChat] Protocol error:", err.message)
+      callback({ error: -2 }) // net::ERR_FAILED
+    }
+  })
 
   // ── Init DB ─────────────────────────────────────
   try {
@@ -95,13 +127,11 @@ ipcMain.handle("msg:send", async (_e, { jid, body, type = "text" }) => {
   try {
     if (!baileysClient) return { ok: false, error: "Client belum siap." }
     const result = await baileysClient.sendTextMessage(jid, body)
-    // result adalah WAMessage dari Baileys: { key: { id, remoteJid, fromMe }, ... }
-    // Pastikan key.id tersedia untuk dedup di renderer
     return {
       ok: true,
       message: {
         key: result?.key || {},
-        id: result?.key?.id || null,  // shortcut untuk kemudahan akses
+        id: result?.key?.id || null,
       }
     }
   } catch (err) {
@@ -221,16 +251,13 @@ ipcMain.handle("db:sync:status", () => {
 
 // ════════════════════════════════════════════════════════════
 // BAILEYS EVENT → DB BRIDGE
-// Called from baileys/client.js via direct require
 // ════════════════════════════════════════════════════════════
-// This module exports a function that the Baileys client can call
-// to write events to SQLite without going through IPC
+
 module.exports.onBaileysMessage = function (payload) {
   try {
     const d = getDB()
-    // ID selalu dari payload.key.id (Baileys WAMessage key)
     const msgId = payload.key?.id
-    if (!msgId) return // abaikan pesan tanpa ID valid
+    if (!msgId) return
 
     d.insertMessage({
       id: msgId,
@@ -249,16 +276,8 @@ module.exports.onBaileysMessage = function (payload) {
       raw: null,
     })
 
-    // Ambil media path dari DB setelah insert (bisa sudah didownload)
-    let mediaSavedPath = null
-    let mediaUrl = null
-    try {
-      const saved = d.getMessageById?.(msgId)
-      mediaSavedPath = saved?.media_saved_path || null
-      mediaUrl = saved?.media_url || null
-    } catch (_) {}
-
-    // Push ke renderer — payload harus lengkap agar MessageBubble bisa render
+    // Push ke renderer — media_saved_path mungkin belum ada saat ini,
+    // akan di-update via "media:updated" event setelah download selesai
     win?.webContents.send("db:messages:new", {
       chat_jid: payload.jid,
       message: {
@@ -273,16 +292,37 @@ module.exports.onBaileysMessage = function (payload) {
         has_media: payload.hasMedia ? 1 : 0,
         mimetype: payload.mimetype || null,
         duration: payload.duration || null,
-        media_saved_path: mediaSavedPath,
-        media_url: mediaUrl,
+        // FIX 3: media_saved_path awalnya null, akan di-update via event "media:updated"
+        media_saved_path: null,
+        media_url: payload.mediaUrl || null,
         is_group: payload.isGroup ? 1 : 0,
       }
     })
 
-    // Refresh chat list sidebar
     win?.webContents.send("db:chats:updated")
   } catch (err) {
     console.error("[AuroraChat] DB write error:", err.message)
+  }
+}
+
+// ── FIX 4: Event baru — dipanggil dari client.js setelah media selesai didownload ──
+// Renderer listen event ini lalu update state message yang sudah ada
+module.exports.onMediaDownloaded = function ({ msgId, chatJid, localPath }) {
+  try {
+    if (!msgId || !localPath) return
+    // Normalize path jadi forward slash dan pastikan ada file:// prefix
+    const normalized = localPath.replace(/\\/g, "/")
+    const fileUrl = normalized.startsWith("file://") ? normalized : `file://${normalized}`
+
+    win?.webContents.send("media:updated", {
+      id: msgId,
+      chat_jid: chatJid,
+      media_saved_path: fileUrl,
+    })
+
+    console.log(`[AuroraChat] Media ready → renderer: ${msgId}`)
+  } catch (err) {
+    console.error("[AuroraChat] onMediaDownloaded error:", err.message)
   }
 }
 
@@ -343,6 +383,7 @@ app.on("will-quit", () => {
 app.on("activate", () => {
   if (BrowserWindow.getAllWindows().length === 0) createWindow()
 })
+
 // ── Session check IPC ────────────────────────────────────
 ipcMain.handle("auth:check-session", () => {
   return { hasSession: hasExistingSession() }

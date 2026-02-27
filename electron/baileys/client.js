@@ -51,6 +51,8 @@ const {
   getAggregateVotesInPollMessage,
 } = require("baileys")
 
+// ADD MessageParser by Towartz
+const { parseMessage, buildRendererPayload } = require("./messageParser")
 const { Boom } = require("@hapi/boom")
 const pino = require("pino")
 const chalk = require("chalk")
@@ -190,13 +192,20 @@ async function _withDlSemaphore(fn) {
 }
 
 async function downloadAndSaveMedia(msg, messageType, isHistorySync = false) {
-  // Jangan download media dari history sync — URL sering expired/key kosong
-  if (isHistorySync) return { skipped: true, reason: 'history_sync' }
+  if (isHistorySync) return { skipped: true, reason: "history_sync" }
 
   return _withDlSemaphore(async () => {
     try {
+      // Unwrap inner message untuk viewOnce & wrappers lain
+      const rawMsg = msg.message?.ephemeralMessage?.message
+        || msg.message?.viewOnceMessage?.message
+        || msg.message?.viewOnceMessageV2?.message
+        || msg.message?.documentWithCaptionMessage?.message
+        || msg.message
+      const msgToDownload = rawMsg !== msg.message ? { ...msg, message: rawMsg } : msg
+
       const buffer = await Promise.resolve(
-        downloadMediaMessage(msg, 'buffer', {}, {
+        downloadMediaMessage(msgToDownload, "buffer", {}, {
           logger,
           reuploadRequest: sock?.updateMediaMessage,
         })
@@ -207,40 +216,47 @@ async function downloadAndSaveMedia(msg, messageType, isHistorySync = false) {
       const sizeMB = buffer.length / (1024 * 1024)
       if (sizeMB > CONFIG.MAX_MEDIA_SIZE_MB) {
         logW(`Media too large: ${sizeMB.toFixed(2)}MB, skipping`)
-        return { skipped: true, reason: 'too_large', size: buffer.length }
+        return { skipped: true, reason: "too_large", size: buffer.length }
       }
 
-      const msgObj = msg.message?.[messageType]
-      const ext = getExtensionFromMimetype(msgObj?.mimetype || 'application/octet-stream')
+      const msgObj = msgToDownload.message?.[messageType]
+      const ext = getExtensionFromMimetype(msgObj?.mimetype || "application/octet-stream")
       const filename = `${msg.key.id}_${Date.now()}.${ext}`
       const localPath = path.join(CONFIG.MEDIA_DIR, filename)
 
       fs.writeFileSync(localPath, buffer)
-
-      db.updateMediaDownload(msg.key.id, localPath, buffer.length, 'downloaded')
-      db.updateMediaSavedPath(msg.key.id, localPath)
+      db.updateMediaDownload?.(msg.key.id, localPath, buffer.length, "downloaded")
+      db.updateMediaSavedPath?.(msg.key.id, localPath)
 
       logOk(`Media downloaded: ${filename} (${sizeMB.toFixed(2)}MB)`)
+
+      // ── Notify renderer via main.js ──────────────────────
+      try {
+        const mainModule = require("../main")
+        mainModule?.onMediaDownloaded?.({
+          msgId: msg.key.id,
+          chatJid: msg.key.remoteJid,
+          localPath,
+        })
+      } catch (_) {}
+
       return { localPath, size: buffer.length, filename }
     } catch (error) {
       const msg_err = error.message || String(error)
-      const isExpired = msg_err.includes('empty media key') || msg_err.includes('Cannot derive')
-      const isNetwork = msg_err.includes('terminated') || msg_err.includes('fetch') || msg_err.includes('ECONNRESET')
+      const isExpired = msg_err.includes("empty media key") || msg_err.includes("Cannot derive")
+      const isNetwork = msg_err.includes("terminated") || msg_err.includes("fetch") || msg_err.includes("ECONNRESET")
 
       if (!isExpired) {
-        if (isNetwork) {
-          logW(`Media network error (${msg.key.id?.slice(0,8)}…): ${msg_err.slice(0,80)}`)
-        } else {
-          logE(`Error downloading media: ${msg_err}`)
-        }
+        isNetwork
+          ? logW(`Media network error (${msg.key.id?.slice(0, 8)}…): ${msg_err.slice(0, 80)}`)
+          : logE(`Error downloading media: ${msg_err}`)
       }
 
-      try { db.updateMediaDownload(msg.key.id, null, null, 'failed', msg_err.slice(0,200)) } catch (_) {}
+      try { db.updateMediaDownload?.(msg.key.id, null, null, "failed", msg_err.slice(0, 200)) } catch (_) {}
       return { error: msg_err }
     }
   })
 }
-
 
 function getExtensionFromMimetype(mimetype) {
   const map = {
@@ -277,92 +293,116 @@ function cleanupSocket() {
 }
 
 // ════════════════════════════════════════════════════════════
+// ── ADD: resolveMediaTypeKey ─────────────────────────────────
+// Mapping msgType → key di msg.message untuk downloadMediaMessage
+// ════════════════════════════════════════════════════════════
+
+function resolveMediaTypeKey(msgType, message) {
+  if (!message) return null
+  const m = message.ephemeralMessage?.message
+    || message.viewOnceMessage?.message
+    || message.viewOnceMessageV2?.message
+    || message.documentWithCaptionMessage?.message
+    || message
+
+  const map = {
+    imageMessage: "imageMessage",
+    videoMessage: "videoMessage",
+    audioMessage: "audioMessage",
+    pttMessage: "audioMessage",
+    documentMessage: "documentMessage",
+    stickerMessage: "stickerMessage",
+  }
+  if (map[msgType] && m[map[msgType]]) return map[msgType]
+
+  if (msgType === "viewOnceMessage") {
+    const inner = m.viewOnceMessage?.message
+    if (inner?.imageMessage) return "imageMessage"
+    if (inner?.videoMessage) return "videoMessage"
+  }
+  if (msgType === "viewOnceMessageV2") {
+    const inner = m.viewOnceMessageV2?.message
+    if (inner?.imageMessage) return "imageMessage"
+    if (inner?.videoMessage) return "videoMessage"
+  }
+  return null
+}
+
+// ════════════════════════════════════════════════════════════
 // MESSAGE HANDLER
 // ════════════════════════════════════════════════════════════
 
 async function handleMessage(msg, type, isHistorySync = false) {
   if (!msg.message) return
-
-  // Skip status broadcasts
   if (isJidStatusBroadcast(msg.key.remoteJid || "")) return
   if (isJidBroadcast(msg.key.remoteJid || "")) return
 
-  // Save to database
-  const saveResult = db.saveMessage(msg, isHistorySync, isHistorySync ? 'history' : 'live')
+  // ── Parse dengan messageParser ───────────────────────────
+  const parsed = parseMessage(msg, {
+    jid: msg.key.remoteJid,
+    pushname: msg.pushName || null,
+    isHistorySync,
+    myJid: sock?.user?.id || null,
+  })
+  if (!parsed?.id) return
 
-  if (saveResult.success) {
-    // Queue media download if has media
-    if (saveResult.hasMedia && CONFIG.AUTO_DOWNLOAD_MEDIA) {
-      const mediaTypes = ['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage', 'stickerMessage']
-      const mediaType = mediaTypes.find(mt => msg.message[mt])
-      if (mediaType) {
-        db.queueMediaDownload(msg.key.id, msg.key.remoteJid, mediaType.replace('Message', ''), msg.message[mediaType].url)
-        // Download async — pass isHistorySync agar media lama tidak di-download
-        downloadAndSaveMedia(msg, mediaType, isHistorySync).catch(() => {})
-      }
+  // ── Simpan ke DB ─────────────────────────────────────────
+  try {
+    db.insertMessage(parsed)
+  } catch (err) {
+    if (err.message?.includes("UNIQUE")) {
+      try { db.updateMessageStatus?.(parsed.id, parsed.status) } catch (_) {}
+    } else {
+      logE(`DB insert error: ${err.message}`)
+      return
     }
-
-    // Update sync stats if history sync
-    if (isHistorySync) {
-      syncStats.messages++
-    }
-
-    // Update chat last message in DB (so chat list shows correct preview)
-    const jid = msg.key.remoteJid || ""
-    const body = extractBody(msg.message)
-    if (!isHistorySync && jid) {
-      try {
-        db.statements?.updateChatLastMessage?.run({
-          jid,
-          timestamp: Number(msg.messageTimestamp) || Math.floor(Date.now() / 1000),
-          message_id: msg.key.id,
-          body: body || null,
-        })
-      } catch (_) {}
-    }
-
-    // Emit to renderer
-    const isGroup = isJidGroup(jid)
-    const isMe = msg.key.fromMe
-    const pushname = msg.pushName || "Unknown"
-    
-
-    // Cache for retry
-    if (msg.message) {
-      msgRetryCache.set(msg.key.id, msg.message)
-    }
-
-    // Log
-    if (!isMe && body && !isHistorySync) {
-      const colors = ["green", "yellow", "magenta", "cyan", "blue"]
-      const c = colors[Math.floor(Math.random() * colors.length)]
-      console.log(
-        tag("green", "MSG"),
-        chalk[c](`${pushname} (${jid})`),
-        chalk.white("→"),
-        chalk.white(body.length > 120 ? body.slice(0, 120) + "…" : body)
-      )
-    }
-
-    // Send to renderer
-    send("messages:new", {
-      key: msg.key,
-      message: msg.message,
-      body,
-      msgType: saveResult.type,
-      jid,
-      sender: isMe ? (sock.user?.id ?? "") : (msg.participant || jid),
-      pushname,
-      isGroup,
-      isMe,
-      timestamp: Number(msg.messageTimestamp) || Math.floor(Date.now() / 1000),
-      status: msg.status ?? 0,
-      starred: msg.starred ?? false,
-      broadcast: msg.broadcast ?? false,
-      hasMedia: saveResult.hasMedia,
-      isHistorySync,
-    })
   }
+
+  // ── Queue media download (hanya live, bukan history sync) ─
+  if (parsed.has_media && CONFIG.AUTO_DOWNLOAD_MEDIA && !isHistorySync) {
+    const mediaTypeKey = resolveMediaTypeKey(parsed.msg_type, msg.message)
+    if (mediaTypeKey) {
+      db.queueMediaDownload?.(parsed.id, parsed.chat_jid, parsed.msg_type, parsed.media_url)
+      downloadAndSaveMedia(msg, mediaTypeKey, false).catch(() => {})
+    }
+  }
+
+  // ── Update chat last message di DB ────────────────────────
+  if (!isHistorySync && parsed.chat_jid) {
+    try {
+      db.statements?.updateChatLastMessage?.run({
+        jid: parsed.chat_jid,
+        timestamp: parsed.timestamp,
+        message_id: parsed.id,
+        body: parsed.body || null,
+      })
+    } catch (_) {}
+  }
+
+  // History sync: hanya save ke DB, tidak push ke renderer
+  if (isHistorySync) {
+    syncStats.messages++
+    return
+  }
+
+  // ── Cache for retry ───────────────────────────────────────
+  if (msg.message) msgRetryCache.set(msg.key.id, msg.message)
+
+  // ── Log ───────────────────────────────────────────────────
+  if (!parsed.from_me && parsed.body) {
+    const colors = ["green", "yellow", "magenta", "cyan", "blue"]
+    const c = colors[Math.floor(Math.random() * colors.length)]
+    console.log(
+      tag("green", "MSG"),
+      chalk[c](`${parsed.pushname} (${parsed.chat_jid})`),
+      chalk.white("→"),
+      chalk.white(parsed.body.length > 120 ? parsed.body.slice(0, 120) + "…" : parsed.body)
+    )
+  }
+
+  // ── Push ke renderer ─────────────────────────────────────
+  send("messages:new", buildRendererPayload(parsed))
+  send("db:chats:updated")
 }
 
 // ════════════════════════════════════════════════════════════
