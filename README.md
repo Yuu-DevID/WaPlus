@@ -1,6 +1,6 @@
 FIx Bugs:
-
+- qr display
 
 
 Known Bugs:
-- qr display
+- voice message and other message
