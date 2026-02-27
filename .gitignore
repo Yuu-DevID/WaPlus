@@ -15,6 +15,7 @@ electron/baileys/media/
 electron/baileys/database/*.db
 electron/baileys/database/*.db-shm
 electron/baileys/database/*.db-wal
+electron/baileys/lid_map.json
 
 # Logs
 logs/
@@ -37,3 +38,4 @@ npm-debug.log*
 Thumbs.db
 WaPlus-dev.zip
 Tree_Project.txt
+
