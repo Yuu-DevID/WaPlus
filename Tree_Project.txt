@@ -1,0 +1,55 @@
+Project : WaPlus-dev
+Generated: 2026-02-27 05:53:59
+==================================================
+WaPlus-dev/
+├── .git/
+│   └── ...
+├── electron/
+│   ├── baileys/
+│   │   ├── database/
+│   │   │   └── ...
+│   │   ├── media/
+│   │   │   └── ...
+│   │   ├── session/
+│   │   │   └── ...
+│   │   ├── client.js
+│   │   ├── database.js
+│   │   └── messageParser.js
+│   ├── db/
+│   │   └── database.js
+│   ├── main.js
+│   └── preload.js
+├── node_modules/
+│   └── ...
+├── src/
+│   ├── components/
+│   │   ├── ChatItem.jsx
+│   │   ├── ChatList.jsx
+│   │   ├── ChatWindow.jsx
+│   │   ├── ContactPanel.jsx
+│   │   ├── CountrySelect.jsx
+│   │   ├── MessageBubble.jsx
+│   │   ├── MessageInput.jsx
+│   │   ├── QRDisplay.jsx
+│   │   ├── Sidebar.jsx
+│   │   └── StepIndicator.jsx
+│   ├── data/
+│   │   └── countries.js
+│   ├── pages/
+│   │   ├── Auth.jsx
+│   │   └── Main.jsx
+│   ├── store/
+│   │   ├── app.js
+│   │   ├── auth.js
+│   │   └── chat.js
+│   ├── App.jsx
+│   ├── main.jsx
+│   └── styles.css
+├── .gitignore
+├── Tree_Project.txt
+├── index.html
+├── package-lock.json
+├── package.json
+├── project_tree.py
+├── tailwind.config.js
+└── vite.config.js

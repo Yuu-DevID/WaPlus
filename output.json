@@ -1,0 +1,47 @@
+{
+  "key": {
+    "remoteJid": "120363423582568389@g.us",
+    "fromMe": false,
+    "id": "ACD1D02AA34BE4CBA75EFC0C1CE9214F",
+    "participant": "6282260526230@s.whatsapp.net"
+  },
+  "messageTimestamp": 1772137488,
+  "pushName": "wylayy",
+  "broadcast": false,
+  "message": {
+    "conversation": "mending gtps",
+    "messageContextInfo": {
+      "messageSecret": "rZtv+HQMrSvjkkTfX1E2q0vsSFMtyBzGaOyqEaYXxDg=",
+      "limitSharingV2": {
+        "sharingLimited": true,
+        "trigger": "CHAT_SETTING",
+        "limitSharingSettingTimestamp": "1770208172265",
+        "initiatedByMe": false
+      }
+    }
+  },
+  "id": "ACD1D02AA34BE4CBA75EFC0C1CE9214F",
+  "isBaileys": false,
+  "chatId": "120363423582568389@g.us",
+  "chatLid": "",
+  "fromMe": false,
+  "from": "120363423582568389@g.us",
+  "isBroadcast": false,
+  "isStatusBroadcast": false,
+  "isNewsletter": false,
+  "isGroup": true,
+  "isUser": false,
+  "senderId": "6282260526230@s.whatsapp.net",
+  "participant": "6282260526230@s.whatsapp.net",
+  "mtype": "conversation",
+  "msg": "mending gtps",
+  "quoted": null,
+  "body": "mending gtps",
+  "mentionedJid": [],
+  "text": "mending gtps",
+  "isCmd": false,
+  "cmd": "mending",
+  "args": [
+    "gtps"
+  ]
+}
