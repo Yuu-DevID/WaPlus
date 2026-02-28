@@ -264,6 +264,50 @@ function normalizeMsgType(rawType) {
     "ephemeralMessage": "ephemeral",
     "viewOnceMessage": "viewOnceMessage",
     "viewOnceMessageV2": "viewOnceMessageV2",
+
+    // ── Proto types tambahan dari WAProto.proto ────────────────────────────
+    // Album (multiple images/videos in one message)
+    "albumMessage": "albumMessage",
+
+    // Encrypted comment (e.g. status replies, broadcast)
+    "encCommentMessage": "encCommentMessage",
+
+    // Status mention (when someone mentions you in their Status)
+    "statusMentionMessage": "statusMentionMessage",
+
+    // Group mentioned message (system message when group is tagged)
+    "groupMentionedMessage": "groupMentionedMessage",
+
+    // Business call (bcall = business/VOIP call message)
+    "bcallMessage": "bcallMessage",
+
+    // Placeholder — proto-level placeholder for unsupported future types
+    "placeholderMessage": "placeholderMessage",
+
+    // Encrypted event update (edit to a WA Event)
+    "encEventUpdateMessage": "encEventUpdateMessage",
+
+    // Bot invoke (AI/bot interactions inside WA)
+    "botInvokeMessage": "botInvokeMessage",
+
+    // Encrypted reaction (reaction with additional privacy layer)
+    "encReactionMessage": "encReactionMessage",
+
+    // Message history bundle (synced history chunk)
+    "messageHistoryBundle": "messageHistoryBundle",
+
+    // Product catalog + invoice
+    "invoiceMessage": "invoiceMessage",
+    "productCatalogMessage": "productCatalogMessage",
+
+    // Payment invite (merchant payment link)
+    "paymentInviteMessage": "paymentInviteMessage",
+
+    // Request to join a call
+    "callToAction": "callToAction",
+
+    // Native flow (for interactive native flows like OTP, forms)
+    "nativeFlowMessage": "nativeFlowMessage",
   }
 
   return aliases[rawType] || rawType
@@ -439,16 +483,145 @@ function extractBody(message, msgType) {
     }
 
     // ── Call log ───────────────────────────────────────────
-    case "callLogMessage":
-      return m.callLogMessage?.isVideo ? "Panggilan Video" : "Panggilan Suara"
+    case "callLogMessage": {
+      const cl = m.callLogMessage
+      if (!cl) return "Panggilan"
+      const kind = cl.isVideo ? "Video" : "Suara"
+      const outcome = cl.callOutcome
+      // callOutcome: 1=answered, 2=missed, 4=declined, 8=failed
+      if (outcome === 2) return `Panggilan ${kind} Tak Terjawab`
+      if (outcome === 4) return `Panggilan ${kind} Ditolak`
+      if (cl.durationSecs) {
+        const m_ = Math.floor(cl.durationSecs / 60)
+        const s_ = cl.durationSecs % 60
+        const dur = m_ > 0 ? `${m_}m ${s_}d` : `${s_}d`
+        return `Panggilan ${kind} (${dur})`
+      }
+      return `Panggilan ${kind}`
+    }
+
+    // ── Scheduled call ─────────────────────────────────────
+    case "scheduledCallCreationMessage": {
+      const sc = m.scheduledCallCreationMessage
+      if (!sc) return "Jadwal Panggilan"
+      const title = sc.title || sc.scheduledTimestamp
+        ? `"${sc.title}" `
+        : ""
+      return `Jadwal Panggilan ${title}dibuat`
+    }
+
+    case "scheduledCallEditMessage":
+      return m.scheduledCallEditMessage?.title
+        ? `Jadwal Panggilan "${m.scheduledCallEditMessage.title}" diubah`
+        : "Jadwal Panggilan diubah"
 
     // ── Event ──────────────────────────────────────────────
-    case "eventMessage":
-      return m.eventMessage?.name || "Acara"
+    case "eventMessage": {
+      const ev = m.eventMessage?.event || m.eventMessage
+      if (!ev) return "Acara"
+      const parts = [ev.name || "Acara"]
+      if (ev.startTime) {
+        const d = new Date(Number(ev.startTime) * 1000)
+        parts.push(d.toLocaleDateString("id-ID", { day: "numeric", month: "short", year: "numeric" }))
+      }
+      if (ev.location?.name) parts.push(`📍 ${ev.location.name}`)
+      return parts.join(" · ")
+    }
+
+    // ── Encrypted event update ─────────────────────────────
+    case "encEventUpdateMessage":
+      return m.encEventUpdateMessage?.description || "Acara diperbarui"
+
+    // ── Pin in chat ────────────────────────────────────────
+    case "pinInChatMessage": {
+      const pin = m.pinInChatMessage
+      if (!pin) return "Pesan disematkan"
+      return pin.type === 1 ? "Pesan disematkan" : "Pesan dilepas sematan"
+    }
+
+    // ── Keep in chat ───────────────────────────────────────
+    case "keepInChatMessage": {
+      const keep = m.keepInChatMessage
+      if (!keep) return "Pesan disimpan"
+      return keep.keepType === 1 ? "Pesan disimpan" : "Pesan tidak disimpan"
+    }
 
     // ── Newsletter ─────────────────────────────────────────
     case "newsletterAdminInviteMessage":
       return m.newsletterAdminInviteMessage?.newsletterName || "Undangan Newsletter"
+
+    // ── Album (multiple media in one bubble) ───────────────
+    case "albumMessage": {
+      const album = m.albumMessage
+      const count = album?.expectedImageCount || album?.expectedVideoCount || 0
+      const hasVid = (album?.expectedVideoCount || 0) > 0
+      if (count === 0) return "Album"
+      return hasVid ? `Album (${count} media)` : `Album (${count} foto)`
+    }
+
+    // ── Encrypted comment (status reply) ───────────────────
+    case "encCommentMessage":
+      return m.encCommentMessage?.text || "Komentar"
+
+    // ── Status mention ─────────────────────────────────────
+    case "statusMentionMessage": {
+      const sm = m.statusMentionMessage
+      const count = sm?.message?.length || 0
+      return count > 0 ? "Menyebut status Anda" : "Status"
+    }
+
+    // ── Group mentioned ────────────────────────────────────
+    case "groupMentionedMessage":
+      return m.groupMentionedMessage?.text || "Grup disebutkan"
+
+    // ── Business call ──────────────────────────────────────
+    case "bcallMessage": {
+      const bc = m.bcallMessage
+      return bc?.isVideo ? "Panggilan Video Bisnis" : "Panggilan Bisnis"
+    }
+
+    // ── Placeholder (unsupported msg type from newer WA) ───
+    case "placeholderMessage":
+      return m.placeholderMessage?.type != null
+        ? "Pesan tidak didukung"
+        : "Pesan tidak tersedia"
+
+    // ── Bot invoke ─────────────────────────────────────────
+    case "botInvokeMessage":
+      return m.botInvokeMessage?.message?.conversation
+        || m.botInvokeMessage?.message?.extendedTextMessage?.text
+        || "Bot"
+
+    // ── Encrypted reaction ─────────────────────────────────
+    case "encReactionMessage":
+      return m.encReactionMessage?.encPayload
+        ? "Reaksi" // encrypted, can't decode without keys
+        : ""
+
+    // ── Invoice / product catalog ──────────────────────────
+    case "invoiceMessage": {
+      const inv = m.invoiceMessage
+      return inv?.title || inv?.description || "Invoice"
+    }
+
+    case "productCatalogMessage": {
+      const pc = m.productCatalogMessage
+      return pc?.product?.title || pc?.product?.description || "Katalog Produk"
+    }
+
+    // ── Payment invite ─────────────────────────────────────
+    case "paymentInviteMessage": {
+      const pi = m.paymentInviteMessage
+      return pi?.serviceType != null ? "Tautan Pembayaran" : "Undangan Pembayaran"
+    }
+
+    // ── Native flow (interactive form/OTP/etc) ─────────────
+    case "nativeFlowMessage": {
+      const nf = m.nativeFlowMessage || m.interactiveMessage?.nativeFlowMessage
+      return nf?.name || nf?.buttonParamsJson
+        ? "Formulir Interaktif"
+        : ""
+    }
 
     default:
       // Fallback: coba ambil dari conversation atau text fields yang umum
@@ -740,6 +913,176 @@ function extractReaction(message) {
 }
 
 // ════════════════════════════════════════════════════════════
+// EVENT PARSER (WAProto: EventMessage)
+// ════════════════════════════════════════════════════════════
+
+/**
+ * Extract WA Event details.
+ * EventMessage fields: name, description, startTime, endTime, location,
+ * joinLink, isCanceled, editToken, extraGuestListJid
+ */
+function extractEvent(message, msgType) {
+  if (msgType !== "eventMessage") return null
+  const ev = message.eventMessage?.event || message.eventMessage
+  if (!ev) return null
+
+  return {
+    name:        ev.name        || null,
+    description: ev.description || null,
+    start_time:  ev.startTime   ? Number(ev.startTime)  : null,
+    end_time:    ev.endTime     ? Number(ev.endTime)    : null,
+    location_name:    ev.location?.name    || null,
+    location_address: ev.location?.address || null,
+    location_lat:     ev.location?.degreesLatitude  || null,
+    location_lng:     ev.location?.degreesLongitude || null,
+    join_link:   ev.joinLink    || null,
+    is_canceled: ev.isCanceled  ? 1 : 0,
+  }
+}
+
+// ════════════════════════════════════════════════════════════
+// CALL LOG PARSER (WAProto: CallLogMessage)
+// ════════════════════════════════════════════════════════════
+
+/**
+ * Extract call log metadata.
+ * CallLogMessage fields: isVideo, callResult/callOutcome, durationSecs,
+ * participants (repeated CallParticipant { jid, callResult })
+ * callOutcome enum: CONNECTED(1), MISSED(2), DECLINED(4), FAILED(8)
+ */
+function extractCallLog(message, msgType) {
+  if (msgType !== "callLogMessage") return null
+  const cl = message.callLogMessage
+  if (!cl) return null
+
+  const OUTCOMES = { 1: "answered", 2: "missed", 4: "declined", 8: "failed" }
+
+  return {
+    is_video:     cl.isVideo     ? 1 : 0,
+    outcome:      OUTCOMES[cl.callOutcome] || OUTCOMES[cl.callResult] || "unknown",
+    duration_secs: cl.durationSecs || null,
+    // Participants array — store JIDs of who was on the call
+    participants: (cl.participants || [])
+      .map(p => p.jid || p)
+      .filter(Boolean),
+  }
+}
+
+// ════════════════════════════════════════════════════════════
+// GROUP INVITE PARSER (WAProto: GroupInviteMessage)
+// ════════════════════════════════════════════════════════════
+
+/**
+ * Extract group invite details.
+ * GroupInviteMessage fields: groupJid, inviteCode, inviteExpiration,
+ * groupName, caption, groupType (DEFAULT/PARENT)
+ */
+function extractGroupInvite(message, msgType) {
+  if (msgType !== "groupInviteMessage") return null
+  const gi = message.groupInviteMessage
+  if (!gi) return null
+
+  return {
+    group_jid:   gi.groupJid   || null,
+    group_name:  gi.groupName  || null,
+    invite_code: gi.inviteCode || null,
+    // inviteExpiration is a Long — convert to unix timestamp
+    invite_expiry: gi.inviteExpiration
+      ? Number(gi.inviteExpiration)
+      : null,
+    caption:    gi.caption    || null,
+    // groupType: 0=DEFAULT, 1=PARENT (community)
+    group_type: gi.groupType  ?? 0,
+  }
+}
+
+// ════════════════════════════════════════════════════════════
+// PIN / KEEP PARSERS (WAProto: PinInChatMessage, KeepInChatMessage)
+// ════════════════════════════════════════════════════════════
+
+/**
+ * Extract pinned message metadata.
+ * PinInChatMessage fields: key (MessageKey of pinned msg), type (PIN=1, UNPIN=2)
+ */
+function extractPinInChat(message, msgType) {
+  if (msgType !== "pinInChatMessage") return null
+  const pin = message.pinInChatMessage
+  if (!pin) return null
+
+  return {
+    pinned_msg_id:  pin.key?.id          || null,
+    pinned_chat_id: pin.key?.remoteJid   || null,
+    pin_type:       pin.type === 2 ? "unpin" : "pin",  // 1=pin, 2=unpin
+  }
+}
+
+/**
+ * Extract keep-in-chat metadata.
+ * KeepInChatMessage fields: key (MessageKey), keepType (KEEP_FOR_ALL=1, UNDO_KEEP_FOR_ALL=2)
+ */
+function extractKeepInChat(message, msgType) {
+  if (msgType !== "keepInChatMessage") return null
+  const k = message.keepInChatMessage
+  if (!k) return null
+
+  return {
+    kept_msg_id:  k.key?.id        || null,
+    kept_chat_id: k.key?.remoteJid || null,
+    keep_type:    k.keepType === 2 ? "undo" : "keep",
+  }
+}
+
+// ════════════════════════════════════════════════════════════
+// SCHEDULED CALL PARSER (WAProto: ScheduledCallCreationMessage)
+// ════════════════════════════════════════════════════════════
+
+/**
+ * Extract scheduled call details.
+ * ScheduledCallCreationMessage fields: title, scheduledTimestamp, callType (AUDIO=1/VIDEO=2),
+ * duration, callParticipants (repeated { jid })
+ */
+function extractScheduledCall(message, msgType) {
+  if (msgType !== "scheduledCallCreationMessage" && msgType !== "scheduledCallEditMessage") {
+    return null
+  }
+  const sc = message.scheduledCallCreationMessage || message.scheduledCallEditMessage
+  if (!sc) return null
+
+  return {
+    title:          sc.title             || null,
+    scheduled_at:   sc.scheduledTimestamp ? Number(sc.scheduledTimestamp) : null,
+    is_video:       sc.callType === 2    ? 1 : 0,
+    duration_secs:  sc.duration          || null,
+    participants:   (sc.callParticipants || [])
+      .map(p => p.jid || p)
+      .filter(Boolean),
+  }
+}
+
+// ════════════════════════════════════════════════════════════
+// ALBUM PARSER (WAProto: AlbumMessage)
+// ════════════════════════════════════════════════════════════
+
+/**
+ * Extract album metadata.
+ * AlbumMessage fields: expectedImageCount, expectedVideoCount,
+ * mediaKeys (repeated bytes — one per media item)
+ */
+function extractAlbum(message, msgType) {
+  if (msgType !== "albumMessage") return null
+  const album = message.albumMessage
+  if (!album) return null
+
+  return {
+    image_count: album.expectedImageCount || 0,
+    video_count: album.expectedVideoCount || 0,
+    total:       (album.expectedImageCount || 0) + (album.expectedVideoCount || 0),
+    // We can't fully decode individual media without additional msgs,
+    // but store count so UI can show "Album (3 foto)" correctly
+  }
+}
+
+// ════════════════════════════════════════════════════════════
 // FORWARDING INFO
 // ════════════════════════════════════════════════════════════
 
@@ -842,6 +1185,15 @@ function parseMessage(msg, opts = {}) {
     : null
   const forwardInfo = extractForwardInfo(rawMessage, msgType)
 
+  // ── New extractors ─────────────────────────────────────
+  const eventInfo    = extractEvent(rawMessage, msgType)
+  const callInfo     = extractCallLog(rawMessage, msgType)
+  const groupInvite  = extractGroupInvite(rawMessage, msgType)
+  const pinInfo      = extractPinInChat(rawMessage, msgType)
+  const keepInfo     = extractKeepInChat(rawMessage, msgType)
+  const schedCall    = extractScheduledCall(rawMessage, msgType)
+  const albumInfo    = extractAlbum(rawMessage, msgType)
+
   // ── Timestamp ──────────────────────────────────────────
   const timestamp = Number(msg.messageTimestamp) || Math.floor(Date.now() / 1000)
 
@@ -912,6 +1264,45 @@ function parseMessage(msg, opts = {}) {
     is_forwarded: forwardInfo.isForwarded ? 1 : 0,
     forwarding_score: forwardInfo.forwardingScore || 0,
 
+    // ── Event (WAProto: EventMessage) ──────────────────
+    event_name:        eventInfo?.name        || null,
+    event_description: eventInfo?.description || null,
+    event_start_time:  eventInfo?.start_time  || null,
+    event_end_time:    eventInfo?.end_time    || null,
+    event_location:    eventInfo?.location_name || eventInfo?.location_address || null,
+    event_join_link:   eventInfo?.join_link   || null,
+    event_is_canceled: eventInfo?.is_canceled ?? null,
+
+    // ── Call log (WAProto: CallLogMessage) ─────────────
+    call_is_video:   callInfo?.is_video      ?? null,
+    call_outcome:    callInfo?.outcome       || null,
+    call_duration:   callInfo?.duration_secs || null,
+    call_participants: callInfo?.participants?.length
+      ? JSON.stringify(callInfo.participants)
+      : null,
+
+    // ── Group invite (WAProto: GroupInviteMessage) ─────
+    group_invite_jid:    groupInvite?.group_jid    || null,
+    group_invite_name:   groupInvite?.group_name   || null,
+    group_invite_code:   groupInvite?.invite_code  || null,
+    group_invite_expiry: groupInvite?.invite_expiry || null,
+
+    // ── Pin / Keep ─────────────────────────────────────
+    pin_msg_id:  pinInfo?.pinned_msg_id  || null,
+    pin_type:    pinInfo?.pin_type       || null,
+    keep_msg_id: keepInfo?.kept_msg_id   || null,
+    keep_type:   keepInfo?.keep_type     || null,
+
+    // ── Scheduled call ─────────────────────────────────
+    sched_call_title:  schedCall?.title         || null,
+    sched_call_at:     schedCall?.scheduled_at  || null,
+    sched_call_video:  schedCall?.is_video      ?? null,
+
+    // ── Album ──────────────────────────────────────────
+    album_count: albumInfo
+      ? (albumInfo.image_count + albumInfo.video_count)
+      : null,
+
     // ── Flags ──────────────────────────────────────────
     starred: msg.starred ? 1 : 0,
     is_history_sync: opts.isHistorySync ? 1 : 0,
@@ -931,10 +1322,18 @@ function shouldStoreRaw(msgType) {
   return [
     "pollUpdateMessage",
     "reactionMessage",
+    "encReactionMessage",      // encrypted reaction needs raw to decode later
     "requestPaymentMessage",
     "sendPaymentMessage",
     "orderMessage",
-    "eventMessage",
+    "eventMessage",            // rich event data
+    "encEventUpdateMessage",   // encrypted event update
+    "scheduledCallCreationMessage",
+    "scheduledCallEditMessage",
+    "albumMessage",            // individual items arrive separately
+    "botInvokeMessage",        // structured params useful for bot integrations
+    "nativeFlowMessage",       // buttonParamsJson may have structured data
+    "interactiveResponseMessage", // nativeFlowResponseMessage paramsJson
   ].includes(msgType)
 }
 
@@ -1002,6 +1401,40 @@ function buildRendererPayload(parsed) {
     is_forwarded: parsed.is_forwarded,
     forwarding_score: parsed.forwarding_score,
 
+    // ── Event ──────────────────────────────────────────
+    event_name:        parsed.event_name,
+    event_description: parsed.event_description,
+    event_start_time:  parsed.event_start_time,
+    event_end_time:    parsed.event_end_time,
+    event_location:    parsed.event_location,
+    event_join_link:   parsed.event_join_link,
+    event_is_canceled: parsed.event_is_canceled,
+
+    // ── Call log ───────────────────────────────────────
+    call_is_video:    parsed.call_is_video,
+    call_outcome:     parsed.call_outcome,
+    call_duration:    parsed.call_duration,
+
+    // ── Group invite ───────────────────────────────────
+    group_invite_jid:    parsed.group_invite_jid,
+    group_invite_name:   parsed.group_invite_name,
+    group_invite_code:   parsed.group_invite_code,
+    group_invite_expiry: parsed.group_invite_expiry,
+
+    // ── Pin / Keep ─────────────────────────────────────
+    pin_msg_id:  parsed.pin_msg_id,
+    pin_type:    parsed.pin_type,
+    keep_msg_id: parsed.keep_msg_id,
+    keep_type:   parsed.keep_type,
+
+    // ── Scheduled call ─────────────────────────────────
+    sched_call_title: parsed.sched_call_title,
+    sched_call_at:    parsed.sched_call_at,
+    sched_call_video: parsed.sched_call_video,
+
+    // ── Album ──────────────────────────────────────────
+    album_count: parsed.album_count,
+
     starred: parsed.starred,
   }
 }
@@ -1056,4 +1489,13 @@ module.exports = {
   extractReaction,
   hasMediaContent,
   MEDIA_TYPES,
+
+  // ── New proto extractors ──────────────────────────────
+  extractEvent,
+  extractCallLog,
+  extractGroupInvite,
+  extractPinInChat,
+  extractKeepInChat,
+  extractScheduledCall,
+  extractAlbum,
 }

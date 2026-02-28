@@ -52,7 +52,7 @@ function SyncBanner({ syncStatus }) {
 }
 
 export default function ChatList({ connStatus }) {
-  const { chats, contacts, groups, communities, loadChats, loadContacts, syncStatus, setSyncStatus } = useChatStore()
+  const { chats, contacts, groups, communities, channels, loadChats, loadContacts, syncStatus, setSyncStatus } = useChatStore()
   const { activeJid, setActiveJid, navTab } = useAppStore()
   const [search, setSearch] = useState("")
   const [filter, setFilter] = useState("all")
@@ -84,6 +84,8 @@ export default function ChatList({ connStatus }) {
     baseItems = contacts
   } else if (navTab === "communities") {
     baseItems = communities
+  } else if (navTab === "channels") {
+    baseItems = channels || []
   } else {
     if (filter === "groups") baseItems = groups
     else if (filter === "unread") baseItems = chats.filter(c => c.unread_count > 0)
@@ -112,11 +114,12 @@ export default function ChatList({ connStatus }) {
   const isContacts = navTab === "contacts"
   const isCommunities = navTab === "communities"
 
-  const emptyIcon = search ? "🔍" : isCommunities ? "🏘️" : isContacts ? "👥" : filter === "unread" ? "✅" : filter === "groups" ? "👥" : "💬"
-  const emptyTitle = search ? "Tidak ada hasil" : isCommunities ? "Belum ada komunitas" : isContacts ? "Belum ada kontak" : filter === "unread" ? "Semua sudah dibaca" : filter === "groups" ? "Belum ada grup" : "Belum ada pesan"
-  const emptyDesc = search ? "Coba kata kunci lain" : "Mulai chat baru dengan tombol + di atas"
+  const isChannels = navTab === "channels"
+  const emptyIcon = search ? "🔍" : isCommunities ? "🏘️" : isContacts ? "👥" : isChannels ? "📢" : filter === "unread" ? "✅" : filter === "groups" ? "👥" : "💬"
+  const emptyTitle = search ? "Tidak ada hasil" : isCommunities ? "Belum ada komunitas" : isContacts ? "Belum ada kontak" : isChannels ? "Belum ada saluran" : filter === "unread" ? "Semua sudah dibaca" : filter === "groups" ? "Belum ada grup" : "Belum ada pesan"
+  const emptyDesc = search ? "Coba kata kunci lain" : isChannels ? "Saluran yang kamu ikuti akan muncul di sini" : "Mulai chat baru dengan tombol + di atas"
 
-  const panelTitle = isCommunities ? "Komunitas" : isContacts ? "Kontak" : "Pesan"
+  const panelTitle = isCommunities ? "Komunitas" : isContacts ? "Kontak" : isChannels ? "Saluran" : "Pesan"
 
   // Total unread badge for header
   const totalUnread = chats.reduce((s, c) => s + (c.unread_count || 0), 0)
@@ -166,7 +169,7 @@ export default function ChatList({ connStatus }) {
       </div>
 
       {/* Filter tabs — only for chats tab */}
-      {navTab === "chats" && (
+      {navTab === "chats" && !isChannels && (
         <div className="filter-row">
           {CHAT_FILTERS.map(f => (
             <button

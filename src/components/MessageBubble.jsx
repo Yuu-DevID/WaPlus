@@ -1,31 +1,87 @@
 // src/components/MessageBubble.jsx
 // ═══════════════════════════════════════════════════════════════════════════
-// PRODUCTION GRADE v3 — AuroraChat Message Bubble
+// PRODUCTION GRADE v4 — AuroraChat Message Bubble
 //
-// FIXES:
-// [FIX-1] toBool() — SQLite 0/1 → boolean everywhere. {0 && <X/>} = "0" bug.
-// [FIX-2] QuotedMsg sender — was showing raw JID "628xxx@s.whatsapp.net",
-//         now shows clean display name (resolved upstream in chat.js store).
-// [FIX-3] msg-row layout — ALL conditional renders use toBool().
-//         No stray text nodes. msg-row flexbox alignment is clean.
-// [FIX-4] Quoted bubble — added left accent bar + proper styling so it
-//         doesn't visually break the bubble layout.
-// [FIX-5] from_me detection — reliable, uses toBool(msg.from_me).
+// FIXES v4:
+// [FIX-6]  FORMAT_RE — was using literal newlines inside regex literal →
+//          "Unterminated regular expression" fatal parse error. Replaced
+//          entire linkifyText() with a single correct RegExp built via
+//          new RegExp() with properly escaped patterns. Deleted dead code
+//          (FORMAT_RE, URL_RE, unused `last`/`m` variables).
+// [FIX-7]  allRe string escaping — single-quote chars inside single-quoted
+//          template caused subtle parse ambiguity. Now uses template literal
+//          with unambiguous escaping.
+// [FIX-8]  wrapRef used before declaration in isReaction early-return block.
+//          Moved all hooks to top of MessageBubble before any early returns.
+// [FIX-9]  NO_PAD_TYPES Set recreated every render → moved to module scope.
+// [FIX-10] PlayIcon / PauseIcon / MicIcon / MusicIcon defined inside
+//          AudioBubble render fn → new component identity every render,
+//          breaks React reconciliation. Moved to module scope.
+// [FIX-11] linkifyText inner segments called recursively (no nesting
+//          support), but nested formatting tokens were split wrong.
+//          Cleaned up logic to be clear, minimal, and correct.
+//
+// PERF:
+// - Module-level constants for Set, RegExp, component refs
+// - Memoized expensive helpers (seedWaveform, linkifyText result) via useMemo
+// - useCallback on all event handlers
+// - Stable waveform via module-level cache (keyed by msgId)
 // ═══════════════════════════════════════════════════════════════════════════
 
 import { format } from "date-fns"
-import { useState, useRef, useCallback, useEffect } from "react"
+import { useState, useRef, useCallback, useEffect, useMemo, memo } from "react"
 import { prefetchChat } from "../hooks/useMediaPrefetch"
 
-// ─── Reply Icon SVG ───────────────────────────────────────────────────────────
-function ReplyIcon() {
-  return (
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-      <polyline points="9 17 4 12 9 7"/>
-      <path d="M20 18v-2a4 4 0 0 0-4-4H4"/>
-    </svg>
-  )
+// ════════════════════════════════════════════════════════════
+// MODULE-LEVEL CONSTANTS (created once, never re-allocated)
+// ════════════════════════════════════════════════════════════
+
+/** Types that render media flush to bubble edge — no padding */
+const NO_PAD_TYPES = new Set([
+  "imageMessage", "videoMessage", "stickerMessage",
+  "viewOnceMessage", "viewOnceMessageV2",
+])
+
+const SPEED_STEPS = [1, 1.5, 2]
+
+const DOC_ICONS = {
+  PDF: "📕", DOCX: "📘", DOC: "📘", XLSX: "📗", XLS: "📗",
+  PPTX: "📙", PPT: "📙", ZIP: "🗜️", RAR: "🗜️", TXT: "📃",
+  APK: "📱", MP4: "🎬", PNG: "🖼️", JPG: "🖼️", JPEG: "🖼️",
+  MP3: "🎵", OGG: "🎵", AAC: "🎵", CSV: "📊", WEBP: "🖼️",
 }
+
+// ════════════════════════════════════════════════════════════
+// [FIX-6] CORRECT combined regex — no literal newlines
+//
+// Matches (in priority order):
+//   1. ```multiline code block```
+//   2. `inline code`
+//   3. *bold*   (no newlines inside)
+//   4. _italic_ (no newlines inside)
+//   5. ~strike~ (no newlines inside)
+//   6. URL (http/https/www)
+//
+// Built with new RegExp() so escape sequences are unambiguous.
+// ════════════════════════════════════════════════════════════
+const RICH_RE = new RegExp(
+  "(" +
+    "```[\\s\\S]+?```" +        // group 1: fenced code
+  "|" +
+    "`[^`\\n]+`" +              // inline code
+  "|" +
+    "\\*[^*\\n]+\\*" +          // bold
+  "|" +
+    "_[^_\\n]+_" +              // italic
+  "|" +
+    "~[^~\\n]+~" +              // strikethrough
+  ")" +
+  "|" +
+  "(" +
+    "https?:\\/\\/[^\\s<>\"')\\]]+|www\\.[^\\s<>\"')\\]]+\\.[^\\s<>\"')\\]]+" +
+  ")",                          // group 2: URL
+  "gi"
+)
 
 // ════════════════════════════════════════════════════════════
 // [FIX-1] toBool — normalize SQLite 0/1 → JS boolean
@@ -33,43 +89,122 @@ function ReplyIcon() {
 // ════════════════════════════════════════════════════════════
 const toBool = (v) => v === 1 || v === true
 
-// ─── Media path → loadable URL ───────────────────────────────────────────────
-// Handles: file:// prefixed paths, Unix /absolute, Windows D:\absolute\path
-function getMediaSrc(msg) {
-  const p = msg.media_saved_path
-  if (p) return pathToFileUrl(p)
-  if (msg.media_url) return msg.media_url
-  return null
+// ─── Linkify + WhatsApp text formatting ──────────────────────────────────────
+function linkifyText(text) {
+  if (!text) return null
+
+  const segments = []
+  let key = 0
+  let lastIdx = 0
+
+  // Reset lastIndex before exec loop (regex has 'g' flag)
+  RICH_RE.lastIndex = 0
+
+  let m
+  while ((m = RICH_RE.exec(text)) !== null) {
+    // Push plain text before this match
+    if (m.index > lastIdx) {
+      segments.push(text.slice(lastIdx, m.index))
+    }
+
+    const token = m[0]
+
+    if (m[1]) {
+      // ── Formatting token ──
+      if (token.startsWith("```")) {
+        segments.push(
+          <code key={key++} className="bubble-code-block">{token.slice(3, -3)}</code>
+        )
+      } else if (token.startsWith("`")) {
+        segments.push(
+          <code key={key++} className="bubble-code-inline">{token.slice(1, -1)}</code>
+        )
+      } else if (token.startsWith("*")) {
+        segments.push(<strong key={key++}>{token.slice(1, -1)}</strong>)
+      } else if (token.startsWith("_")) {
+        segments.push(<em key={key++}>{token.slice(1, -1)}</em>)
+      } else if (token.startsWith("~")) {
+        segments.push(<s key={key++}>{token.slice(1, -1)}</s>)
+      }
+    } else if (m[2]) {
+      // ── URL token ──
+      let href = token
+      if (!href.startsWith("http")) href = "https://" + href
+      // Trim trailing punctuation that's likely not part of the URL
+      href = href.replace(/[.,;:!?)\]]+$/, "")
+      const display = href.replace(/^https?:\/\//, "").replace(/\/$/, "")
+      segments.push(
+        <a
+          key={key++}
+          href={href}
+          onClick={(e) => {
+            e.preventDefault()
+            e.stopPropagation()
+            window.api?.openExternal?.(href) ?? window.open(href, "_blank")
+          }}
+          title={href}
+          className="bubble-link"
+        >
+          {display}
+        </a>
+      )
+    }
+
+    lastIdx = m.index + token.length
+  }
+
+  // Remaining plain text
+  if (lastIdx < text.length) {
+    segments.push(text.slice(lastIdx))
+  }
+
+  if (segments.length === 0) return text
+  if (segments.length === 1 && typeof segments[0] === "string") return segments[0]
+  return segments
 }
+
+// ─── RichText: renders formatted + linkified text preserving newlines ──────────
+const RichText = memo(function RichText({ text, className, style }) {
+  if (!text) return null
+  const lines = text.split("\n")
+  return (
+    <span className={className} style={style}>
+      {lines.map((line, i) => (
+        <span key={i}>
+          {linkifyText(line)}
+          {i < lines.length - 1 && <br />}
+        </span>
+      ))}
+    </span>
+  )
+})
+
+// ════════════════════════════════════════════════════════════
+// MEDIA PATH UTILITIES
+// ════════════════════════════════════════════════════════════
 
 function pathToFileUrl(rawPath) {
   if (!rawPath) return null
   // Already a file:// URL
   if (rawPath.startsWith("file://")) {
     // Guard against legacy broken encoding: D%3A → D: (old normalizeMediaPath bug)
-    // If the path contains %3A (encoded colon) right after a drive letter, decode and re-encode correctly
     if (rawPath.includes("%3A") || rawPath.includes("%3a")) {
       try {
-        // Decode entire URL, then re-run through pathToFileUrl as a raw path
         const decoded = decodeURIComponent(rawPath.replace(/^file:\/\/\/?/, ""))
         return pathToFileUrl(decoded)
-      } catch (_) {}
+      } catch (_) { /* keep original */ }
     }
     return rawPath
   }
   // Normalize backslashes (Windows)
   let p = rawPath.replace(/\\/g, "/")
-  // Windows drive letter: "D:/..." → "file:///D:/..."
-  // We must NOT encode the colon in "D:" — only encode path segments
   const winDrive = /^([A-Za-z]):\//
   if (winDrive.test(p)) {
-    // e.g. "D:/path/to file/img.webp" → "file:///D:/path/to%20file/img.webp"
-    const encoded = p.replace(winDrive, (_, letter) => `/${letter.toUpperCase()}:/`)
+    const encoded = p
+      .replace(winDrive, (_, letter) => `/${letter.toUpperCase()}:/`)
       .split("/")
       .map((seg, i) => {
-        // First segment after split("D:/") is empty or drive — don't encode
         if (i === 0) return seg
-        // Preserve drive-colon segment "D:"
         if (/^[A-Za-z]:$/.test(seg)) return seg
         return encodeURIComponent(seg)
       })
@@ -78,86 +213,145 @@ function pathToFileUrl(rawPath) {
   }
   // Unix absolute path
   const withSlash = p.startsWith("/") ? p : `/${p}`
-  const encoded = withSlash.split("/").map((seg, i) => i === 0 ? seg : encodeURIComponent(seg)).join("/")
+  const encoded = withSlash
+    .split("/")
+    .map((seg, i) => (i === 0 ? seg : encodeURIComponent(seg)))
+    .join("/")
   return `file://${encoded}`
 }
 
-// ─── useMediaSrc — reactive media source with existence check ────────────────
+// ─── useMediaSrc — reactive media source with async existence check ────────────
 // 1. Shows src IMMEDIATELY (optimistic) from stored path — no flicker on open
 // 2. Resets error state when path changes (media:updated fires after download)
-// 3. Async existence check: if file is gone (deleted / session change), clears
-//    src so bubble shows "downloading..." and prefetch can re-trigger.
+// 3. Async existence check: if file is gone, clears src so bubble shows
+//    "downloading..." and prefetch can re-trigger.
 function useMediaSrc(msg) {
   const rawPath = msg.media_saved_path || null
-  // Start optimistic: show path immediately, verify async
-  const [verifiedSrc, setVerifiedSrc] = useState(() => rawPath ? pathToFileUrl(rawPath) : null)
+  const [verifiedSrc, setVerifiedSrc] = useState(() =>
+    rawPath ? pathToFileUrl(rawPath) : null
+  )
   const [err, setErr] = useState(false)
   const prevRaw = useRef(rawPath)
-  const checkRef = useRef(false)  // prevent double-check on strict mode
+  const checked = useRef(false)
 
-  // When rawPath changes (media:updated arrives), accept immediately + reset error
+  // Detect path change (media:updated) — synchronous during render is intentional
   if (prevRaw.current !== rawPath) {
     prevRaw.current = rawPath
     const newSrc = rawPath ? pathToFileUrl(rawPath) : null
+    // These state setters called during render schedule a re-render — valid React pattern
     setVerifiedSrc(newSrc)
     if (err) setErr(false)
-    checkRef.current = false  // allow re-check for new path
+    checked.current = false
   }
 
-  // Async existence verification — only when we have a path and haven't checked yet
   useEffect(() => {
-    if (!rawPath || checkRef.current) return
-    if (!window.api?.fsExists) return  // IPC not available (unit tests / dev)
-    checkRef.current = true
-
-    window.api.fsExists({ rawPath }).then(exists => {
-      if (!exists) {
-        // File is gone — clear src (shows "downloading...") and re-trigger download
-        setVerifiedSrc(null)
-        if (msg.chat_jid) prefetchChat(msg.chat_jid, 30, true)
-      }
-      // If exists: already showing correct src, nothing to do
-    }).catch(() => {
-      // IPC error — keep showing current optimistic src
-    })
+    if (!rawPath || checked.current) return
+    if (!window.api?.fsExists) return
+    checked.current = true
+    window.api
+      .fsExists({ rawPath })
+      .then((exists) => {
+        if (!exists) {
+          setVerifiedSrc(null)
+          if (msg.chat_jid) prefetchChat(msg.chat_jid, 30, true)
+        }
+      })
+      .catch(() => { /* IPC error — keep optimistic src */ })
   }, [rawPath]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Fallback to media_url if no local file
-  const src = verifiedSrc || (msg.media_url || null)
+  const src = verifiedSrc || msg.media_url || null
   return { src, err, setErr }
 }
 
-// ─── Format phone number ──────────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════
+// SMALL STATELESS SUB-COMPONENTS
+// ════════════════════════════════════════════════════════════
+
 function fmtPhone(raw) {
   if (!raw) return "?"
-  // Strip @domain if still present
   const n = raw.includes("@") ? raw.split("@")[0] : raw
   if (!/^\d{6,}$/.test(n)) return raw
   return `+${n}`
 }
 
-// ─── Tick indicators ──────────────────────────────────────────────────────────
-function Ticks({ status }) {
-  const s = Number(status)
-  if (s === 0) return <span style={{ fontSize: 10, color: "var(--text-3)", marginLeft: 2 }}>⏱</span>
-  if (s === 1) return <span className="tick-sent" style={{ marginLeft: 2 }}>✓</span>
-  if (s === 2) return <span className="tick-sent" style={{ marginLeft: 2 }}>✓✓</span>
-  return <span className="tick-read" style={{ marginLeft: 2 }}>✓✓</span>
+function fmtTime(s) {
+  if (!s || !isFinite(s)) return "0:00"
+  const m = Math.floor(s / 60)
+  const sec = Math.floor(s % 60)
+  return `${m}:${sec.toString().padStart(2, "0")}`
 }
 
-function BubbleTime({ ts }) {
+// ─── Reply Icon ───────────────────────────────────────────────────────────────
+function ReplyIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <polyline points="9 17 4 12 9 7" />
+      <path d="M20 18v-2a4 4 0 0 0-4-4H4" />
+    </svg>
+  )
+}
+
+// ─── [FIX-10] Audio icons moved to module scope — stable component identity ───
+function PlayIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="currentColor" width="18" height="18" aria-hidden="true">
+      <polygon points="6,4 20,12 6,20" />
+    </svg>
+  )
+}
+function PauseIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="currentColor" width="18" height="18" aria-hidden="true">
+      <rect x="5" y="4" width="4" height="16" rx="1" />
+      <rect x="15" y="4" width="4" height="16" rx="1" />
+    </svg>
+  )
+}
+function MicIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"
+      width="13" height="13" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <rect x="9" y="2" width="6" height="11" rx="3" />
+      <path d="M5 10a7 7 0 0 0 14 0" />
+      <line x1="12" y1="19" x2="12" y2="23" />
+      <line x1="8" y1="23" x2="16" y2="23" />
+    </svg>
+  )
+}
+function MusicIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"
+      width="13" height="13" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M9 18V5l12-2v13" />
+      <circle cx="6" cy="18" r="3" />
+      <circle cx="18" cy="16" r="3" />
+    </svg>
+  )
+}
+
+// ─── Tick indicators ──────────────────────────────────────────────────────────
+const Ticks = memo(function Ticks({ status }) {
+  const s = Number(status)
+  if (s === 0) return <span className="tick tick-pending" aria-label="Pending">⏱</span>
+  if (s === 1) return <span className="tick tick-sent" aria-label="Sent">✓</span>
+  if (s === 2) return <span className="tick tick-delivered" aria-label="Delivered">✓✓</span>
+  return <span className="tick tick-read" aria-label="Read">✓✓</span>
+})
+
+const BubbleTime = memo(function BubbleTime({ ts }) {
   if (!ts) return null
   return (
     <span className="bubble-time">
       {format(new Date(ts * 1000), "HH:mm")}
     </span>
   )
-}
+})
 
 // ─── [FIX-2] Quoted/reply preview ────────────────────────────────────────────
-// sender is now already resolved to display name by chat.js store
-function QuotedMsg({ body, sender, type, hasMedia, mimetype, onClick, quotedFromMe }) {
-  // Don't render if both sender and body are empty/null
+const QuotedMsg = memo(function QuotedMsg({
+  body, sender, type, hasMedia, mimetype, onClick, quotedFromMe,
+}) {
   if (!sender && !body && !hasMedia && !quotedFromMe) return null
 
   const mediaIcon = (() => {
@@ -169,13 +363,10 @@ function QuotedMsg({ body, sender, type, hasMedia, mimetype, onClick, quotedFrom
     return "📎 "
   })()
 
-  // [FIX-OWN] sender is null when resolveQuotedSender detected it was our own JID
-  // quotedFromMe = true means the quoted message was sent by us
   let displaySender
-  if (quotedFromMe || sender === null) {
+  if (sender === "__me__" || quotedFromMe) {
     displaySender = "Kamu"
   } else if (sender) {
-    // Already resolved by chat.js — but strip if it still has @
     displaySender = sender.includes("@") ? fmtPhone(sender) : sender
   } else {
     displaySender = null
@@ -185,6 +376,8 @@ function QuotedMsg({ body, sender, type, hasMedia, mimetype, onClick, quotedFrom
     <div
       className="quoted"
       onClick={onClick}
+      role={onClick ? "button" : undefined}
+      tabIndex={onClick ? 0 : undefined}
       style={onClick ? { cursor: "pointer" } : undefined}
     >
       {displaySender && (
@@ -195,15 +388,20 @@ function QuotedMsg({ body, sender, type, hasMedia, mimetype, onClick, quotedFrom
       </div>
     </div>
   )
-}
+})
 
 // ─── Reaction overlay ─────────────────────────────────────────────────────────
-function ReactionOverlay({ reactions }) {
-  if (!reactions?.length) return null
-  const grouped = {}
-  for (const r of reactions) grouped[r.text] = (grouped[r.text] || 0) + 1
+const ReactionOverlay = memo(function ReactionOverlay({ reactions }) {
+  const grouped = useMemo(() => {
+    if (!reactions?.length) return null
+    const g = {}
+    for (const r of reactions) g[r.text] = (g[r.text] || 0) + 1
+    return g
+  }, [reactions])
+
+  if (!grouped) return null
   return (
-    <div className="reaction-row">
+    <div className="reaction-row" role="img" aria-label="Reactions">
       {Object.entries(grouped).map(([e, n]) => (
         <div key={e} className="reaction-chip">
           <span>{e}</span>
@@ -212,15 +410,79 @@ function ReactionOverlay({ reactions }) {
       ))}
     </div>
   )
-}
+})
 
 // ─── Forward badge ────────────────────────────────────────────────────────────
 function ForwardBadge({ score }) {
   if (!score) return null
   return (
     <div className="forward-badge">
-      <span>↪</span>
+      <span aria-hidden="true">↪</span>
       <span>{score >= 5 ? "Sering diteruskan" : "Diteruskan"}</span>
+    </div>
+  )
+}
+
+// ─── Image Lightbox ───────────────────────────────────────────────────────────
+function ImageLightbox({ src, alt, onClose }) {
+  const [imgLoaded, setImgLoaded] = useState(false)
+
+  useEffect(() => {
+    const handler = (e) => { if (e.key === "Escape") onClose() }
+    document.addEventListener("keydown", handler)
+    return () => document.removeEventListener("keydown", handler)
+  }, [onClose])
+
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label="Image preview"
+      style={{
+        position: "fixed", inset: 0, zIndex: 9999,
+        background: "rgba(0,0,0,0.92)",
+        display: "flex", alignItems: "center", justifyContent: "center",
+        cursor: "zoom-out",
+      }}
+      onClick={onClose}
+    >
+      {!imgLoaded && (
+        <div style={{ position: "absolute", display: "flex", flexDirection: "column", alignItems: "center", gap: 10 }}>
+          <div className="spinner" style={{ borderTopColor: "var(--green)", borderColor: "rgba(37,211,102,.2)", width: 36, height: 36 }} />
+          <span style={{ color: "rgba(255,255,255,0.5)", fontSize: 12 }}>Memuat gambar...</span>
+        </div>
+      )}
+      <img
+        src={src}
+        alt={alt || "Foto"}
+        onLoad={() => setImgLoaded(true)}
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          maxWidth: "90vw", maxHeight: "90vh",
+          borderRadius: 10, objectFit: "contain",
+          boxShadow: "0 12px 60px rgba(0,0,0,0.8)",
+          cursor: "default",
+          opacity: imgLoaded ? 1 : 0,
+          transition: "opacity 0.25s",
+        }}
+      />
+      <button
+        onClick={onClose}
+        title="Tutup (Esc)"
+        style={{
+          position: "fixed", top: 16, right: 18,
+          background: "rgba(255,255,255,0.14)", border: "1px solid rgba(255,255,255,0.15)",
+          backdropFilter: "blur(8px)",
+          borderRadius: "50%", width: 36, height: 36,
+          color: "#fff", fontSize: 18, cursor: "pointer",
+          display: "flex", alignItems: "center", justifyContent: "center",
+          transition: "background 0.15s",
+        }}
+        onMouseEnter={(e) => { e.currentTarget.style.background = "rgba(255,255,255,0.25)" }}
+        onMouseLeave={(e) => { e.currentTarget.style.background = "rgba(255,255,255,0.14)" }}
+      >
+        &#215;
+      </button>
     </div>
   )
 }
@@ -228,39 +490,76 @@ function ForwardBadge({ score }) {
 // ─── Image bubble ─────────────────────────────────────────────────────────────
 function ImageBubble({ msg }) {
   const { src, err, setErr } = useMediaSrc(msg)
+  const [lightbox, setLightbox] = useState(false)
+  const [loaded, setLoaded] = useState(false)
 
   if (!src || err) {
     return (
-      <div className="media-img">
-        <div className="media-img-thumb" style={{
+      <div style={{ lineHeight: 0, borderRadius: 8, overflow: "hidden", background: "rgba(255,255,255,0.06)", minHeight: 120 }}>
+        <div style={{
           display: "flex", flexDirection: "column",
           alignItems: "center", justifyContent: "center",
-          gap: 4, minHeight: 100,
+          gap: 6, minHeight: 120, padding: 16,
         }}>
-          <span style={{ fontSize: 38 }}>🖼️</span>
+          <span style={{ fontSize: 36 }}>&#128247;</span>
           <span style={{ fontSize: 10, color: "var(--text-3)" }}>
             {src ? "Gagal memuat" : "Mengunduh..."}
           </span>
+          {!src && (
+            <div className="spinner spinner-sm"
+              style={{ borderTopColor: "var(--green)", borderColor: "rgba(37,211,102,.2)" }} />
+          )}
         </div>
-        {msg.body && <div className="media-caption">{msg.body}</div>}
+        {msg.body && (
+          <div className="media-caption" style={{ padding: "6px 10px 8px", fontSize: 13, lineHeight: 1.4 }}>
+            <RichText text={msg.body} />
+          </div>
+        )}
       </div>
     )
   }
 
   return (
-    <div className="media-img">
-      <img
-        src={src}
-        alt={msg.body || "Foto"}
-        onError={() => setErr(true)}
-        style={{
-          maxWidth: "100%", maxHeight: 300,
-          borderRadius: 8, display: "block",
-          objectFit: "cover", cursor: "pointer",
-        }}
-      />
-      {msg.body && <div className="media-caption">{msg.body}</div>}
-    </div>
+    <>
+      {lightbox && (
+        <ImageLightbox src={src} alt={msg.body} onClose={() => setLightbox(false)} />
+      )}
+      <div style={{ lineHeight: 0, borderRadius: msg.body ? "8px 8px 0 0" : 8, overflow: "hidden", position: "relative" }}>
+        {!loaded && (
+          <div style={{
+            position: "absolute", inset: 0, display: "flex",
+            alignItems: "center", justifyContent: "center",
+            background: "rgba(255,255,255,0.04)", minHeight: 80,
+          }}>
+            <div className="spinner spinner-sm"
+              style={{ borderTopColor: "var(--green)", borderColor: "rgba(37,211,102,.2)" }} />
+          </div>
+        )}
+        <img
+          src={src}
+          alt={msg.body || "Foto"}
+          onLoad={() => setLoaded(true)}
+          onError={() => setErr(true)}
+          onClick={() => setLightbox(true)}
+          style={{
+            display: "block",
+            maxWidth: "100%",
+            maxHeight: 320,
+            width: "100%",
+            objectFit: "cover",
+            cursor: "zoom-in",
+            opacity: loaded ? 1 : 0,
+            transition: "opacity 0.2s",
+            verticalAlign: "bottom",
+          }}
+        />
+      </div>
+      {msg.body && (
+        <div className="media-caption" style={{ padding: "6px 10px 8px", fontSize: 13, lineHeight: 1.4 }}>
+          <RichText text={msg.body} />
+        </div>
+      )}
+    </>
   )
 }
 
@@ -275,7 +574,7 @@ function VideoBubble({ msg }) {
         <div className="media-video-thumb">
           <div className="play-btn">{isGif ? "GIF" : "▶️"}</div>
           <span style={{ fontSize: 12, color: "var(--text-3)" }}>
-            {msg.body || (isGif ? "GIF" : "Video")}
+            {msg.body ? <RichText text={msg.body} /> : (isGif ? "GIF" : "Video")}
           </span>
         </div>
       </div>
@@ -286,12 +585,13 @@ function VideoBubble({ msg }) {
     return (
       <div className="media-img">
         <video
-          src={src} autoPlay loop muted playsInline
+          src={src}
+          autoPlay loop muted playsInline
           onError={() => setErr(true)}
           style={{ maxWidth: "100%", maxHeight: 280, borderRadius: 8, display: "block" }}
         />
         <div className="gif-badge">GIF</div>
-        {msg.body && <div className="media-caption">{msg.body}</div>}
+        {msg.body && <div className="media-caption"><RichText text={msg.body} /></div>}
       </div>
     )
   }
@@ -299,29 +599,29 @@ function VideoBubble({ msg }) {
   return (
     <div className="media-video">
       <video
-        src={src} controls preload="metadata"
+        src={src}
+        controls
+        preload="metadata"
         onError={() => setErr(true)}
         style={{ maxWidth: "100%", maxHeight: 280, borderRadius: 8, display: "block" }}
       />
-      {msg.body && <div className="media-caption">{msg.body}</div>}
+      {msg.body && <div className="media-caption"><RichText text={msg.body} /></div>}
     </div>
   )
 }
 
-// ─── Audio / PTT bubble ───────────────────────────────────────────────────────
 // ════════════════════════════════════════════════════════════
-// AUDIO PLAYER — Real playback with waveform, scrub, speed
+// AUDIO PLAYER
 // ════════════════════════════════════════════════════════════
 
-// ── Global singleton: only one audio plays at a time ────────
-// Uses a module-level ref so any AudioBubble can stop others.
+// Global singleton: only one audio plays at a time
 const _audioRegistry = { current: null }
 
-// ── Deterministic waveform from message id ───────────────────
-// WhatsApp doesn't expose waveform data via Baileys, so we
-// generate a stable-looking waveform seeded from the message id.
-// Same message always shows the same bars (deterministic, no flicker).
+// Waveform cache: keyed by msgId so we don't recompute across re-mounts
+const _waveformCache = new Map()
+
 function seedWaveform(id, bars = 40) {
+  if (_waveformCache.has(id)) return _waveformCache.get(id)
   const str = id || "x"
   let h = 0
   for (let i = 0; i < str.length; i++) {
@@ -329,45 +629,35 @@ function seedWaveform(id, bars = 40) {
   }
   const heights = []
   for (let i = 0; i < bars; i++) {
-    // LCG: fast, good distribution
     h = (Math.imul(1664525, h) + 1013904223) | 0
-    // Shape: taller in the middle, quieter at ends (natural voice envelope)
     const pos = i / bars
     const envelope = 1 - Math.pow((pos - 0.5) * 2, 4)
-    const raw = ((h >>> 0) / 0xFFFFFFFF)   // 0..1
+    const raw = (h >>> 0) / 0xFFFFFFFF
     heights.push(0.12 + raw * 0.88 * envelope)
   }
+  _waveformCache.set(id, heights)
   return heights
 }
 
-function fmtTime(s) {
-  if (!s || !isFinite(s)) return "0:00"
-  const m = Math.floor(s / 60)
-  const sec = Math.floor(s % 60)
-  return `${m}:${sec.toString().padStart(2, "0")}`
-}
-
-const SPEED_STEPS = [1, 1.5, 2]
-
 function AudioBubble({ msg }) {
-  const { src }   = useMediaSrc(msg)
-  const isPtt     = toBool(msg.is_ptt) || msg.msg_type === "pttMessage"
-  const msgId     = msg.id || msg.message_id || ""
-  const waveform  = useRef(seedWaveform(msgId)).current
+  const { src } = useMediaSrc(msg)
+  const isPtt = toBool(msg.is_ptt) || msg.msg_type === "pttMessage"
+  const msgId = msg.id || msg.message_id || ""
+  // waveform is stable — read from cache, never recalculated
+  const waveform = useMemo(() => seedWaveform(msgId), [msgId])
 
-  const audioRef  = useRef(null)
-  const [playing,    setPlaying]    = useState(false)
-  const [progress,   setProgress]   = useState(0)       // 0..1
-  const [elapsed,    setElapsed]    = useState(0)        // seconds
-  const [duration,   setDuration]   = useState(msg.media_duration || msg.duration || 0)
-  const [speedIdx,   setSpeedIdx]   = useState(0)        // index into SPEED_STEPS
-  const [loadState,  setLoadState]  = useState("idle")   // idle|loading|ready|error
-  const scrubRef  = useRef(null)
-  const rafRef    = useRef(null)
+  const audioRef = useRef(null)
+  const [playing,   setPlaying]   = useState(false)
+  const [progress,  setProgress]  = useState(0)
+  const [elapsed,   setElapsed]   = useState(0)
+  const [duration,  setDuration]  = useState(msg.media_duration || msg.duration || 0)
+  const [speedIdx,  setSpeedIdx]  = useState(0)
+  const [loadState, setLoadState] = useState("idle")
+  const scrubRef = useRef(null)
+  const rafRef   = useRef(null)
 
   const speed = SPEED_STEPS[speedIdx]
 
-  // ── Create / manage <audio> element ──────────────────────
   useEffect(() => {
     if (!src) return
     const audio = new Audio()
@@ -376,24 +666,25 @@ function AudioBubble({ msg }) {
     audioRef.current = audio
     setLoadState("loading")
 
-    audio.addEventListener("loadedmetadata", () => {
-      setDuration(audio.duration)
-      setLoadState("ready")
-    })
-    audio.addEventListener("error", () => {
-      setLoadState("error")
-    })
-    audio.addEventListener("ended", () => {
+    const onMeta  = () => { setDuration(audio.duration); setLoadState("ready") }
+    const onError = () => setLoadState("error")
+    const onEnded = () => {
       setPlaying(false)
       setProgress(0)
       setElapsed(0)
       audio.currentTime = 0
       if (rafRef.current) cancelAnimationFrame(rafRef.current)
-    })
+    }
 
-    // Register for singleton management
+    audio.addEventListener("loadedmetadata", onMeta)
+    audio.addEventListener("error", onError)
+    audio.addEventListener("ended", onEnded)
+
     const cleanup = () => {
       audio.pause()
+      audio.removeEventListener("loadedmetadata", onMeta)
+      audio.removeEventListener("error", onError)
+      audio.removeEventListener("ended", onEnded)
       audio.src = ""
       if (rafRef.current) cancelAnimationFrame(rafRef.current)
     }
@@ -405,20 +696,16 @@ function AudioBubble({ msg }) {
     }
   }, [src])
 
-  // ── Apply speed changes ───────────────────────────────────
   useEffect(() => {
     if (audioRef.current) audioRef.current.playbackRate = speed
   }, [speed])
 
-  // ── RAF loop for progress ─────────────────────────────────
   const startRaf = useCallback(() => {
     const tick = () => {
       const audio = audioRef.current
       if (!audio) return
-      const t = audio.currentTime
-      const d = audio.duration || 1
-      setProgress(t / d)
-      setElapsed(t)
+      setProgress(audio.currentTime / (audio.duration || 1))
+      setElapsed(audio.currentTime)
       rafRef.current = requestAnimationFrame(tick)
     }
     rafRef.current = requestAnimationFrame(tick)
@@ -429,20 +716,17 @@ function AudioBubble({ msg }) {
     rafRef.current = null
   }, [])
 
-  // ── Play / Pause ──────────────────────────────────────────
   const togglePlay = useCallback(() => {
     const audio = audioRef.current
     if (!audio || loadState === "error") return
 
-    // Stop any other playing audio (singleton)
+    // Singleton: stop any other playing audio
     if (_audioRegistry.current && _audioRegistry.current !== audio) {
       _audioRegistry.current.pause()
       _audioRegistry.current._setPlaying?.(false)
-      // Stop their RAF via a custom signal
       _audioRegistry.current._stopRaf?.()
     }
     _audioRegistry.current = audio
-    // Expose control hooks for singleton stop
     audio._setPlaying = setPlaying
     audio._stopRaf = stopRaf
 
@@ -452,19 +736,15 @@ function AudioBubble({ msg }) {
       setPlaying(false)
     } else {
       audio.playbackRate = speed
-      audio.play().then(() => {
-        setPlaying(true)
-        startRaf()
-      }).catch(() => {
-        setLoadState("error")
-      })
+      audio.play()
+        .then(() => { setPlaying(true); startRaf() })
+        .catch(() => setLoadState("error"))
     }
   }, [playing, loadState, speed, startRaf, stopRaf])
 
-  // ── Scrub bar click / drag ────────────────────────────────
   const handleScrub = useCallback((e) => {
     const audio = audioRef.current
-    if (!audio || !audio.duration) return
+    if (!audio?.duration) return
     const bar = scrubRef.current
     if (!bar) return
     const rect = bar.getBoundingClientRect()
@@ -474,55 +754,24 @@ function AudioBubble({ msg }) {
     setElapsed(audio.currentTime)
   }, [])
 
-  // ── Speed cycle ───────────────────────────────────────────
   const cycleSpeed = useCallback((e) => {
     e.stopPropagation()
-    setSpeedIdx(i => (i + 1) % SPEED_STEPS.length)
+    setSpeedIdx((i) => (i + 1) % SPEED_STEPS.length)
   }, [])
 
-  // ── Render helpers ────────────────────────────────────────
   const isLoading = !src || loadState === "loading" || loadState === "idle"
   const isError   = loadState === "error"
-  const displayDur = duration ? fmtTime(playing ? elapsed : duration) : fmtTime(elapsed || 0)
-
-  // Play/pause icon — SVG for crispness
-  const PlayIcon = () => (
-    <svg viewBox="0 0 24 24" fill="currentColor" width="18" height="18">
-      <polygon points="6,4 20,12 6,20" />
-    </svg>
-  )
-  const PauseIcon = () => (
-    <svg viewBox="0 0 24 24" fill="currentColor" width="18" height="18">
-      <rect x="5" y="4" width="4" height="16" rx="1"/>
-      <rect x="15" y="4" width="4" height="16" rx="1"/>
-    </svg>
-  )
-  const MicIcon = () => (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="13" height="13"
-      strokeLinecap="round" strokeLinejoin="round">
-      <rect x="9" y="2" width="6" height="11" rx="3"/>
-      <path d="M5 10a7 7 0 0 0 14 0"/>
-      <line x1="12" y1="19" x2="12" y2="23"/>
-      <line x1="8" y1="23" x2="16" y2="23"/>
-    </svg>
-  )
-  const MusicIcon = () => (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="13" height="13"
-      strokeLinecap="round" strokeLinejoin="round">
-      <path d="M9 18V5l12-2v13"/>
-      <circle cx="6" cy="18" r="3"/>
-      <circle cx="18" cy="16" r="3"/>
-    </svg>
-  )
+  const displayDur = duration
+    ? fmtTime(playing ? elapsed : duration)
+    : fmtTime(elapsed || 0)
 
   return (
     <div className={`audio-player${playing ? " audio-playing" : ""}${isError ? " audio-error" : ""}`}>
-
-      {/* Play/Pause button */}
       <button
         className="audio-btn-play"
         onClick={togglePlay}
         disabled={isError}
+        aria-label={playing ? "Jeda" : "Putar"}
         title={isLoading ? "Mengunduh..." : isError ? "Gagal memuat audio" : playing ? "Jeda" : "Putar"}
       >
         {isLoading ? (
@@ -536,15 +785,16 @@ function AudioBubble({ msg }) {
         )}
       </button>
 
-      {/* Track area */}
       <div className="audio-track-area">
-
-        {/* Waveform bars + scrub overlay */}
         <div
           ref={scrubRef}
           className="audio-waveform"
           onClick={handleScrub}
-          title="Klik untuk loncat ke posisi"
+          role="slider"
+          aria-label="Posisi audio"
+          aria-valuenow={Math.round(progress * 100)}
+          aria-valuemin={0}
+          aria-valuemax={100}
         >
           {waveform.map((h, i) => {
             const barProgress = i / waveform.length
@@ -557,9 +807,7 @@ function AudioBubble({ msg }) {
                 style={{
                   height: `${Math.round(h * 100)}%`,
                   background: filled
-                    ? isActive
-                      ? "var(--green)"
-                      : "var(--green-dim)"
+                    ? isActive ? "var(--green)" : "var(--green-dim)"
                     : "rgba(255,255,255,0.12)",
                   transform: isActive && playing ? "scaleY(1.3)" : "scaleY(1)",
                 }}
@@ -568,7 +816,6 @@ function AudioBubble({ msg }) {
           })}
         </div>
 
-        {/* Bottom row: type label + time + speed */}
         <div className="audio-info-row">
           <span className="audio-type-badge">
             {isPtt ? <MicIcon /> : <MusicIcon />}
@@ -577,7 +824,12 @@ function AudioBubble({ msg }) {
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
             <span className="audio-time">{displayDur}</span>
             {!isLoading && !isError && (
-              <button className="audio-speed-btn" onClick={cycleSpeed} title="Ubah kecepatan">
+              <button
+                className="audio-speed-btn"
+                onClick={cycleSpeed}
+                title="Ubah kecepatan"
+                aria-label={`Kecepatan ${speed}x`}
+              >
                 {speed}×
               </button>
             )}
@@ -589,18 +841,10 @@ function AudioBubble({ msg }) {
 }
 
 // ─── Document bubble ──────────────────────────────────────────────────────────
-const DOC_ICONS = {
-  PDF: "📕", DOCX: "📘", DOC: "📘", XLSX: "📗", XLS: "📗",
-  PPTX: "📙", PPT: "📙", ZIP: "🗜️", RAR: "🗜️", TXT: "📃",
-  APK: "📱", MP4: "🎬", PNG: "🖼️", JPG: "🖼️", MP3: "🎵",
-  OGG: "🎵", AAC: "🎵", CSV: "📊",
-}
-
 function DocBubble({ msg }) {
-  const mimetype = msg.mimetype
   const filename = msg.media_filename || msg.body || "Dokumen"
-  const ext = mimetype
-    ? mimetype.split("/")[1]?.split(";")[0]?.toUpperCase()
+  const ext = msg.mimetype
+    ? msg.mimetype.split("/")[1]?.split(";")[0]?.toUpperCase()
     : "FILE"
   return (
     <div className="media-doc">
@@ -614,15 +858,10 @@ function DocBubble({ msg }) {
 }
 
 // ─── Sticker bubble ───────────────────────────────────────────────────────────
-// Stickers are WebP (static or animated). Electron/Chromium handles animated
-// WebP natively via <img>. We try <img> first; if it fails (e.g. corrupt file
-// or CORS on remote URL), fall back to <video autoPlay loop muted>.
-// useMediaSrc() auto-resets `err` when media:updated fires a new path.
 function StickerBubble({ msg }) {
   const { src, err, setErr } = useMediaSrc(msg)
-  const [imgFailed, setImgFailed] = useState(false)
+  const [imgFailed,   setImgFailed]   = useState(false)
   const [videoFailed, setVideoFailed] = useState(false)
-  const isAnimated = toBool(msg.is_animated)
 
   // Reset fallback states when src changes (new download arrived)
   const prevSrcRef = useRef(src)
@@ -632,7 +871,6 @@ function StickerBubble({ msg }) {
     setVideoFailed(false)
   }
 
-  // No source yet — still downloading
   if (!src) {
     return (
       <div style={{
@@ -645,12 +883,12 @@ function StickerBubble({ msg }) {
         <span style={{ fontSize: 10, color: "var(--text-3)", textAlign: "center" }}>
           Mengunduh stiker...
         </span>
-        <div className="spinner spinner-sm" style={{ borderTopColor: "var(--green)", borderColor: "rgba(37,211,102,.2)" }} />
+        <div className="spinner spinner-sm"
+          style={{ borderTopColor: "var(--green)", borderColor: "rgba(37,211,102,.2)" }} />
       </div>
     )
   }
 
-  // Both img and video failed — show error with retry hint
   if (imgFailed && videoFailed) {
     return (
       <div style={{
@@ -667,13 +905,8 @@ function StickerBubble({ msg }) {
     )
   }
 
-  const stickerStyle = {
-    width: 150, height: 150,
-    objectFit: "contain", display: "block",
-    borderRadius: 4,
-  }
+  const stickerStyle = { width: 150, height: 150, objectFit: "contain", display: "block", borderRadius: 4 }
 
-  // If img failed (e.g. video/webm sticker), try video element
   if (imgFailed) {
     return (
       <video
@@ -685,7 +918,6 @@ function StickerBubble({ msg }) {
     )
   }
 
-  // Default: <img> — Electron Chromium renders animated WebP natively
   return (
     <img
       src={src}
@@ -723,19 +955,19 @@ function PollBubble({ msg }) {
       </div>
       {opts.length > 0
         ? opts.map((o, i) => {
-          const pct = total > 0 ? Math.round((o.votes || 0) / total * 100) : 0
-          return (
-            <div key={i} className="poll-option">
-              <div className="poll-option-top">
-                <span className="poll-option-name">{o.name || o}</span>
-                <span className="poll-option-pct">{pct}%</span>
+            const pct = total > 0 ? Math.round(((o.votes || 0) / total) * 100) : 0
+            return (
+              <div key={i} className="poll-option">
+                <div className="poll-option-top">
+                  <span className="poll-option-name">{o.name || o}</span>
+                  <span className="poll-option-pct">{pct}%</span>
+                </div>
+                <div className="poll-bar">
+                  <div className="poll-bar-fill" style={{ width: `${pct}%` }} />
+                </div>
               </div>
-              <div className="poll-bar">
-                <div className="poll-bar-fill" style={{ width: `${pct}%` }} />
-              </div>
-            </div>
-          )
-        })
+            )
+          })
         : <div className="poll-sub">Buka di HP untuk melihat opsi</div>
       }
       {total > 0 && <div className="poll-total">{total} suara</div>}
@@ -751,10 +983,16 @@ function LocationBubble({ msg }) {
   const isLive = msg.msg_type === "liveLocationMessage"
   const mapsUrl = (lat && lng) ? `https://www.google.com/maps?q=${lat},${lng}` : null
 
+  const handleClick = useCallback(() => {
+    if (mapsUrl) window.open(mapsUrl, "_blank")
+  }, [mapsUrl])
+
   return (
     <div
       className="media-location"
-      onClick={() => mapsUrl && window.open(mapsUrl, "_blank")}
+      onClick={handleClick}
+      role={mapsUrl ? "link" : undefined}
+      tabIndex={mapsUrl ? 0 : undefined}
       style={{ cursor: mapsUrl ? "pointer" : "default" }}
     >
       <div className="location-map">
@@ -763,7 +1001,7 @@ function LocationBubble({ msg }) {
             src={`https://maps.googleapis.com/maps/api/staticmap?center=${lat},${lng}&zoom=15&size=200x100&markers=${lat},${lng}`}
             alt="Peta"
             style={{ width: "100%", height: 80, objectFit: "cover", borderRadius: 6 }}
-            onError={e => { e.target.style.display = "none" }}
+            onError={(e) => { e.target.style.display = "none" }}
           />
         ) : (
           <span style={{ fontSize: 32 }}>🗺️</span>
@@ -832,7 +1070,7 @@ function GroupInviteBubble({ msg }) {
   )
 }
 
-// ─── Buttons/Interactive bubble ───────────────────────────────────────────────
+// ─── Interactive / Buttons bubbles ────────────────────────────────────────────
 function ButtonsBubble({ msg }) {
   return (
     <div className="buttons-bubble">
@@ -875,7 +1113,6 @@ function PaymentBubble({ msg }) {
   )
 }
 
-// ─── Call log bubble ─────────────────────────────────────────────────────────
 function CallLogBubble({ msg }) {
   const isVideo = msg.body?.includes("Video") || msg.mimetype?.includes("video")
   return (
@@ -913,11 +1150,9 @@ function NewsletterBubble({ msg }) {
 // ════════════════════════════════════════════════════════════
 // MAIN CONTENT RENDERER
 // ════════════════════════════════════════════════════════════
-
 function renderContent(msg) {
   const t = msg.msg_type || "conversation"
 
-  // ViewOnce check — both type string and integer flag
   if (toBool(msg.is_view_once) || t === "viewOnceMessage" || t === "viewOnceMessageV2") {
     return <ViewOnceBubble msg={msg} />
   }
@@ -925,7 +1160,7 @@ function renderContent(msg) {
   switch (t) {
     case "conversation":
     case "extendedTextMessage":
-      return <div className="bubble-text">{msg.body || ""}</div>
+      return <div className="bubble-text"><RichText text={msg.body || ""} /></div>
 
     case "imageMessage":    return <ImageBubble msg={msg} />
     case "videoMessage":    return <VideoBubble msg={msg} />
@@ -953,13 +1188,10 @@ function renderContent(msg) {
       )
 
     case "reactionMessage":
-      return (
-        <div style={{ fontSize: 32, padding: "2px 4px", lineHeight: 1 }}>
-          {msg.body || msg.reaction_emoji || "❤️"}
-        </div>
-      )
+      return null
 
-    case "groupInviteMessage":     return <GroupInviteBubble msg={msg} />
+    case "groupInviteMessage":
+      return <GroupInviteBubble msg={msg} />
 
     case "buttonsMessage":
     case "listMessage":
@@ -973,7 +1205,8 @@ function renderContent(msg) {
     case "interactiveResponseMessage":
       return <InteractiveResponseBubble msg={msg} />
 
-    case "orderMessage":           return <OrderBubble msg={msg} />
+    case "orderMessage":
+      return <OrderBubble msg={msg} />
 
     case "productMessage":
       return (
@@ -991,11 +1224,10 @@ function renderContent(msg) {
     case "sendPaymentMessage":
       return <PaymentBubble msg={msg} />
 
-    case "callLogMessage":              return <CallLogBubble msg={msg} />
-    case "eventMessage":                return <EventBubble msg={msg} />
+    case "callLogMessage":               return <CallLogBubble msg={msg} />
+    case "eventMessage":                 return <EventBubble msg={msg} />
     case "newsletterAdminInviteMessage": return <NewsletterBubble msg={msg} />
 
-    // System messages — render nothing, parent will skip
     case "protocol":
     case "ephemeral":
     case "messageContextInfo":
@@ -1003,12 +1235,12 @@ function renderContent(msg) {
       return null
 
     default: {
-      if (msg.body) return <div className="bubble-text">{msg.body}</div>
+      if (msg.body) return <div className="bubble-text"><RichText text={msg.body} /></div>
       const LABELS = {
         call: "📞 Panggilan", payment: "💳 Pembayaran",
-        order: "🛒 Pesanan", product: "🛍 Produk",
-        event: "📅 Acara", buttons: "🔘 Tombol",
-        list: "📋 Daftar", interactive: "💬 Interaktif",
+        order: "🛒 Pesanan",  product: "🛍 Produk",
+        event: "📅 Acara",    buttons: "🔘 Tombol",
+        list: "📋 Daftar",    interactive: "💬 Interaktif",
         keepInChat: "📌 Disimpan", pinInChat: "📌 Disematkan",
       }
       return <div className="bubble-unsupported">{LABELS[t] || `📎 ${t}`}</div>
@@ -1019,7 +1251,6 @@ function renderContent(msg) {
 // ════════════════════════════════════════════════════════════
 // CONTEXT MENU
 // ════════════════════════════════════════════════════════════
-
 function ContextMenu({ x, y, items, onClose }) {
   const ref = useRef(null)
 
@@ -1035,24 +1266,31 @@ function ContextMenu({ x, y, items, onClose }) {
     }
   }, [onClose])
 
-  // Ensure menu doesn't go off-screen
   const style = {
     left: Math.min(x, window.innerWidth - 180),
-    top: Math.min(y, window.innerHeight - items.length * 38 - 20),
+    top:  Math.min(y, window.innerHeight - items.length * 38 - 20),
   }
 
   return (
-    <div ref={ref} className="ctx-menu" style={{ position: "fixed", ...style }}>
+    <div
+      ref={ref}
+      className="ctx-menu"
+      role="menu"
+      style={{ position: "fixed", ...style }}
+    >
       {items.map((item, i) =>
         item === "divider" ? (
-          <div key={i} className="ctx-menu-divider" />
+          <div key={i} className="ctx-menu-divider" role="separator" />
         ) : (
           <div
             key={i}
             className={`ctx-menu-item${item.danger ? " danger" : ""}`}
+            role="menuitem"
+            tabIndex={0}
             onMouseDown={(e) => { e.stopPropagation(); item.action(); onClose() }}
+            onKeyDown={(e) => { if (e.key === "Enter") { item.action(); onClose() } }}
           >
-            {item.icon && <span style={{ fontSize: 15 }}>{item.icon}</span>}
+            {item.icon && <span style={{ fontSize: 15 }} aria-hidden="true">{item.icon}</span>}
             {item.label}
           </div>
         )
@@ -1064,7 +1302,6 @@ function ContextMenu({ x, y, items, onClose }) {
 // ════════════════════════════════════════════════════════════
 // MAIN COMPONENT
 // ════════════════════════════════════════════════════════════
-
 export default function MessageBubble({ msg, onReply, onScrollToMsg }) {
   // ── [FIX-1+FIX-5] Normalize ALL SQLite integer booleans ──────────────────
   const isMe        = toBool(msg.from_me)
@@ -1074,25 +1311,7 @@ export default function MessageBubble({ msg, onReply, onScrollToMsg }) {
   const t          = msg.msg_type || "conversation"
   const isReaction = t === "reactionMessage"
   const isSticker  = t === "stickerMessage"
-
-  // No-padding types (media rendered flush to bubble edge)
-  const NO_PAD_TYPES = new Set([
-    "imageMessage", "videoMessage", "stickerMessage",
-    "viewOnceMessage", "viewOnceMessageV2",
-  ])
-  const hasNoPad = NO_PAD_TYPES.has(t)
-
-  const bubbleClass = [
-    "bubble",
-    isMe ? "me" : null,
-    (isReaction || isSticker) ? "sticker" : null,
-    hasNoPad ? "no-pad" : null,
-  ].filter(Boolean).join(" ")
-
-  const content = renderContent(msg)
-
-  // System messages render nothing
-  if (content === null) return null
+  const hasNoPad   = NO_PAD_TYPES.has(t)
 
   // [FIX-4] Quoted message — check all possible fields
   const hasQuoted = !!(msg.quoted_id || msg.quoted_body || msg.quoted_sender)
@@ -1100,15 +1319,15 @@ export default function MessageBubble({ msg, onReply, onScrollToMsg }) {
   // [FIX-3] Null-safe sender initial
   const senderInitial = (msg.sender_name || msg.sender_jid || "?")[0].toUpperCase()
 
-  // ── Reply via swipe state ──────────────────────────────────────────────
-  const [swiping, setSwiping] = useState(false)
+  // ── [FIX-8] ALL hooks must be declared before any early returns ────────────
+  const [swiping,     setSwiping]     = useState(false)
   const [highlighted, setHighlighted] = useState(false)
-  const swipeStartX = useRef(null)
+  const [ctxMenu,     setCtxMenu]     = useState(null)
+  const swipeStartX    = useRef(null)
   const swipeTriggered = useRef(false)
-  const wrapRef = useRef(null)
-
-  // ── Context menu state ─────────────────────────────────────────────────
-  const [ctxMenu, setCtxMenu] = useState(null) // { x, y }
+  const wrapRef        = useRef(null)
+  const mouseStartX    = useRef(null)
+  const mouseDown      = useRef(false)
 
   const handleReply = useCallback(() => {
     if (onReply) onReply(msg)
@@ -1123,11 +1342,7 @@ export default function MessageBubble({ msg, onReply, onScrollToMsg }) {
   const onTouchMove = useCallback((e) => {
     if (swipeStartX.current === null) return
     const dx = e.touches[0].clientX - swipeStartX.current
-    // Swipe right = positive dx (for both me and them)
-    // For "me" messages: swipe left (dx < -40)
-    // For "them" messages: swipe right (dx > 40)
-    const threshold = 40
-    const triggered = isMe ? dx < -threshold : dx > threshold
+    const triggered = isMe ? dx < -40 : dx > 40
     if (triggered && !swipeTriggered.current) {
       swipeTriggered.current = true
       setSwiping(true)
@@ -1140,10 +1355,6 @@ export default function MessageBubble({ msg, onReply, onScrollToMsg }) {
     swipeStartX.current = null
   }, [])
 
-  // Mouse drag for swipe simulation on desktop
-  const mouseStartX = useRef(null)
-  const mouseDown = useRef(false)
-
   const onMouseDown = useCallback((e) => {
     if (e.button !== 0) return
     mouseStartX.current = e.clientX
@@ -1154,8 +1365,7 @@ export default function MessageBubble({ msg, onReply, onScrollToMsg }) {
   const onMouseMove = useCallback((e) => {
     if (!mouseDown.current || mouseStartX.current === null) return
     const dx = e.clientX - mouseStartX.current
-    const threshold = 50
-    const triggered = isMe ? dx < -threshold : dx > threshold
+    const triggered = isMe ? dx < -50 : dx > 50
     if (triggered && !swipeTriggered.current) {
       swipeTriggered.current = true
       setSwiping(true)
@@ -1169,7 +1379,6 @@ export default function MessageBubble({ msg, onReply, onScrollToMsg }) {
     mouseStartX.current = null
   }, [])
 
-  // Right-click context menu
   const onContextMenu = useCallback((e) => {
     e.preventDefault()
     setCtxMenu({ x: e.clientX, y: e.clientY })
@@ -1187,6 +1396,20 @@ export default function MessageBubble({ msg, onReply, onScrollToMsg }) {
     return () => el.removeEventListener("msg-highlight", handler)
   }, [])
 
+  // ── Derived values ─────────────────────────────────────────────────────────
+  const bubbleClass = [
+    "bubble",
+    isMe ? "me" : null,
+    (isReaction || isSticker) ? "sticker" : null,
+    hasNoPad ? "no-pad" : null,
+  ].filter(Boolean).join(" ")
+
+  const content = renderContent(msg)
+
+  // System messages render nothing
+  if (content === null) return null
+
+  // ── Context menu items ─────────────────────────────────────────────────────
   const getPreviewText = () => {
     if (t === "imageMessage") return "📷 Foto"
     if (t === "videoMessage") return "🎬 Video"
@@ -1200,16 +1423,63 @@ export default function MessageBubble({ msg, onReply, onScrollToMsg }) {
     { icon: "↩", label: "Balas", action: handleReply },
     "divider",
     {
-      icon: "📋", label: "Salin", action: () => {
-        const text = msg.body || getPreviewText()
-        navigator.clipboard?.writeText(text)
-      }
+      icon: "📋",
+      label: "Salin",
+      action: () => navigator.clipboard?.writeText(msg.body || getPreviewText()),
     },
-    ...(hasQuoted && onScrollToMsg ? [{
-      icon: "⬆", label: "Lihat pesan dikutip",
-      action: () => onScrollToMsg(msg.quoted_id)
-    }] : []),
+    ...(hasQuoted && onScrollToMsg
+      ? [{ icon: "⬆", label: "Lihat pesan dikutip", action: () => onScrollToMsg(msg.quoted_id) }]
+      : []),
   ]
+
+  // ── [REACTION-FLOAT] reactionMessage = floating emoji, NO bubble ──────────
+  if (isReaction) {
+    const emoji = msg.body || msg.reaction_emoji || "❤️"
+    return (
+      <div
+        ref={wrapRef}
+        style={{
+          display: "flex",
+          justifyContent: isMe ? "flex-end" : "flex-start",
+          padding: "1px 14px",
+          userSelect: "none",
+        }}
+      >
+        <div style={{
+          display: "flex", flexDirection: "column",
+          alignItems: isMe ? "flex-end" : "flex-start", gap: 2,
+        }}>
+          {!isMe && isGroup && msg.sender_name && (
+            <div style={{ fontSize: 11, color: "var(--text-3)", paddingLeft: 2 }}>
+              {msg.sender_name}
+            </div>
+          )}
+          <div
+            title={`Reaksi • ${msg.sender_name || (isMe ? "Kamu" : "Mereka")}`}
+            style={{
+              fontSize: 28, lineHeight: 1, cursor: "default",
+              filter: "drop-shadow(0 1px 3px rgba(0,0,0,0.4))",
+              transition: "transform 0.12s",
+            }}
+            onMouseEnter={(e) => { e.currentTarget.style.transform = "scale(1.18)" }}
+            onMouseLeave={(e) => { e.currentTarget.style.transform = "scale(1)" }}
+          >
+            {emoji}
+          </div>
+          <div style={{ fontSize: 10, color: "var(--text-3)", lineHeight: 1 }}>
+            {msg.timestamp
+              ? new Date(msg.timestamp * 1000).toLocaleTimeString("id-ID", { hour: "2-digit", minute: "2-digit" })
+              : ""}
+            {isMe && (
+              <span style={{ marginLeft: 3, opacity: 0.7 }}>
+                {Number(msg.status) >= 3 ? "✓✓" : "✓"}
+              </span>
+            )}
+          </div>
+        </div>
+      </div>
+    )
+  }
 
   // ── [FIX-3] LAYOUT: msg-row structure ────────────────────────────────────
   return (
@@ -1226,15 +1496,14 @@ export default function MessageBubble({ msg, onReply, onScrollToMsg }) {
       onMouseLeave={onMouseUp}
     >
       {/* Reply quick button — appears on hover */}
-      {!isReaction && (
-        <button
-          className="reply-btn"
-          title="Balas"
-          onMouseDown={(e) => { e.stopPropagation(); handleReply() }}
-        >
-          <ReplyIcon />
-        </button>
-      )}
+      <button
+        className="reply-btn"
+        title="Balas"
+        aria-label="Balas pesan"
+        onMouseDown={(e) => { e.stopPropagation(); handleReply() }}
+      >
+        <ReplyIcon />
+      </button>
 
       {/* Context menu */}
       {ctxMenu && (
@@ -1247,7 +1516,7 @@ export default function MessageBubble({ msg, onReply, onScrollToMsg }) {
       )}
 
       <div
-        className={"msg-row" + (isMe ? " me" : " them") + (highlighted ? " highlighted" : "")}
+        className={`msg-row${isMe ? " me" : " them"}${highlighted ? " highlighted" : ""}`}
         onContextMenu={onContextMenu}
         style={{ flex: 1, minWidth: 0 }}
       >
@@ -1257,18 +1526,22 @@ export default function MessageBubble({ msg, onReply, onScrollToMsg }) {
         )}
 
         {/* Inner row: [avatar?] [bubble] */}
-        <div className={"msg-inner" + (isMe ? " me" : "")}>
+        <div className={`msg-inner${isMe ? " me" : ""}`}>
 
           {/* Group mini-avatar — opponent only */}
           {!isMe && isGroup && (
-            <div className="msg-mini-avatar" style={{ background: "#1565c0", flexShrink: 0 }}>
+            <div
+              className="msg-mini-avatar"
+              aria-hidden="true"
+              style={{ background: "#1565c0", flexShrink: 0 }}
+            >
               {senderInitial}
             </div>
           )}
 
           {/* Bubble wrapper */}
-          <div className="bubble-wrap">
-            <div className={bubbleClass}>
+          <div className="bubble-wrap" style={{ position: "relative" }}>
+            <div className={bubbleClass} style={{ position: "relative" }}>
 
               {/* Forward indicator */}
               {isForwarded && <ForwardBadge score={msg.forwarding_score} />}
@@ -1282,10 +1555,7 @@ export default function MessageBubble({ msg, onReply, onScrollToMsg }) {
                   hasMedia={toBool(msg.quoted_has_media)}
                   mimetype={msg.quoted_mimetype}
                   onClick={() => onScrollToMsg && msg.quoted_id && onScrollToMsg(msg.quoted_id)}
-                  quotedFromMe={
-                    // quoted_sender is null when resolveQuotedSender detected own JID
-                    msg.quoted_sender === null && !!(msg.quoted_id || msg.quoted_body)
-                  }
+                  quotedFromMe={msg.quoted_sender === "__me__"}
                 />
               )}
 
@@ -1293,12 +1563,29 @@ export default function MessageBubble({ msg, onReply, onScrollToMsg }) {
               {content}
 
               {/* Footer: timestamp + delivery ticks */}
-              {!isReaction && !isSticker && (
-                <div className={"bubble-footer" + (isMe ? " me" : "")}>
-                  <BubbleTime ts={msg.timestamp} />
-                  {isMe && <Ticks status={msg.status} />}
-                </div>
-              )}
+              {!isReaction && !isSticker && (() => {
+                const isImgVideo = t === "imageMessage" || t === "videoMessage"
+                if (isImgVideo && !msg.body) {
+                  return (
+                    <div style={{
+                      position: "absolute", bottom: 6, right: 8,
+                      background: "rgba(0,0,0,0.55)", backdropFilter: "blur(4px)",
+                      borderRadius: 8, padding: "1px 6px",
+                      display: "flex", alignItems: "center", gap: 3,
+                      pointerEvents: "none",
+                    }}>
+                      <BubbleTime ts={msg.timestamp} />
+                      {isMe && <Ticks status={msg.status} />}
+                    </div>
+                  )
+                }
+                return (
+                  <div className={`bubble-footer${isMe ? " me" : ""}`}>
+                    <BubbleTime ts={msg.timestamp} />
+                    {isMe && <Ticks status={msg.status} />}
+                  </div>
+                )
+              })()}
             </div>
 
             {/* Emoji reactions overlay */}

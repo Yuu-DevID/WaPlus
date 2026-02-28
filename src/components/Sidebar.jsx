@@ -41,10 +41,40 @@ const COLORS = ["#1a5c3e","#1565c0","#6a1b9a","#b71c1c","#e65100","#2e7d32","#00
 function getColor(s) { if(!s) return COLORS[0]; let h=0; for(let i=0;i<s.length;i++) h=s.charCodeAt(i)+((h<<5)-h); return COLORS[Math.abs(h)%COLORS.length] }
 function initials(n) { if(!n) return "?"; return n.trim().split(/\s+/).slice(0,2).map(w=>w[0]).join("").toUpperCase() }
 
+const IconStatus = () => (
+  <svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+    <circle cx="12" cy="12" r="10"/>
+    <circle cx="12" cy="12" r="3"/>
+    <line x1="12" y1="2" x2="12" y2="5"/>
+    <line x1="12" y1="19" x2="12" y2="22"/>
+    <line x1="2" y1="12" x2="5" y2="12"/>
+    <line x1="19" y1="12" x2="22" y2="12"/>
+  </svg>
+)
+
+const IconPlugin = () => (
+  <svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M20.24 12.24a6 6 0 0 0-8.49-8.49L5 10.5V19h8.5z"/>
+    <line x1="16" y1="8" x2="2" y2="22"/>
+    <line x1="17.5" y1="15" x2="9" y2="15"/>
+  </svg>
+)
+const IconChannel = () => (
+  <svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07A19.5 19.5 0 0 1 4.69 12 19.79 19.79 0 0 1 1.61 3.53 2 2 0 0 1 3.55 1h3a2 2 0 0 1 2 1.72c.127.96.361 1.903.7 2.81a2 2 0 0 1-.45 2.11L7.91 8.69a16 16 0 0 0 6.29 6.29l.9-.9a2 2 0 0 1 2.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0 1 22 16.92z"/>
+    <line x1="3" y1="3" x2="21" y2="21" stroke="none"/>
+    <circle cx="12" cy="12" r="4"/>
+    <path d="M12 2v2M12 20v2M2 12h2M20 12h2" stroke="currentColor" strokeWidth="1.5"/>
+  </svg>
+)
+
 const NAV = [
   { id:"chats",       icon:<IconChats/>,     tip:"Pesan" },
   { id:"contacts",    icon:<IconContacts/>,  tip:"Kontak" },
   { id:"communities", icon:<IconCommunity/>, tip:"Komunitas" },
+  { id:"channels",    icon:<IconChannel/>,   tip:"Saluran (Channel)" },
+  { id:"status",      icon:<IconStatus/>,    tip:"Upload Status" },
+  { id:"mods",        icon:<IconPlugin/>,    tip:"Plugin Manager" },
 ]
 
 export default function Sidebar() {

@@ -228,6 +228,55 @@ ipcMain.on("connection:force-reconnect", async () => {
   }
 })
 
+// ── Send Media (images/video/doc from drag&drop or paste) ──────────────────
+ipcMain.handle("msg:send-media", async (_e, { jid, items, quotedMsgId }) => {
+  try {
+    if (!baileysClient) return { ok: false, error: "Client belum siap." }
+
+    let quotedWAMsg = null
+    if (quotedMsgId) {
+      try {
+        const d   = getDB()
+        const row = d.getMessageById?.(quotedMsgId)
+        if (row) {
+          let rawMessage = null
+          try { rawMessage = JSON.parse(row.message_json) } catch (_) {}
+          if (!rawMessage) rawMessage = row.body ? { conversation: row.body } : { conversation: "" }
+          const isGrp = (row.remote_jid || "").endsWith("@g.us")
+          const part  = isGrp && !row.from_me && row.participant ? row.participant : undefined
+          quotedWAMsg = {
+            key: { remoteJid: row.remote_jid, fromMe: row.from_me === 1, id: row.id, ...(part ? { participant: part } : {}) },
+            message: rawMessage,
+            messageTimestamp: row.message_timestamp || Math.floor(Date.now() / 1000),
+            pushName: row.push_name || null,
+          }
+        }
+      } catch (_) {}
+    }
+
+    const results = []
+    for (const item of items) {
+      const base64 = item.dataUrl.split(",")[1]
+      const buf    = Buffer.from(base64, "base64")
+      let r
+      if (item.mimeType?.startsWith("image/")) {
+        r = await baileysClient.sendImage(jid, buf, item.caption || "", quotedWAMsg)
+      } else if (item.mimeType?.startsWith("video/")) {
+        r = await baileysClient.sendVideo(jid, buf, item.caption || "", quotedWAMsg)
+      } else {
+        const fname = item.fileName || "file"
+        r = await baileysClient.sendDocument(jid, buf, fname, item.mimeType || "application/octet-stream", item.caption || "", quotedWAMsg)
+      }
+      results.push({ ok: true, id: r?.key?.id })
+      quotedWAMsg = null
+    }
+    return { ok: true, results }
+  } catch (err) {
+    console.error("[AuroraChat] sendMedia error:", err.message)
+    return { ok: false, error: err.message }
+  }
+})
+
 // ════════════════════════════════════════════════════════════
 // IPC — DATABASE (synchronous via invoke)
 // ════════════════════════════════════════════════════════════
@@ -307,6 +356,25 @@ ipcMain.handle("db:messages:search", (_e, { jid, query }) => {
 ipcMain.handle("db:stats", () => {
   try { return { ok: true, data: getDB().getStats() } }
   catch (err) { return { ok: false, error: err.message } }
+})
+
+ipcMain.handle("db:reactions:list", (_e, { jid }) => {
+  try {
+    return { ok: true, data: getDB().getReactionsForChat(jid) }
+  } catch (err) { return { ok: false, error: err.message } }
+})
+
+// ── Backfill last message preview untuk history chats ─────────────────────
+// Dipanggil setelah loadChats() menemukan chats dengan last_message_body null.
+// Menjalankan backfillChatLastMessages() yang mengisi dari tabel messages.
+ipcMain.handle("db:backfill:previews", () => {
+  try {
+    const d = getDB()
+    if (d.backfillChatLastMessages) d.backfillChatLastMessages()
+    return { ok: true }
+  } catch (err) {
+    return { ok: false, error: err.message }
+  }
 })
 
 // ── Media prefetch IPC ────────────────────────────────────
@@ -466,6 +534,141 @@ module.exports.onBaileysSyncDone = function () {
   win?.webContents.send("sync:status", { status: "done", isSyncing: false, progress: 100 })
   win?.webContents.send("db:chats:updated")
 }
+
+// ════════════════════════════════════════════════════════════
+// IPC — STATUS (WhatsApp Story)
+// ════════════════════════════════════════════════════════════
+
+ipcMain.handle("status:get-contact-count", () => {
+  try {
+    if (!baileysClient) return { ok: false, count: 0 }
+    const list = baileysClient.getStatusJidList()
+    return { ok: true, count: list.length }
+  } catch (err) {
+    return { ok: false, count: 0, error: err.message }
+  }
+})
+
+ipcMain.handle("status:send", async (_e, payload) => {
+  try {
+    if (!baileysClient) return { ok: false, error: "Client belum siap" }
+
+    // mediaBuffer comes as array from IPC serialization — convert back to Buffer
+    if (payload.mediaBuffer) {
+      payload.mediaBuffer = Buffer.from(payload.mediaBuffer)
+    }
+
+    const result = await baileysClient.sendStatus(payload)
+    return { ok: true, count: result.count }
+  } catch (err) {
+    console.error("[AuroraChat] status:send error:", err.message)
+    return { ok: false, error: err.message }
+  }
+})
+
+// ════════════════════════════════════════════════════════════
+// IPC — MOD MANAGER
+// ════════════════════════════════════════════════════════════
+
+function getModManager() {
+  try { return require("./mods/modManager") } catch { return null }
+}
+
+ipcMain.handle("mods:list", () => {
+  const mm = getModManager()
+  if (!mm) return { ok: false, data: [] }
+  return { ok: true, data: mm.listPlugins() }
+})
+
+ipcMain.handle("mods:toggle", async (_e, { id, enabled }) => {
+  const mm = getModManager()
+  if (!mm) return { ok: false, error: "ModManager not available" }
+  return await mm.togglePlugin(id, enabled)
+})
+
+ipcMain.handle("mods:reload", async () => {
+  const mm = getModManager()
+  if (!mm) return { ok: false, error: "ModManager not available" }
+  return await mm.reloadPlugins()
+})
+
+ipcMain.handle("mods:detail", (_e, { id }) => {
+  const mm = getModManager()
+  if (!mm) return { ok: false, error: "ModManager not available" }
+  const detail = mm.getPluginDetail(id)
+  return detail ? { ok: true, data: detail } : { ok: false, error: "Plugin not found" }
+})
+
+ipcMain.handle("mods:create", async (_e, { id, name, description, hooks }) => {
+  const mm = getModManager()
+  if (!mm) return { ok: false, error: "ModManager not available" }
+  return await mm.createPlugin(id, name, description, hooks)
+})
+
+ipcMain.handle("mods:open-folder", (_e, { id }) => {
+  const mm = getModManager()
+  if (mm) mm.openPluginFolder(id)
+  return { ok: true }
+})
+
+ipcMain.handle("mods:get-config", (_e, { id }) => {
+  const mm = getModManager()
+  if (!mm) return { ok: false, error: "ModManager not available" }
+  const data = mm.getPluginConfig(id)
+  return data ? { ok: true, data } : { ok: false, error: "Plugin not found" }
+})
+
+ipcMain.handle("mods:save-config", async (_e, { id, values }) => {
+  const mm = getModManager()
+  if (!mm) return { ok: false, error: "ModManager not available" }
+  return await mm.savePluginConfig(id, values)
+})
+
+ipcMain.handle("mods:delete", async (_e, { id }) => {
+  const mm = getModManager()
+  if (!mm) return { ok: false, error: "ModManager not available" }
+  return await mm.deletePlugin(id)
+})
+
+ipcMain.handle("mods:update-hooks", async (_e, { id, hooks }) => {
+  const mm = getModManager()
+  if (!mm) return { ok: false, error: "ModManager not available" }
+  return await mm.updatePluginHooks(id, hooks)
+})
+
+ipcMain.handle("mods:delete-bulk", async (_e, { ids }) => {
+  const mm = getModManager()
+  if (!mm) return { ok: false, error: "ModManager not available" }
+  return await mm.deletePlugins(ids)
+})
+
+// Handle image pick for plugin config (opens native file dialog)
+ipcMain.handle("mods:pick-image", async () => {
+  const { dialog } = require("electron")
+  const result = await dialog.showOpenDialog({
+    title: "Pilih Gambar",
+    filters: [{ name: "Images", extensions: ["jpg", "jpeg", "png", "webp", "gif"] }],
+    properties: ["openFile"],
+  })
+  if (result.canceled || !result.filePaths.length) return { ok: false }
+  const filePath = result.filePaths[0]
+  // Return both local path and base64 data URL
+  const buf  = require("fs").readFileSync(filePath)
+  const ext  = require("path").extname(filePath).slice(1).toLowerCase()
+  const mime = ext === "jpg" ? "image/jpeg" : `image/${ext}`
+  const b64  = `data:${mime};base64,${buf.toString("base64")}`
+  return { ok: true, filePath, dataUrl: b64 }
+})
+
+ipcMain.handle("shell:open-external", async (_e, url) => {
+  const { shell } = require("electron")
+  // Security: only allow http/https URLs
+  if (typeof url === "string" && /^https?:\/\//i.test(url)) {
+    await shell.openExternal(url)
+    return { ok: true }
+  }
+  return { ok: false, error: "Invalid URL" }
+})
 
 // ── App Lifecycle ─────────────────────────────────────────
 app.whenReady().then(createWindow)

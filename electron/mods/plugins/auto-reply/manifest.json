@@ -1,0 +1,7 @@
+{
+  "id": "auto-reply",
+  "name": "Auto Reply",
+  "version": "1.0.0",
+  "description": "Balas pesan otomatis berdasarkan keyword yang dikonfigurasi",
+  "author": "WaPlus"
+}
