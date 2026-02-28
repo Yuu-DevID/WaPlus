@@ -23,6 +23,21 @@ import { useMediaPrefetch } from "../hooks/useMediaPrefetch"
 const toBool = (v) => v === 1 || v === true
 const toInt  = (v) => (v === 1 || v === true ? 1 : 0)
 
+// [FIX-MESSAGES] Normalize JID agar cocok dengan store key yang dipakai loadMessages()
+// Mirror normalizeJid() di store/chat.js — mencegah messages[jid] miss
+// saat prop masuk sebagai @c.us atau dengan :device suffix.
+function normalizeJid(jid) {
+  if (!jid || typeof jid !== "string") return ""
+  const atIdx = jid.lastIndexOf("@")
+  if (atIdx === -1) return jid
+  let user   = jid.slice(0, atIdx)
+  let server = jid.slice(atIdx + 1)
+  const colonIdx = user.indexOf(":")
+  if (colonIdx !== -1) user = user.slice(0, colonIdx)
+  if (server === "c.us") server = "s.whatsapp.net"
+  return `${user}@${server}`
+}
+
 const COLORS = ["#1a5c3e","#1565c0","#6a1b9a","#b71c1c","#e65100",
                 "#2e7d32","#00695c","#4527a0","#00838f","#ad1457"]
 function getColor(s) {
@@ -39,42 +54,50 @@ function initials(n) {
 }
 
 /**
- * resolveDisplayName — single function that converts ANY JID or raw name into
- * a human-readable display name. Handles every ugly variant WA can produce:
+ * resolveDisplayName — converts JID + chat object into a human-readable name.
+ * Never returns raw @lid / @s.whatsapp.net JIDs.
  *
- *   @lid JID            → "+175784908046590"  (unknown, not in contacts)
- *   @s.whatsapp.net     → "+628xxxx"          (unsaved contact)
- *   @g.us               → group name as-is
- *   raw digits only     → "+628xxxx" formatted
- *   normal saved name   → returned as-is
- *
- * Priority: saved name → phone from JID → safe fallback
+ * Priority:
+ *   Groups      : chat.name (subject) > chat.subject > "Grup"
+ *   @lid DM     : chat.name > chat.last_sender_name > chat.push_name > "+number"
+ *   Regular DM  : chat.name (phonebook/push_name) > "+number"
  */
-function resolveDisplayName(jid, savedName) {
-  // 1. If savedName exists and is NOT a raw JID (no "@"), use it
-  if (savedName && !savedName.includes("@") && !/^\d{6,}$/.test(savedName.trim())) {
-    return savedName
-  }
+function resolveDisplayName(jid, chat) {
+  // Support legacy call with (jid, string) for backwards compat
+  const savedName = typeof chat === "string" ? chat : (chat?.name || "")
+  const chatObj   = typeof chat === "object" && chat !== null ? chat : {}
 
-  // 2. Extract parts from JID
-  if (!jid) return savedName || "Unknown"
-  const atIdx = jid.lastIndexOf("@")
-  const server = atIdx !== -1 ? jid.slice(atIdx + 1) : ""
-  const user   = atIdx !== -1 ? jid.slice(0, atIdx) : jid
-
-  // Groups / newsletters → saved name or strip to group ID fragment
-  if (server === "g.us" || server === "newsletter") {
-    return savedName || user.slice(-6) || "Grup"
-  }
-
-  // @lid, @s.whatsapp.net, @c.us — user part should be pure digits
-  // Strip any device suffix (colon) just in case
+  const atIdx     = jid ? jid.lastIndexOf("@") : -1
+  const server    = atIdx !== -1 ? jid.slice(atIdx + 1) : ""
+  const user      = atIdx !== -1 ? jid.slice(0, atIdx) : (jid || "")
   const cleanUser = user.split(":")[0]
-  if (/^\d{6,}$/.test(cleanUser)) {
-    return `+${cleanUser}`
+  const isLid     = server === "lid"
+
+  // Groups / newsletters
+  if (server === "g.us" || server === "newsletter") {
+    const n = savedName || chatObj.subject || ""
+    return (n && !n.includes("@")) ? n : "Grup"
   }
 
-  return savedName || cleanUser || "Unknown"
+  // Coba semua kandidat nama — skip yang mengandung "@" (raw JID)
+  const candidates = [
+    savedName,
+    chatObj.last_sender_name,
+    chatObj.push_name,
+  ]
+  for (const c of candidates) {
+    if (c && typeof c === "string" && !c.includes("@") && c.trim()) {
+      return c.trim()
+    }
+  }
+
+  // Last resort: format number dari JID
+  if (/^\d{6,}$/.test(cleanUser)) {
+    // Untuk @lid, angkanya bukan phone number — label berbeda
+    return isLid ? `~${cleanUser.slice(-8)}` : `+${cleanUser}`
+  }
+
+  return cleanUser || "Unknown"
 }
 
 // ── Avatar ────────────────────────────────────────────────────────────────────
@@ -82,18 +105,25 @@ const picCache = new Map()
 const fetching = new Set()
 
 function Avatar({ jid, name, size = 38 }) {
-  const [url, setUrl] = useState(() => picCache.has(jid) ? picCache.get(jid) : null)
+  const [url, setUrl] = useState(() => picCache.has(jid) ? picCache.get(jid) : undefined)
   const [err, setErr] = useState(false)
 
   useEffect(() => {
-    if (!jid || url || fetching.has(jid) || err) return
-    if (picCache.has(jid)) { setUrl(picCache.get(jid)); return }
+    if (!jid) return
+    if (picCache.has(jid)) {
+      const cached = picCache.get(jid)
+      if (cached !== url) setUrl(cached)
+      return
+    }
+    if (fetching.has(jid)) return
     fetching.add(jid)
     window.api?.getProfilePic?.({ jid })
       .then(r => { const u = r?.url || null; picCache.set(jid, u); setUrl(u) })
       .catch(() => picCache.set(jid, null))
       .finally(() => fetching.delete(jid))
   }, [jid])
+
+  useEffect(() => { setErr(false) }, [url])
 
   return (
     <div
@@ -184,50 +214,65 @@ export default function ChatWindow({ jid }) {
   const {
     messages, loadMessages, refreshActiveChat,
     chats, appendMessage, setActiveJid,
-    contacts,
+    contacts, updateReactions, prependMessages, loadReactions,
   } = useChatStore()
   const { setRightPanel } = useAppStore()
 
   const [loading, setLoading] = useState(true)
+  const [loadingMore, setLoadingMore] = useState(false)  // [FIX-SCROLL] loading older msgs
+  const [hasMore, setHasMore] = useState(true)           // [FIX-SCROLL] more msgs to fetch
   const [replyTo, setReplyTo] = useState(null)   // [REPLY] message being replied to
   const bottomRef  = useRef(null)
   const areaRef    = useRef(null)
   const prevJidRef = useRef(null)
   // [REPLY] Map msgId → DOM element ref for scroll-to-message
   const msgRefsMap = useRef({})
+  // [FIX-SCROLL] Track pagination offset per JID
+  const offsetRef  = useRef(0)
 
   // Resolve chat info
-  const chat = chats.find(c => c.jid === jid)
+  // [FIX-MESSAGES] Normalize JID saat cari chat — @c.us vs @s.whatsapp.net bisa beda
+  const chat = chats.find(c => normalizeJid(c.jid) === normalizeJid(jid))
   // [FIX-LID] resolveDisplayName handles @lid, @s.whatsapp.net, unsaved contacts
-  const name = resolveDisplayName(jid, chat?.name || "")
+  const name = resolveDisplayName(jid, chat || {})
 
-  const msgs = messages[jid] || []
+  // [FIX-MESSAGES] Lookup pakai normalized key — loadMessages() simpan di normalizeJid(jid)
+  const normalizedJid = normalizeJid(jid)
+  const msgs = messages[normalizedJid] || []
   const isGroup = (jid || "").endsWith("@g.us")
 
   // [PREFETCH] Fire high-priority media prefetch when this chat opens.
   // Downloads pending images/videos/stickers in background before user scrolls.
   useMediaPrefetch(jid)
 
-  // ── [FIX-1 + FIX-5] On JID change: clear old, load new, register active ──
+  // ── [FIX-1 + FIX-5] On JID change: load messages, register active ────────
   useEffect(() => {
     if (!jid) return
     prevJidRef.current = jid
-    setReplyTo(null)  // [REPLY] clear reply state on chat switch
-
-    // Tell store which chat is active (enables store-level auto-refresh)
+    setReplyTo(null)
+    offsetRef.current = 0
+    setHasMore(true)
     setActiveJid(jid)
-
     setLoading(true)
-    loadMessages(jid).finally(() => {
-      // Only clear loading if we're still on this same JID
+
+    console.log(`[ChatWindow] opening jid=${jid}`)
+    loadMessages(jid, 50, 0).then(msgs => {
+      if (prevJidRef.current !== jid) {
+        console.log(`[ChatWindow] stale result for ${jid}, current=${prevJidRef.current}, skipping`)
+        return
+      }
+      setLoading(false)
+      // Pakai store length — mungkin berbeda jika refreshActiveChat jalan bersamaan
+      const stored = useChatStore.getState().messages[normalizeJid(jid)] || []
+      const count = stored.length || msgs?.length || 0
+      offsetRef.current = count
+      if (count < 50) setHasMore(false)
+      loadReactions(jid)
+      // Refresh chat list agar history chats update preview mereka
+      useChatStore.getState().loadChats?.()
+    }).catch(() => {
       if (prevJidRef.current === jid) setLoading(false)
     })
-
-    return () => {
-      // On unmount or JID change — deregister active
-      // (setActiveJid(null) is NOT called here to avoid flicker;
-      //  next mount with new JID will overwrite)
-    }
   }, [jid])
 
   // ── [FIX-2] Auto-refresh: event-driven ──────────────────────────────────
@@ -236,53 +281,71 @@ export default function ChatWindow({ jid }) {
     if (!jid || !window.api) return
     const subs = []
 
-    // ── Source 1: messages:new from Baileys client.js ──────────────────────
+    // ── Source 1: messages:new dari Baileys client.js ─────────────────────
+    // payload = buildRendererPayload(parsed) dari messageParser.js
+    // Fields: chat_jid, id, from_me, sender_name, msg_type
+    // (BUKAN jid/key/isMe/pushname/msgType — itu field raw Baileys)
     if (window.api.onMessagesNew) {
       subs.push(window.api.onMessagesNew(data => {
-        // [FIX-4] Only handle events for THIS chat
-        if (data.jid !== jid) return
-        if (data.isHistorySync) return
+        // [FIX-FIELD] data.jid tidak ada — field yang benar adalah data.chat_jid
+        // [FIX-4] normalize kedua sisi agar @c.us vs @s.whatsapp.net tidak mismatch
+        if (!data?.chat_jid) return
+        if (normalizeJid(data.chat_jid) !== normalizeJid(jid)) return
+        if (data.is_history_sync) return
 
-        const msgId = data.key?.id
+        // buildRendererPayload emit id langsung (tanpa key wrapper)
+        const msgId = data.id
         if (!msgId) return
+
+        // [REALTIME-REACTION] Jika ini adalah reaction message, update reaction di target
+        if (data.msg_type === "reactionMessage" && data.reaction_target_id) {
+          const sender = data.sender_jid || data.chat_jid || ""
+          useChatStore.getState().updateReactions(
+            normalizeJid(jid), data.reaction_target_id, sender,
+            data.reaction_emoji || data.body || ""
+          )
+          return  // Don't add as regular message
+        }
 
         appendMessage(jid, {
           id:               msgId,
           chat_jid:         jid,
-          body:             data.body || "",
-          msg_type:         data.msgType || "conversation",
-          timestamp:        data.timestamp || Math.floor(Date.now() / 1000),
-          from_me:          toInt(data.isMe),
-          status:           data.status ?? 0,
-          sender_name:      data.pushname || "",
+          body:             data.body             || "",
+          msg_type:         data.msg_type         || "conversation",
+          timestamp:        data.timestamp        || Math.floor(Date.now() / 1000),
+          from_me:          data.from_me          ?? 0,
+          status:           data.status           ?? 0,
+          sender_name:      data.sender_name      || "",
+          sender_jid:       data.sender_jid       || null,
           is_group:         toInt(isGroup),
-          mimetype:
-            data.message?.imageMessage?.mimetype  ||
-            data.message?.videoMessage?.mimetype  ||
-            data.message?.stickerMessage?.mimetype||
-            data.message?.audioMessage?.mimetype  ||
-            null,
-          duration:         data.message?.audioMessage?.seconds || null,
-          media_saved_path: null,
-          media_url:
-            data.message?.imageMessage?.url ||
-            data.message?.videoMessage?.url ||
-            data.message?.stickerMessage?.url ||
-            null,
-          // Reply info from Baileys
-          quoted_id:     data.quoted?.key?.id || null,
-          quoted_body:   data.quoted?.body    || null,
-          quoted_sender: data.quoted?.participant || data.quoted?.remoteJid || null,
-          quoted_type:   data.quoted?.type    || null,
+          has_media:        data.has_media        ?? 0,
+          mimetype:         data.mimetype         || null,
+          media_duration:   data.media_duration   || null,
+          media_filename:   data.media_filename   || null,
+          media_saved_path: data.media_saved_path || null,
+          media_url:        data.media_url        || null,
+          is_ptt:           data.is_ptt           ?? 0,
+          is_gif:           data.is_gif           ?? 0,
+          is_view_once:     data.is_view_once     ?? 0,
+          is_animated:      data.is_animated      ?? 0,
+          quoted_id:        data.quoted_id        || null,
+          quoted_body:      data.quoted_body      || null,
+          quoted_sender:    data.quoted_sender    || null,
+          quoted_type:      data.quoted_type      || null,
+          quoted_has_media: data.quoted_has_media ?? 0,
+          reaction_emoji:   data.reaction_emoji   || null,
+          reaction_target_id: data.reaction_target_id || null,
+          is_forwarded:     data.is_forwarded     ?? 0,
+          starred:          data.starred          ?? 0,
         })
       }))
     }
 
-    // ── Source 2: db:messages:new from main.js ─────────────────────────────
+    // ── Source 2: db:messages:new dari main.js ────────────────────────────
     if (window.api.onNewMessage) {
       subs.push(window.api.onNewMessage(data => {
-        // [FIX-4] Only handle events for THIS chat
-        if (data.chat_jid !== jid) return
+        // [FIX-4] normalize JID comparison
+        if (normalizeJid(data.chat_jid) !== normalizeJid(jid)) return
         const m = data.message
         if (!m?.id) return
 
@@ -304,22 +367,41 @@ export default function ChatWindow({ jid }) {
       }))
     }
 
-    // ── Source 3: db:chats:updated → silent refresh of message list ────────
-    // This catches: status updates, edits, reactions, etc. that don't
-    // emit a "new message" event but still change the DB
+    // ── Source 3: db:chats:updated → silent refresh message list ──────────
+    // Catches: status updates, edits, reactions, dll yang tidak emit new message
     if (window.api.onChatsUpdated) {
       subs.push(window.api.onChatsUpdated(() => {
         refreshActiveChat()
       }))
     }
 
-    // ── Source 4: media:updated → update specific message media path ───────
+    // ── Source 4: media:updated → update media path pesan tertentu ────────
     if (window.api.onMediaUpdated) {
       subs.push(window.api.onMediaUpdated(data => {
-        if (data.chat_jid !== jid) return
+        if (normalizeJid(data.chat_jid) !== normalizeJid(jid)) return
         useChatStore.getState().updateMessageMedia(data)
       }))
     }
+
+    // ── Source 5: messages:reaction → realtime update di target message ──
+    // [FIX-REACTIONS-REALTIME] Setiap reaction event = array of {key, reaction} objects
+    // Langsung update store TANPA reload — ReactionOverlay re-render otomatis
+    if (window.api.onMessagesReaction) {
+      subs.push(window.api.onMessagesReaction(reactions => {
+        for (const item of (reactions || [])) {
+          const reactionData = item.reaction || item
+          const targetId = reactionData.key?.id || item.key?.id
+          const chatJid  = reactionData.key?.remoteJid || item.key?.remoteJid || jid
+          const emoji    = reactionData.text || ""
+          const sender   = reactionData.key?.participant || reactionData.key?.remoteJid || ""
+          if (!targetId) continue
+          // [REALTIME] Update langsung tanpa tunggu refresh
+          useChatStore.getState().updateReactions(normalizeJid(chatJid || jid), targetId, sender, emoji)
+        }
+      }))
+    }
+
+
 
     return () => subs.forEach(fn => typeof fn === "function" && fn())
   }, [jid, isGroup])
@@ -342,12 +424,15 @@ export default function ChatWindow({ jid }) {
   useEffect(() => {
     if (loading) return
     if (msgs.length > prevMsgCountRef.current) {
-      // Only auto-scroll if user is near bottom (within 200px)
       const area = areaRef.current
       if (area) {
         const distFromBottom = area.scrollHeight - area.scrollTop - area.clientHeight
         if (distFromBottom < 200) {
           setTimeout(() => bottomRef.current?.scrollIntoView({ behavior: "smooth" }), 60)
+        } else {
+          // User scrolled up — increment unread counter
+          const newCount = msgs.length - prevMsgCountRef.current
+          setUnreadCount(prev => prev + newCount)
         }
       }
     }
@@ -373,6 +458,46 @@ export default function ChatWindow({ jid }) {
       setTimeout(() => el.dispatchEvent(new CustomEvent("msg-highlight")), 350)
     }
   }, [])
+
+  // [FIX-SCROLL] Load older messages saat user scroll ke atas
+  const handleScroll = useCallback(async () => {
+    const area = areaRef.current
+    if (!area) return
+    // Track scroll-to-bottom button visibility
+    const dist = area.scrollHeight - area.scrollTop - area.clientHeight
+    setShowScrollBtn(dist > 300)
+    if (dist < 50) setUnreadCount(0)
+
+    if (!loadingMore && hasMore && !loading) {
+      if (area.scrollTop > 120) return  // belum dekat atas
+
+      setLoadingMore(true)
+      const currentOffset = offsetRef.current
+      const LOAD_COUNT = 30
+
+    const scrollHeightBefore = area.scrollHeight
+
+    const older = await prependMessages(jid, LOAD_COUNT, currentOffset)
+    offsetRef.current = currentOffset + older.length
+
+    if (older.length < LOAD_COUNT) setHasMore(false)
+
+    // Trigger media prefetch untuk messages yang baru di-load
+    if (older.length > 0 && jid) {
+      const { prefetchChat } = await import("../hooks/useMediaPrefetch")
+      prefetchChat(jid, LOAD_COUNT + 10, false)
+    }
+
+    // Restore scroll position agar viewport tidak loncat
+    requestAnimationFrame(() => {
+      if (!area) return
+      const scrollHeightAfter = area.scrollHeight
+      area.scrollTop += (scrollHeightAfter - scrollHeightBefore)
+    })
+
+      setLoadingMore(false)
+    }
+  }, [jid, loadingMore, hasMore, loading, prependMessages])
 
   // ════════════════════════════════════════════════════════════
   // RENDER
@@ -404,7 +529,13 @@ export default function ChatWindow({ jid }) {
       </div>
 
       {/* ── Messages area ── */}
-      <div className="msg-area" ref={areaRef}>
+      <div className="msg-area" ref={areaRef} onScroll={handleScroll}>
+        {/* [FIX-SCROLL] Loading older messages spinner */}
+        {loadingMore && (
+          <div style={{ display: "flex", justifyContent: "center", padding: "8px 0" }}>
+            <span className="spinner spinner-sm" style={{ borderTopColor: "var(--green)", borderColor: "rgba(37,211,102,.2)" }} />
+          </div>
+        )}
         {loading ? (
           Array.from({ length: 8 }).map((_, i) => (
             <SkeletonBubble key={i} isMe={i % 3 === 0} />
@@ -438,6 +569,28 @@ export default function ChatWindow({ jid }) {
         )}
         <div ref={bottomRef} />
       </div>
+
+      {/* ── Scroll to bottom FAB ── */}
+      {showScrollBtn && (
+        <button
+          className="scroll-to-bottom-btn"
+          onClick={() => {
+            bottomRef.current?.scrollIntoView({ behavior: "smooth" })
+            setUnreadCount(0)
+          }}
+          title="Scroll ke pesan terbaru"
+        >
+          {unreadCount > 0 && (
+            <span className="scroll-unread-badge">
+              {unreadCount > 99 ? "99+" : unreadCount}
+            </span>
+          )}
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none"
+            stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M12 5v14M5 12l7 7 7-7"/>
+          </svg>
+        </button>
+      )}
 
       {/* ── Input ── */}
       <MessageInput

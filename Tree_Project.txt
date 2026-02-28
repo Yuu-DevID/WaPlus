@@ -1,19 +1,18 @@
 Project : WaPlus-dev
-Generated: 2026-02-27 13:23:02
+Generated: 2026-02-28 05:44:31
 ==================================================
 WaPlus-dev/
 ├── .git/
 │   └── ...
 ├── electron/
 │   ├── baileys/
-│   │   ├── database/
-│   │   │   └── ...
 │   │   ├── media/
 │   │   │   └── ...
 │   │   ├── session/
 │   │   │   └── ...
 │   │   ├── client.js
 │   │   ├── database.js
+│   │   ├── lid_map.json
 │   │   └── messageParser.js
 │   ├── db/
 │   │   └── database.js
@@ -35,6 +34,8 @@ WaPlus-dev/
 │   │   └── StepIndicator.jsx
 │   ├── data/
 │   │   └── countries.js
+│   ├── hooks/
+│   │   └── useMediaPrefetch.js
 │   ├── pages/
 │   │   ├── Auth.jsx
 │   │   └── Main.jsx
@@ -47,6 +48,7 @@ WaPlus-dev/
 │   └── styles.css
 ├── .gitignore
 ├── Tree_Project.txt
+├── WaPlus-dev.zip
 ├── index.html
 ├── output (1).json
 ├── output.json

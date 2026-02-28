@@ -64,13 +64,26 @@ function formatTs(ts) {
 const picCache = new Map()
 const fetching = new Set()
 
-const ChatAvatar = memo(function ChatAvatar({ jid, name, isGroup, size = 46 }) {
-  const [url, setUrl] = useState(() => picCache.has(jid) ? picCache.get(jid) : null)
+const ChatAvatar = memo(function ChatAvatar({ jid, name, isGroup, isChannel, size = 46 }) {
+  // [FIX-AVATAR] Use picCache as source of truth. picCache stores:
+  //   undefined = never fetched
+  //   null      = fetched, no pic (show initials)
+  //   string    = fetched, has URL (show image)
+  const [url, setUrl] = useState(() => {
+    if (picCache.has(jid)) return picCache.get(jid)
+    return undefined  // undefined = not yet fetched
+  })
   const [err, setErr] = useState(false)
 
   useEffect(() => {
-    if (!jid || url !== null || fetching.has(jid) || err) return
-    if (picCache.has(jid)) { setUrl(picCache.get(jid)); return }
+    if (!jid) return
+    // Already in cache (including null = confirmed no pic)
+    if (picCache.has(jid)) {
+      const cached = picCache.get(jid)
+      if (cached !== url) setUrl(cached)
+      return
+    }
+    if (fetching.has(jid)) return
     fetching.add(jid)
     window.api?.getProfilePic?.({ jid })
       .then(r => {
@@ -84,6 +97,9 @@ const ChatAvatar = memo(function ChatAvatar({ jid, name, isGroup, size = 46 }) {
       })
       .finally(() => fetching.delete(jid))
   }, [jid])
+
+  // Reset err when url changes (new pic fetched)
+  useEffect(() => { setErr(false) }, [url])
 
   const initials = buildInitials(name)
   const color    = seedColor(jid)  // Seed from JID, not name, for stability
@@ -119,22 +135,16 @@ const ChatAvatar = memo(function ChatAvatar({ jid, name, isGroup, size = 46 }) {
       ) : (
         initials
       )}
-      {/* [FIX-6] Group badge */}
-      {isGroup && !url && (
+      {/* [FIX-6] Group / Channel badge */}
+      {(isGroup || isChannel) && !url && (
         <div style={{
-          position:   "absolute",
-          bottom:     -1,
-          right:      -1,
-          width:      16,
-          height:     16,
-          borderRadius: "50%",
+          position: "absolute", bottom: -1, right: -1,
+          width: 16, height: 16, borderRadius: "50%",
           background: "var(--bg-2, #1a1a1a)",
-          display:    "flex",
-          alignItems: "center",
-          justifyContent: "center",
-          fontSize:   9,
+          display: "flex", alignItems: "center", justifyContent: "center",
+          fontSize: 9,
         }}>
-          👥
+          {isChannel ? "📢" : "👥"}
         </div>
       )}
     </div>
@@ -199,25 +209,42 @@ const ChatItem = memo(function ChatItem({ chat, isActive, onClick, observe, unob
     return () => unobserve?.(el)
   }, [jid, observe, unobserve])
 
-  // [FIX-1] chat.name is already resolved by store normalizeChat().
-  // Final safety: handle @lid, @s.whatsapp.net, raw JID, and unsaved contacts.
-  let displayName = chat.name || ""
-  if (!displayName || displayName.includes("@")) {
-    const atIdx = jid.lastIndexOf("@")
-    const server = atIdx !== -1 ? jid.slice(atIdx + 1) : ""
-    const user   = atIdx !== -1 ? jid.slice(0, atIdx) : jid
-    const cleanUser = user.split(":")[0]
-    if (server === "g.us" || server === "newsletter") {
-      // Group/newsletter: pakai name dari DB atau fallback
-      displayName = chat.subject || cleanUser || "Grup"
-    } else if (server === "lid") {
-      // @lid belum ter-resolve → tampilkan sebagai nomor saja tanpa "@lid"
-      displayName = /^\d{6,}$/.test(cleanUser) ? `+${cleanUser}` : cleanUser || "Unknown"
-    } else if (/^\d{6,}$/.test(cleanUser)) {
-      displayName = `+${cleanUser}`
-    } else {
-      displayName = cleanUser || "Unknown"
-    }
+  // ── Display name resolution ─────────────────────────────────────────────
+  // Never show raw @lid / @s.whatsapp.net JIDs. Priority:
+  //   Groups  : chat.name (subject) > chat.subject > "Grup"
+  //   @lid DM : chat.name (DB resolved push_name) > last_sender_name > push_name > +number
+  //   DM      : chat.name (phonebook/push_name) > +number from JID
+  const atIdx     = jid.lastIndexOf("@")
+  const server    = atIdx !== -1 ? jid.slice(atIdx + 1) : ""
+  const user      = atIdx !== -1 ? jid.slice(0, atIdx) : jid
+  const cleanUser = user.split(":")[0]
+  const isLidJid  = server === "lid"
+  const isChannel = server === "newsletter"
+
+  let displayName = ""
+
+  if (isChannel) {
+    // Newsletter/channel
+    displayName = chat.name || chat.subject || "Saluran"
+    if (displayName.includes("@")) displayName = "Saluran"
+  } else if (isGroup || server === "g.us") {
+    // GROUP — name = group subject
+    displayName = chat.name || chat.subject || "Grup"
+    if (displayName.includes("@")) displayName = "Grup"
+
+  } else if (isLidJid) {
+    // @LID DM — DB should have resolved push_name but try every fallback
+    const candidateName = chat.name || chat.last_sender_name || chat.push_name || ""
+    displayName = (candidateName && !candidateName.includes("@"))
+      ? candidateName
+      : (/^\d{6,}$/.test(cleanUser) ? `~${cleanUser.slice(-8)}` : cleanUser || "Unknown")
+
+  } else {
+    // Regular DM — phonebook name or format number
+    const candidateName = chat.name || ""
+    displayName = (candidateName && !candidateName.includes("@"))
+      ? candidateName
+      : (/^\d{6,}$/.test(cleanUser) ? `+${cleanUser}` : cleanUser || "Unknown")
   }
 
   const unread  = Number(chat.unread_count) || 0
@@ -245,7 +272,7 @@ const ChatItem = memo(function ChatItem({ chat, isActive, onClick, observe, unob
       onMouseLeave={e => { if (!isActive) e.currentTarget.style.background = "transparent" }}
     >
       {/* Avatar */}
-      <ChatAvatar jid={jid} name={displayName} isGroup={isGroup} />
+      <ChatAvatar jid={jid} name={displayName} isGroup={isGroup} isChannel={isChannel} />
 
       {/* Content */}
       <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 2 }}>

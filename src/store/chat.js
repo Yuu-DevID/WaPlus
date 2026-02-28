@@ -56,9 +56,11 @@ function normalizeJid(jid) {
 // DB stores quoted_sender as JID like "6285770017326@s.whatsapp.net"
 // We want to show just the number or contact name, not the raw JID.
 // [FIX-LID] @lid JIDs must be resolved — they look like "175784908046590@lid"
-// [FIX-OWN] If sender JID matches our own JID, return null (caller shows "Kamu")
+// [FIX-OWN] If sender JID matches our own JID, return "__me__" sentinel
 function resolveQuotedSender(sender, contacts, ownJid) {
   if (!sender) return null
+  // [FIX-DB-SELF] __self__ sentinel = DB detected this quoted msg was from_me=1
+  if (sender === "__self__") return "__me__"
   // If it's already a name (no @), return as-is
   if (!sender.includes("@")) return sender
 
@@ -70,11 +72,12 @@ function resolveQuotedSender(sender, contacts, ownJid) {
   // Try to resolve via contacts, otherwise show as unknown number
   const isLid = server === "lid"
 
-  // [FIX-OWN] Check if this is our own JID
+  // [FIX-OWN] Check if this is our own JID — return sentinel "__me__" (not null)
+  // null means "unresolved/unknown", "__me__" means definitively our own message
   if (ownJid) {
-    const ownUser = ownJid.split("@")[0].split(":")[0]
+    const ownUser    = ownJid.split("@")[0].split(":")[0]
     const senderUser = user.split(":")[0]
-    if (ownUser === senderUser) return null // caller renders "Kamu"
+    if (ownUser === senderUser) return "__me__"
   }
 
   // Try to find in contacts store — also try to match @lid via number
@@ -120,6 +123,8 @@ function normalizeMsg(m, contacts, ownJid) {
     poll_options:   parseJson(m.poll_options, null),
     contacts_json:  parseJson(m.contacts_json, null),
     mentioned_jids: parseJson(m.mentioned_jids, []),
+    // reactions are merged in separately via loadReactions() / updateReactions()
+    reactions: m.reactions || [],
   }
 }
 
@@ -154,6 +159,8 @@ export const useChatStore = create((set, get) => ({
 
   communities: [],
   communitiesTotal: 0,
+  channels: [],
+  channelsTotal: 0,
 
   // ── Messages ─────────────────────────────────────────────────────────────
   // Keyed by JID — only loaded chats are kept in memory
@@ -172,6 +179,7 @@ export const useChatStore = create((set, get) => ({
 
   // ── Sync ─────────────────────────────────────────────────────────────────
   syncStatus: "idle",
+  _backfillDone: false,
 
   // ════════════════════════════════════════════════════════════
   // CHAT ACTIONS
@@ -206,11 +214,13 @@ export const useChatStore = create((set, get) => ({
             byJid[jid] = prev ? mergeChat(prev, norm) : norm
           }
         }
-        const allChats    = Object.values(byJid)
-          .filter(c => !c.is_community)
+        const allRaw      = Object.values(byJid)
+        const channels    = allRaw.filter(c => (c.jid || "").endsWith("@newsletter"))
+        const allChats    = allRaw
+          .filter(c => !c.is_community && !(c.jid || "").endsWith("@newsletter"))
           .map(c => ({ ...c, from_me: c.from_me != null ? Number(c.from_me) : 0 }))
         const groups      = allChats.filter(c => c.is_group)
-        const communities = Object.values(byJid).filter(c => c.is_community)
+        const communities = allRaw.filter(c => c.is_community)
 
         set({
           chats:            allChats,
@@ -219,8 +229,47 @@ export const useChatStore = create((set, get) => ({
           groupsTotal:      groups.length,
           communities,
           communitiesTotal: communities.length,
+          channels,
+          channelsTotal:    channels.length,
           chatsLoading:     false,
         })
+
+        // [FIX-HISTORY-PREVIEW] Jika ada chat tanpa last_message preview
+        // (last_msg null — umum untuk history sync chats), trigger DB backfill
+        // yang mengisi last_message_body dari tabel messages, lalu reload.
+        // [FIX-BACKFILL-SPAM] Hanya backfill SEKALI per session — mencegah loop:
+        // loadChats → backfill → db:chats:updated → loadChats → backfill → ...
+        const hasBlankPreviews = allChats.some(c => !c.last_msg)
+        const alreadyBackfilled = get()._backfillDone
+        if (hasBlankPreviews && !alreadyBackfilled) {
+          set({ _backfillDone: true })
+          window.api?.dbBackfillPreviews?.().then(() => {
+            window.api?.dbChats?.({ limit: 100, offset: 0 }).then(r2 => {
+              if (!r2?.ok) return
+              const raw2 = r2.data || []
+              const byJid2 = {}
+              for (const c of raw2) {
+                const jid2 = normalizeJid(c.jid)
+                if (!jid2) continue
+                const norm2 = { ...c, jid: jid2 }
+                const prev2 = byJid2[jid2]
+                if (!prev2 || (norm2.last_msg_at || 0) >= (prev2.last_msg_at || 0)) {
+                  byJid2[jid2] = prev2 ? mergeChat(prev2, norm2) : norm2
+                }
+              }
+              const all2 = Object.values(byJid2)
+                .filter(c => !c.is_community)
+                .map(c => ({ ...c, from_me: c.from_me != null ? Number(c.from_me) : 0 }))
+              const grp2 = all2.filter(c => c.is_group)
+              const comm2 = Object.values(byJid2).filter(c => c.is_community)
+              set({
+                chats: all2, chatsTotal: r2.total || all2.length,
+                groups: grp2, groupsTotal: grp2.length,
+                communities: comm2, communitiesTotal: comm2.length,
+              })
+            }).catch(() => {})
+          }).catch(() => {})
+        }
       } else {
         set({ chatsLoading: false })
       }
@@ -278,63 +327,88 @@ export const useChatStore = create((set, get) => ({
     // [FIX-SPLIT-CHAT] Normalize before using as store key and IPC arg
     const cleanJid = normalizeJid(jid)
 
-    // [FIX-3] Increment sequence — any prior in-flight request for this JID
-    // will see seq mismatch and discard its result (prevents chat mismatch)
+    // [FIX-3] Sequence counter — only the LATEST call for a given JID wins.
+    // IMPORTANT: do NOT clear messages[cleanJid] here — keep showing old messages
+    // while the new fetch is in-flight. This prevents blank flash on chat switch.
     const seq = (get()._seq[cleanJid] || 0) + 1
     set(s => ({
       _seq:            { ...s._seq, [cleanJid]: seq },
       messagesLoading: true,
-      messages:        { ...s.messages, [cleanJid]: [] },
+      // [FIX-BLANK-FLASH] Tidak clear messages di sini — tampilkan pesan lama
+      // selama fetch berjalan. Blank flash terjadi karena clear ke [] lalu tunggu IPC.
     }))
 
     try {
       const result = await window.api?.dbMessages?.({ jid: cleanJid, limit, offset })
 
       if (get()._seq[cleanJid] !== seq) {
-        console.log(`[AuroraChat] loadMessages stale for ${cleanJid}, discarding`)
-        return []
+        console.log(`[AuroraChat] loadMessages stale for ${cleanJid} (seq=${seq}, current=${get()._seq[cleanJid]}) — returning cached`)
+        return get().messages[cleanJid] || []
       }
 
       if (result?.ok) {
         const contacts = get().contacts
         const ownJid = getOwnJid()
         const msgs = (result.data || []).slice().reverse().map(m => normalizeMsg(m, contacts, ownJid))
+        console.log(`[AuroraChat] loadMessages OK for ${cleanJid}: ${msgs.length} msgs (offset=${offset})`)
 
         set(s => ({
           messages:        { ...s.messages, [cleanJid]: msgs },
           messagesLoading: false,
         }))
         return msgs
+      } else {
+        console.error(`[AuroraChat] loadMessages FAILED for ${cleanJid}:`, result)
       }
     } catch (err) {
       console.error("[AuroraChat] loadMessages error:", err)
     }
 
     if (get()._seq[cleanJid] === seq) set({ messagesLoading: false })
-    return []
+    console.warn(`[AuroraChat] loadMessages returning cached for ${cleanJid}`)
+    return get().messages[cleanJid] || []
   },
 
   // [FIX-4] Refresh active chat messages silently (no loading spinner)
-  // Called when "db:chats:updated" fires and activeJid is set
+  // Called when "db:chats:updated" fires and activeJid is set.
+  // Kept intentionally simple — complex guards caused switch-back blank screen bugs.
   refreshActiveChat: async () => {
-    const { activeJid, _seq, contacts } = get()
+    const { activeJid, contacts } = get()
     if (!activeJid) return
+    const cleanJid = normalizeJid(activeJid)
+    if (!cleanJid) return
 
     try {
-      const result = await window.api?.dbMessages?.({ jid: activeJid, limit: 50, offset: 0 })
+      const result = await window.api?.dbMessages?.({ jid: cleanJid, limit: 50, offset: 0 })
       if (!result?.ok) return
 
-      // Check we're still on the same chat
-      if (get().activeJid !== activeJid) return
+      // Guard: bail if user switched away while IPC was in-flight
+      if (normalizeJid(get().activeJid) !== cleanJid) return
 
       const ownJid = getOwnJid()
-        const msgs = (result.data || []).slice().reverse().map(m => normalizeMsg(m, contacts, ownJid))
-      const existing = get().messages[activeJid] || []
+      const msgs    = (result.data || []).slice().reverse().map(m => normalizeMsg(m, contacts, ownJid))
+      const existing = get().messages[cleanJid] || []
 
-      // Smart merge: only update if we got MORE messages or content changed
-      if (msgs.length > existing.length || (msgs.length > 0 && msgs[msgs.length - 1]?.id !== existing[existing.length - 1]?.id)) {
+      // [FIX-PAGINATE] Jika user sudah scroll up dan load lebih dari 50 msgs,
+      // jangan wipe scroll position — hanya append pesan baru di tail.
+      if (existing.length > msgs.length) {
+        const existingIds = new Set(existing.map(m => m.id))
+        const newTail = msgs.filter(m => !existingIds.has(m.id))
+        if (newTail.length > 0) {
+          set(s => ({
+            messages: { ...s.messages, [cleanJid]: [...(s.messages[cleanJid] || []), ...newTail] }
+          }))
+        }
+        return
+      }
+
+      // Normal case: update hanya jika ada perubahan
+      if (msgs.length > 0 && (
+        msgs.length !== existing.length ||
+        msgs[msgs.length - 1]?.id !== existing[existing.length - 1]?.id
+      )) {
         set(s => ({
-          messages: { ...s.messages, [activeJid]: msgs },
+          messages: { ...s.messages, [cleanJid]: msgs },
         }))
       }
     } catch (err) {
@@ -382,6 +456,94 @@ export const useChatStore = create((set, get) => ({
     if (idx < 0) return s
     const updated = [...msgs]
     updated[idx] = { ...updated[idx], media_saved_path: normalizeMediaPath(media_saved_path) }
+    return { messages: { ...s.messages, [cleanJid]: updated } }
+  }),
+
+  // [FIX-SCROLL] Prepend older messages saat user scroll ke atas (pagination)
+  prependMessages: async (jid, limit = 30, offset = 0) => {
+    if (!jid) return []
+    const cleanJid = normalizeJid(jid)
+    try {
+      const result = await window.api?.dbMessages?.({ jid: cleanJid, limit, offset })
+      if (!result?.ok) return []
+      const contacts = useChatStore.getState().contacts
+      const ownJid = getOwnJid()
+      const older = (result.data || []).slice().reverse().map(m => normalizeMsg(m, contacts, ownJid))
+      const existing = useChatStore.getState().messages[cleanJid] || []
+      // Dedup by id
+      const existingIds = new Set(existing.map(m => m.id))
+      const newMsgs = older.filter(m => !existingIds.has(m.id))
+      if (newMsgs.length > 0) {
+        set(s => ({
+          messages: { ...s.messages, [cleanJid]: [...newMsgs, ...(s.messages[cleanJid] || [])] }
+        }))
+      }
+      return newMsgs
+    } catch (err) {
+      console.error("[AuroraChat] prependMessages error:", err)
+      return []
+    }
+  },
+
+  // [FIX-REACTIONS] Load semua reactions untuk chat dan merge ke message objects.
+  // Dipanggil setelah loadMessages() — query terpisah agar tidak block tampilan pesan.
+  loadReactions: async (jid) => {
+    if (!jid || !window.api?.dbReactions) return
+    const cleanJid = normalizeJid(jid)
+    try {
+      const result = await window.api.dbReactions({ jid: cleanJid })
+      if (!result?.ok || !result.data?.length) return
+
+      // Group by target message id: { [msgId]: [{text, sender_jid}] }
+      const byTarget = {}
+      for (const r of result.data) {
+        if (!r.reaction_target_id || !r.text) continue
+        if (!byTarget[r.reaction_target_id]) byTarget[r.reaction_target_id] = []
+        // Deduplicate same sender (keep last)
+        const existing = byTarget[r.reaction_target_id]
+        const idx = existing.findIndex(x => x.sender === r.sender_jid)
+        if (idx >= 0) existing.splice(idx, 1)
+        existing.push({ text: r.text, sender: r.sender_jid })
+      }
+
+      set(s => {
+        const msgs = s.messages[cleanJid]
+        if (!msgs?.length) return s
+        const updated = msgs.map(m => {
+          const reactions = byTarget[m.id]
+          if (!reactions) return m
+          return { ...m, reactions }
+        })
+        return { messages: { ...s.messages, [cleanJid]: updated } }
+      })
+    } catch (err) {
+      console.error("[AuroraChat] loadReactions error:", err)
+    }
+  },
+
+  // [FIX-REACTIONS] Update reactions array pada pesan tertentu
+  // Dipanggil saat messages:reaction IPC masuk
+  updateReactions: (chatJid, targetMsgId, reactorJid, emoji) => set((s) => {
+    const cleanJid = normalizeJid(chatJid)
+    if (!cleanJid) return s
+    const msgs = s.messages[cleanJid]
+    if (!msgs) return s
+    const idx = msgs.findIndex(m => m.id === targetMsgId)
+    if (idx < 0) return s
+
+    const updated = [...msgs]
+    const msg = { ...updated[idx] }
+    const reactions = [...(msg.reactions || [])]
+
+    // Remove existing reaction dari sender yang sama
+    const existingIdx = reactions.findIndex(r => r.sender === reactorJid)
+    if (existingIdx >= 0) reactions.splice(existingIdx, 1)
+
+    // Add new reaction (empty emoji = unreact)
+    if (emoji) reactions.push({ text: emoji, sender: reactorJid })
+
+    msg.reactions = reactions
+    updated[idx] = msg
     return { messages: { ...s.messages, [cleanJid]: updated } }
   }),
 

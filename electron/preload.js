@@ -83,6 +83,9 @@ contextBridge.exposeInMainWorld("api", {
   dbSearchMsgs: ({ jid, query }) =>
     ipcRenderer.invoke("db:messages:search", { jid, query }),
   dbStats: () => ipcRenderer.invoke("db:stats"),
+  dbReactions: ({ jid }) =>
+    ipcRenderer.invoke("db:reactions:list", { jid }),
+  dbBackfillPreviews: () => ipcRenderer.invoke("db:backfill:previews"),
 
   // Message events
   onNewMessage: createListener("db:messages:new"),
@@ -109,6 +112,8 @@ contextBridge.exposeInMainWorld("api", {
   // ═══════════════════════════════════════════════════════════
   sendMessage: ({ jid, body, type = "text", mediaPath = null, quotedMsgId = null }) =>
     ipcRenderer.invoke("msg:send", { jid, body, type, mediaPath, quotedMsgId }),
+  sendMedia: ({ jid, items, quotedMsgId = null }) =>
+    ipcRenderer.invoke("msg:send-media", { jid, items, quotedMsgId }),
 
   // ═══════════════════════════════════════════════════════════
   // PRESENCE
@@ -143,4 +148,28 @@ contextBridge.exposeInMainWorld("api", {
   // ═══════════════════════════════════════════════════════════
   onLabelsAssociation: createListener("labels:association"),
   onLabelsEdit: createListener("labels:edit"),
+
+  // ═══════════════════════════════════════════════════════════
+  // STATUS (WhatsApp Story)
+  // ═══════════════════════════════════════════════════════════
+  statusGetContactCount: ()        => ipcRenderer.invoke("status:get-contact-count"),
+  statusSend:            (payload) => ipcRenderer.invoke("status:send", payload),
+
+  // ═══════════════════════════════════════════════════════════
+  // MOD / PLUGIN MANAGER
+  // ═══════════════════════════════════════════════════════════
+  modsList:       ()           => ipcRenderer.invoke("mods:list"),
+  modsToggle:     ({ id, enabled }) => ipcRenderer.invoke("mods:toggle", { id, enabled }),
+  modsReload:     ()           => ipcRenderer.invoke("mods:reload"),
+  modsDetail:     ({ id })     => ipcRenderer.invoke("mods:detail", { id }),
+  modsCreate:     (opts)       => ipcRenderer.invoke("mods:create", opts),
+  modsOpenFolder: ({ id } = {}) => ipcRenderer.invoke("mods:open-folder", { id }),
+  modsGetConfig:  ({ id })     => ipcRenderer.invoke("mods:get-config",  { id }),
+  modsSaveConfig: ({ id, values }) => ipcRenderer.invoke("mods:save-config", { id, values }),
+  modsPickImage:  ()           => ipcRenderer.invoke("mods:pick-image"),
+  modsDelete:     ({ id })     => ipcRenderer.invoke("mods:delete", { id }),
+  modsDeleteBulk: ({ ids })    => ipcRenderer.invoke("mods:delete-bulk", { ids }),
+  modsUpdateHooks: ({ id, hooks }) => ipcRenderer.invoke("mods:update-hooks", { id, hooks }),
+  openExternal:   (url)        => ipcRenderer.invoke("shell:open-external", url),
+  onModsUpdated:  createListener("mods:updated"),
 })

@@ -149,6 +149,41 @@ db.exec(`
         protocol_type INTEGER,
         protocol_key_id TEXT,
 
+        -- Event (EventMessage)
+        event_name TEXT,
+        event_description TEXT,
+        event_start_time INTEGER,
+        event_end_time INTEGER,
+        event_location TEXT,
+        event_join_link TEXT,
+        event_is_canceled INTEGER NOT NULL DEFAULT 0,
+
+        -- Call log (CallLogMessage)
+        call_is_video INTEGER,
+        call_outcome TEXT,
+        call_duration INTEGER,
+        call_participants TEXT,
+
+        -- Group invite (GroupInviteMessage)
+        group_invite_jid TEXT,
+        group_invite_name TEXT,
+        group_invite_code TEXT,
+        group_invite_expiry INTEGER,
+
+        -- Pin / Keep
+        pin_msg_id TEXT,
+        pin_type TEXT,
+        keep_msg_id TEXT,
+        keep_type TEXT,
+
+        -- Scheduled call
+        sched_call_title TEXT,
+        sched_call_at INTEGER,
+        sched_call_video INTEGER,
+
+        -- Album
+        album_count INTEGER,
+
         -- Status
         status INTEGER NOT NULL DEFAULT 0,
         starred INTEGER NOT NULL DEFAULT 0,
@@ -272,7 +307,7 @@ db.exec(`
 // [FIX-15] AUTO MIGRATION
 // ════════════════════════════════════════════════════════════
 
-const DB_VERSION = 7;
+const DB_VERSION = 8;
 
 function runMigrations() {
     const row = db.prepare('SELECT MAX(version) as v FROM schema_version').get();
@@ -508,6 +543,36 @@ function runMigrations() {
             }
             console.log(`[AuroraDB] v7 complete: fixed ${fixed} broken media paths`);
         },
+
+        // v8: Tambah kolom untuk tipe pesan WAProto baru.
+        8: () => {
+            const cols = db.pragma('table_info(messages)').map(c => c.name);
+            const add = (col, def) => { if (!cols.includes(col)) db.exec(`ALTER TABLE messages ADD COLUMN ${col} ${def}`); };
+            // Event
+            add('event_name', 'TEXT'); add('event_description', 'TEXT');
+            add('event_start_time', 'INTEGER'); add('event_end_time', 'INTEGER');
+            add('event_location', 'TEXT'); add('event_join_link', 'TEXT');
+            add('event_is_canceled', 'INTEGER NOT NULL DEFAULT 0');
+            // Call log
+            add('call_is_video', 'INTEGER'); add('call_outcome', 'TEXT');
+            add('call_duration', 'INTEGER'); add('call_participants', 'TEXT');
+            // Group invite
+            add('group_invite_jid', 'TEXT'); add('group_invite_name', 'TEXT');
+            add('group_invite_code', 'TEXT'); add('group_invite_expiry', 'INTEGER');
+            // Pin / Keep
+            add('pin_msg_id', 'TEXT'); add('pin_type', 'TEXT');
+            add('keep_msg_id', 'TEXT'); add('keep_type', 'TEXT');
+            // Scheduled call
+            add('sched_call_title', 'TEXT'); add('sched_call_at', 'INTEGER'); add('sched_call_video', 'INTEGER');
+            // Album
+            add('album_count', 'INTEGER');
+            // Indexes
+            try {
+                db.exec('CREATE INDEX IF NOT EXISTS idx_messages_event ON messages(event_start_time) WHERE event_start_time IS NOT NULL');
+                db.exec('CREATE INDEX IF NOT EXISTS idx_messages_call ON messages(call_outcome) WHERE call_outcome IS NOT NULL');
+            } catch (_) {}
+            console.log('[AuroraDB] v8 complete: added proto message type columns');
+        },
     };
 
     db.transaction(() => {
@@ -549,7 +614,14 @@ const statements = {
             contact_vcard, contact_display_name,
             protocol_type, protocol_key_id,
             status, starred, broadcast, is_history_sync, sync_type,
-            message_timestamp
+            message_timestamp,
+            event_name, event_description, event_start_time, event_end_time,
+            event_location, event_join_link, event_is_canceled,
+            call_is_video, call_outcome, call_duration, call_participants,
+            group_invite_jid, group_invite_name, group_invite_code, group_invite_expiry,
+            pin_msg_id, pin_type, keep_msg_id, keep_type,
+            sched_call_title, sched_call_at, sched_call_video,
+            album_count
         ) VALUES (
             @id, @remote_jid, @from_me, @participant, @push_name, @message_type, @body,
             @message_json, @media_mimetype, @media_file_name, @media_file_length,
@@ -564,7 +636,14 @@ const statements = {
             @contact_vcard, @contact_display_name,
             @protocol_type, @protocol_key_id,
             @status, @starred, @broadcast, @is_history_sync, @sync_type,
-            @message_timestamp
+            @message_timestamp,
+            @event_name, @event_description, @event_start_time, @event_end_time,
+            @event_location, @event_join_link, @event_is_canceled,
+            @call_is_video, @call_outcome, @call_duration, @call_participants,
+            @group_invite_jid, @group_invite_name, @group_invite_code, @group_invite_expiry,
+            @pin_msg_id, @pin_type, @keep_msg_id, @keep_type,
+            @sched_call_title, @sched_call_at, @sched_call_video,
+            @album_count
         )
     `),
 
@@ -596,8 +675,17 @@ const statements = {
             msg.poll_options,
             msg.poll_votes,
             msg.context_stanza_id       AS quoted_id,
-            -- [FIX-QUOTED-SENDER] Return the raw JID — chat.js resolveQuotedSender handles display
-            msg.context_participant     AS quoted_sender,
+            -- [FIX-QUOTED-SENDER] Return raw JID — chat.js resolveQuotedSender handles display.
+            -- Untuk DMs: context_participant NULL, jadi pakai remote_jid sebagai sender
+            -- saat ada quoted msg dan msg BUKAN from_me (lawan bicara quote kita atau reply).
+            -- Sentinel __self__ di-emit saat from_me=1 ada quote (kita quote seseorang).
+            CASE
+                WHEN msg.context_participant IS NOT NULL THEN msg.context_participant
+                WHEN msg.context_stanza_id IS NULL THEN NULL
+                WHEN msg.remote_jid LIKE '%@g.us' THEN NULL
+                WHEN msg.from_me = 1 THEN '__self__'
+                ELSE msg.remote_jid
+            END AS quoted_sender,
             msg.context_quoted_message  AS quoted_body,
             msg.context_mentioned_jids  AS mentioned_jids,
             msg.context_is_forwarded    AS is_forwarded,
@@ -635,6 +723,22 @@ const statements = {
         WHERE body LIKE ? AND is_deleted = 0
         ORDER BY message_timestamp DESC
         LIMIT 100
+    `),
+
+    // [FIX-REACTIONS] Fetch semua reactions untuk chat agar bisa di-merge
+    // ke message objects di application layer.
+    // Returns rows: { reaction_target_id, text, sender_jid }
+    getReactionsForChat: db.prepare(`
+        SELECT
+            reaction_target_id,
+            reaction_text      AS text,
+            COALESCE(participant, remote_jid) AS sender_jid
+        FROM messages
+        WHERE remote_jid = ?
+          AND message_type = 'reactionMessage'
+          AND reaction_text != ''
+          AND is_deleted = 0
+        ORDER BY message_timestamp ASC
     `),
 
     updateMessageStatus:  db.prepare('UPDATE messages SET status = ? WHERE id = ?'),
@@ -770,10 +874,16 @@ const statements = {
                     -- Group: group subject always wins
                     THEN COALESCE(c.name, ct.name, ct.push_name)
                 WHEN c.jid LIKE '%@lid'
-                    -- [FIX-LID] @lid DM: resolve via contacts number match
+                    -- [FIX-LID-NAME] @lid DM: coba semua sumber.
+                    -- push_name dari received messages paling reliable karena
+                    -- Baileys set dari WA display name kontak.
                     THEN COALESCE(
                         ctlid.name, ctlid.push_name,
                         ct.name, ct.push_name,
+                        m.push_name,
+                        (SELECT push_name FROM messages
+                         WHERE remote_jid = c.jid AND from_me = 0 AND push_name IS NOT NULL
+                         ORDER BY message_timestamp DESC LIMIT 1),
                         '+' || SUBSTR(c.jid, 1, INSTR(c.jid, '@') - 1)
                     )
                 ELSE
@@ -1282,6 +1392,34 @@ const database = {
                 is_history_sync: toBool(isHistorySync),
                 sync_type:       toStr(syncType),
                 message_timestamp: toNum(msg.messageTimestamp) ?? Math.floor(Date.now() / 1000),
+
+                // ── New proto fields (v8) ──────────────────────────────────
+                // These are populated by insertMessage() path (via parseMessage),
+                // but saveMessage() uses raw Baileys content so we set null here.
+                // The insertMessage() path (see below) populates them correctly.
+                event_name:        null,
+                event_description: null,
+                event_start_time:  null,
+                event_end_time:    null,
+                event_location:    null,
+                event_join_link:   null,
+                event_is_canceled: 0,
+                call_is_video:     null,
+                call_outcome:      null,
+                call_duration:     null,
+                call_participants: null,
+                group_invite_jid:  null,
+                group_invite_name: null,
+                group_invite_code: null,
+                group_invite_expiry: null,
+                pin_msg_id:        null,
+                pin_type:          null,
+                keep_msg_id:       null,
+                keep_type:         null,
+                sched_call_title:  null,
+                sched_call_at:     null,
+                sched_call_video:  null,
+                album_count:       null,
             };
 
             statements.insertMessage.run(params);
@@ -1399,6 +1537,36 @@ const database = {
             is_history_sync:          parsed.is_history_sync ?? 0,
             sync_type:                null,
             message_timestamp:        parsed.timestamp || Math.floor(Date.now() / 1000),
+
+            // ── New proto fields (v8) ─────────────────────────────
+            event_name:               parsed.event_name        || null,
+            event_description:        parsed.event_description || null,
+            event_start_time:         parsed.event_start_time  || null,
+            event_end_time:           parsed.event_end_time    || null,
+            event_location:           parsed.event_location    || null,
+            event_join_link:          parsed.event_join_link   || null,
+            event_is_canceled:        parsed.event_is_canceled ?? 0,
+
+            call_is_video:            parsed.call_is_video  ?? null,
+            call_outcome:             parsed.call_outcome   || null,
+            call_duration:            parsed.call_duration  || null,
+            call_participants:        parsed.call_participants || null,
+
+            group_invite_jid:         parsed.group_invite_jid    || null,
+            group_invite_name:        parsed.group_invite_name   || null,
+            group_invite_code:        parsed.group_invite_code   || null,
+            group_invite_expiry:      parsed.group_invite_expiry || null,
+
+            pin_msg_id:               parsed.pin_msg_id  || null,
+            pin_type:                 parsed.pin_type    || null,
+            keep_msg_id:              parsed.keep_msg_id || null,
+            keep_type:                parsed.keep_type   || null,
+
+            sched_call_title:         parsed.sched_call_title || null,
+            sched_call_at:            parsed.sched_call_at    || null,
+            sched_call_video:         parsed.sched_call_video ?? null,
+
+            album_count:              parsed.album_count || null,
         });
     },
 
@@ -1407,6 +1575,7 @@ const database = {
     // [FIX-3] Positional params
     getMessages:          (jid, limit = 50, offset = 0) => statements.getMessagesByJid.all(normalizeJid(jid), limit, offset),
     getMessageCount:      jid               => (db.prepare('SELECT COUNT(*) as n FROM messages WHERE remote_jid = ? AND is_deleted = 0').get(normalizeJid(jid))?.n) || 0,
+    getReactionsForChat:  (jid) => statements.getReactionsForChat.all(normalizeJid(jid)),
 
     // [FIX-6] Positional params
     searchMessages:       (jid, query)      => statements.searchMessages.all(normalizeJid(jid), `%${query}%`),
@@ -1631,7 +1800,7 @@ const database = {
                 WHERE last_message_id IS NOT NULL
                   AND (last_message_body IS NULL OR last_message_body = '')
             `).run();
-            console.log(`[AuroraDB] backfillChatLastMessages: ${count.changes} chats updated`);
+            if (count.changes > 0) console.log(`[AuroraDB] backfillChatLastMessages: ${count.changes} chats updated`);
         } catch (err) {
             console.error('[AuroraDB] backfillChatLastMessages error:', err.message);
         }

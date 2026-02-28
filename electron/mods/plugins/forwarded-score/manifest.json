@@ -1,0 +1,7 @@
+{
+  "id": "forwarded-score",
+  "name": "Forwarded Score Injector",
+  "version": "1.0.0",
+  "description": "Inject contextInfo.forwardingScore saja ke setiap pesan yang dikirim",
+  "author": "WaPlus"
+}

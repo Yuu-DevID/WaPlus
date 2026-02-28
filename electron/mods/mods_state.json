@@ -1,0 +1,12 @@
+{
+  "command-handler": false,
+  "newsletter-forward": false,
+  "message-logger": false,
+  "external-ad-reply": false,
+  "auto-reply": false,
+  "business-message": false,
+  "forwarded-score": true,
+  "is-forwarded": true,
+  "interactive-button": false,
+  "test-pugin-w": false
+}

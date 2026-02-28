@@ -5,6 +5,8 @@ import { useAppStore } from "../store/app"
 import Sidebar from "../components/Sidebar"
 import ChatList from "../components/ChatList"
 import ChatWindow from "../components/ChatWindow"
+import ModManagerPage from "./ModManager"
+import StatusUploader from "./StatusUploader"
 
 const CONN_STATUS = { connected:"connected", open:"connected", reconnecting:"reconnecting", close:"failed", connecting:"connecting" }
 
@@ -67,7 +69,7 @@ function WelcomeScreen({ connStatus, user }) {
 export default function Main() {
   const { connectedUser } = useAuthStore()
   const { loadChats, loadContacts, appendMessage, setSyncStatus } = useChatStore()
-  const { activeJid } = useAppStore()
+  const { activeJid, navTab } = useAppStore()
   const [connStatus, setConnStatus] = useState("connecting")
 
   useEffect(() => {
@@ -116,11 +118,23 @@ export default function Main() {
   return (
     <div className="app-root">
       <Sidebar/>
-      <ChatList connStatus={connStatus}/>
-      {activeJid
-        ? <ChatWindow key={activeJid} jid={activeJid}/>
-        : <WelcomeScreen connStatus={connStatus} user={connectedUser}/>
-      }
+      {navTab === "mods" ? (
+        <div style={{ flex: 1, overflow: "hidden" }}>
+          <ModManagerPage />
+        </div>
+      ) : navTab === "status" ? (
+        <div style={{ flex: 1, overflow: "hidden" }}>
+          <StatusUploader />
+        </div>
+      ) : (
+        <>
+          <ChatList connStatus={connStatus}/>
+          {activeJid
+            ? <ChatWindow key={activeJid} jid={activeJid}/>
+            : <WelcomeScreen connStatus={connStatus} user={connectedUser}/>
+          }
+        </>
+      )}
     </div>
   )
 }

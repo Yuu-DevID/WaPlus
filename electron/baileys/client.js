@@ -66,6 +66,16 @@ const NodeCache = require("node-cache")
 const db = require("./database")
 
 // ════════════════════════════════════════════════════════════
+// MOD MANAGER IMPORT
+// ════════════════════════════════════════════════════════════
+let modManager = null
+try {
+  modManager = require("../mods/modManager")
+} catch (e) {
+  console.warn("[AuroraChat] ModManager not available:", e.message)
+}
+
+// ════════════════════════════════════════════════════════════
 // CONFIG
 // ════════════════════════════════════════════════════════════
 
@@ -444,6 +454,16 @@ async function handleMessage(msg, type, isHistorySync = false) {
   })
   if (!parsed?.id) return
 
+  // ── Run mod hooks (onMessage) ────────────────────────────
+  if (modManager && !isHistorySync) {
+    try {
+      const modResult = await modManager.runOnMessage(parsed, msg)
+      if (modResult === false) return // plugin blocked this message
+    } catch (e) {
+      console.warn("[AuroraChat] ModManager.runOnMessage error:", e.message)
+    }
+  }
+
   // ── Simpan ke DB ─────────────────────────────────────────
   try {
     db.insertMessage(parsed)
@@ -641,6 +661,12 @@ async function connectToWhatsApp(phoneForPairing = null) {
         phone: me?.id?.split(":")[0] || "",
       })
 
+      // Set socket reference for mod manager
+      if (modManager) {
+        modManager.setSocket(sock)
+        modManager.runOnConnect({ name: me?.name, jid: me?.id, phone: me?.id?.split(":")[0] }).catch(() => {})
+      }
+
       // Start sync status
       db.startSync()
       send("sync:status", { isSyncing: true, progress: 0 })
@@ -684,6 +710,11 @@ async function connectToWhatsApp(phoneForPairing = null) {
 
       logE(`Koneksi terputus — code: ${statusCode} (${reason})`)
       send("connection:close", { statusCode, reason })
+
+      // Notify mods about disconnect
+      if (modManager) {
+        modManager.runOnDisconnect(reason).catch(() => {})
+      }
 
       if (statusCode === DisconnectReason.loggedOut) {
         isLoggedOut = true
@@ -1126,6 +1157,13 @@ async function init(win) {
   isLoggedOut = false
   reconnectAttempts = 0
 
+  // Init mod manager
+  if (modManager) {
+    try { await modManager.init(win) } catch (e) {
+      console.warn("[AuroraChat] ModManager init error:", e.message)
+    }
+  }
+
   const sessionExists = fs.existsSync(CONFIG.SESSION_DIR) &&
     fs.readdirSync(CONFIG.SESSION_DIR).length > 0
 
@@ -1208,23 +1246,58 @@ async function downloadMediaForMsg(row) {
 
 async function sendTextMessage(jid, text, opts = {}) {
   assertConnected()
-  const payload = {
+  let payload = {
     text,
     ...(opts.mentions?.length ? { mentions: opts.mentions } : {}),
   }
-  return await sock.sendMessage(jid, payload, opts.quoted ? { quoted: opts.quoted } : {})
+
+  // ── Mod hook: onBeforeSend ────────────────────────────────
+  if (modManager) {
+    const result = await modManager.runOnBeforeSend(jid, payload).catch(() => payload)
+    if (result === false) return null
+    if (result && typeof result === "object") payload = result
+  }
+
+  const sentMsg = await sock.sendMessage(jid, payload, opts.quoted ? { quoted: opts.quoted } : {})
+
+  // ── Mod hook: onAfterSend ─────────────────────────────────
+  if (modManager) {
+    modManager.runOnAfterSend(jid, payload, sentMsg).catch(() => {})
+  }
+
+  return sentMsg
 }
 
 async function sendImage(jid, image, caption = "", quoted = null) {
   assertConnected()
   const src = typeof image === "string" ? { url: image } : image
-  return await sock.sendMessage(jid, { image: src, caption }, quoted ? { quoted } : {})
+  let payload = { image: src, caption }
+
+  if (modManager) {
+    const result = await modManager.runOnBeforeSend(jid, payload).catch(() => payload)
+    if (result === false) return null
+    if (result && typeof result === "object") payload = result
+  }
+
+  const sentMsg = await sock.sendMessage(jid, payload, quoted ? { quoted } : {})
+  if (modManager) modManager.runOnAfterSend(jid, payload, sentMsg).catch(() => {})
+  return sentMsg
 }
 
 async function sendVideo(jid, video, caption = "", quoted = null) {
   assertConnected()
   const src = typeof video === "string" ? { url: video } : video
-  return await sock.sendMessage(jid, { video: src, caption }, quoted ? { quoted } : {})
+  let payload = { video: src, caption }
+
+  if (modManager) {
+    const result = await modManager.runOnBeforeSend(jid, payload).catch(() => payload)
+    if (result === false) return null
+    if (result && typeof result === "object") payload = result
+  }
+
+  const sentMsg = await sock.sendMessage(jid, payload, quoted ? { quoted } : {})
+  if (modManager) modManager.runOnAfterSend(jid, payload, sentMsg).catch(() => {})
+  return sentMsg
 }
 
 async function sendAudio(jid, audio, ptt = false, quoted = null) {
@@ -1240,12 +1313,17 @@ async function sendAudio(jid, audio, ptt = false, quoted = null) {
 async function sendDocument(jid, document, fileName, mimetype = "application/octet-stream", caption = "", quoted = null) {
   assertConnected()
   const src = typeof document === "string" ? { url: document } : document
-  return await sock.sendMessage(jid, {
-    document: src,
-    fileName,
-    mimetype,
-    caption,
-  }, quoted ? { quoted } : {})
+  let payload = { document: src, fileName, mimetype, caption }
+
+  if (modManager) {
+    const result = await modManager.runOnBeforeSend(jid, payload).catch(() => payload)
+    if (result === false) return null
+    if (result && typeof result === "object") payload = result
+  }
+
+  const sentMsg = await sock.sendMessage(jid, payload, quoted ? { quoted } : {})
+  if (modManager) modManager.runOnAfterSend(jid, payload, sentMsg).catch(() => {})
+  return sentMsg
 }
 
 async function sendSticker(jid, sticker, quoted = null) {
@@ -1517,6 +1595,91 @@ async function downloadMedia(message, type = "buffer") {
 }
 
 // ════════════════════════════════════════════════════════════
+// PUBLIC: STATUS (WhatsApp Story)
+// ════════════════════════════════════════════════════════════
+
+const STORY_COLORS = [
+  '#7ACAA7', '#6E257E', '#5796FF', '#7E90A4', '#736769',
+  '#57C9FF', '#25C3DC', '#FF7B6C', '#55C265', '#FF898B',
+  '#8C6991', '#C69FCC', '#B8B226', '#EFB32F', '#AD8774',
+  '#792139', '#C1A03F', '#8FA842', '#A52C71', '#8394CA', '#243640',
+]
+const STORY_FONTS = [0, 1, 2, 6, 7, 8, 9, 10]
+
+function getStatusJidList() {
+  // Get all personal contacts (not groups) from DB
+  try {
+    const contacts = db.getContacts(9999, 0)
+    return contacts
+      .map(c => c.jid)
+      .filter(jid => jid && jid.includes("@s.whatsapp.net"))
+  } catch (_) {
+    return []
+  }
+}
+
+async function sendStatus(payload) {
+  assertConnected()
+
+  const statusJidList = getStatusJidList()
+  const randomColor = STORY_COLORS[Math.floor(Math.random() * STORY_COLORS.length)]
+  const randomFont  = STORY_FONTS[Math.floor(Math.random() * STORY_FONTS.length)]
+
+  const { type, text, mediaBuffer, mimetype, caption } = payload
+
+  let sentMsg
+
+  if (type === "text") {
+    if (!text) throw new Error("Teks tidak boleh kosong")
+    sentMsg = await sock.sendMessage(
+      "status@broadcast",
+      {
+        text,
+        backgroundColor: randomColor,
+        textArgb: 0xffffffff,
+        font: randomFont,
+      },
+      { statusJidList }
+    )
+
+  } else if (type === "image") {
+    const buf = Buffer.isBuffer(mediaBuffer) ? mediaBuffer : Buffer.from(mediaBuffer)
+    sentMsg = await sock.sendMessage(
+      "status@broadcast",
+      { image: buf, caption: caption || "", mimetype: mimetype || "image/jpeg" },
+      { statusJidList }
+    )
+
+  } else if (type === "video") {
+    const buf = Buffer.isBuffer(mediaBuffer) ? mediaBuffer : Buffer.from(mediaBuffer)
+    sentMsg = await sock.sendMessage(
+      "status@broadcast",
+      { video: buf, caption: caption || "", mimetype: mimetype || "video/mp4" },
+      { statusJidList }
+    )
+
+  } else if (type === "audio") {
+    const buf = Buffer.isBuffer(mediaBuffer) ? mediaBuffer : Buffer.from(mediaBuffer)
+    sentMsg = await sock.sendMessage(
+      "status@broadcast",
+      {
+        audio: buf,
+        mimetype: "audio/mp4",
+        ptt: true,
+        waveform: [100, 0, 100, 0, 100, 0, 100],
+        backgroundColor: randomColor,
+      },
+      { statusJidList }
+    )
+
+  } else {
+    throw new Error(`Tipe tidak didukung: ${type}`)
+  }
+
+  return { sentMsg, statusJidList, count: statusJidList.length }
+}
+
+// ════════════════════════════════════════════════════════════
 // PUBLIC: DATABASE QUERIES (untuk IPC handlers)
 // ════════════════════════════════════════════════════════════
 
@@ -1657,6 +1820,9 @@ module.exports = {
   checkNumberExists,
   normalizePhone,
   extractBody,
+
+  sendStatus,
+  getStatusJidList,
 
   // Database exports
   getMessagesFromDB,
