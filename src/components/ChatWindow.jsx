@@ -7,6 +7,7 @@ import { useChatStore } from "../store/chat"
 import { useAppStore } from "../store/app"
 import { format, isToday, isYesterday } from "date-fns"
 import MessageBubble, { AlbumBubbleWrapper } from "./MessageBubble"
+import DevEvalModal from "./DevEvalModal"
 import MessageInput from "./MessageInput"
 import { useMediaPrefetch } from "../hooks/useMediaPrefetch"
 
@@ -182,6 +183,8 @@ export default function ChatWindow({ jid }) {
   const bottomRef = useRef(null)
   const inputAreaRef = useRef(null)
   const [scrollBtnBottom, setScrollBtnBottom] = useState(80)
+  const [headerDevEvalOpen, setHeaderDevEvalOpen] = useState(false)
+  const [headerDevEvalMsg,  setHeaderDevEvalMsg]  = useState(null)
 
   useEffect(() => {
     const updateBtnPos = () => {
@@ -280,16 +283,37 @@ export default function ChatWindow({ jid }) {
         }
         appendMessage(jid, {
           id: msgId, chat_jid: jid, body: data.body || "", msg_type: data.msg_type || "conversation",
-          timestamp: data.timestamp || Math.floor(Date.now() / 1000), from_me: data.from_me ?? 0,
-          status: data.status ?? 0, sender_name: data.sender_name || "", sender_jid: data.sender_jid || null,
+          timestamp: data.timestamp || Math.floor(Date.now() / 1000),
+          // [FIX-FROM-ME] Explicitly cast to 0/1 — never undefined/null/true/false
+          from_me: (data.from_me === true || data.from_me === 1) ? 1 : 0,
+          status: data.status ?? 0,
+          // [FIX-SENDER-NAME] Use resolved contact name from DB, not raw pushname
+          sender_name: data.sender_name || null,
+          sender_jid: data.sender_jid || null,
           is_group: toInt(isGroup), has_media: data.has_media ?? 0, mimetype: data.mimetype || null,
           media_duration: data.media_duration || null, media_filename: data.media_filename || null,
           media_saved_path: data.media_saved_path || null, media_url: data.media_url || null,
+          media_thumbnail_b64: data.media_thumbnail_b64 || null,
           is_ptt: data.is_ptt ?? 0, is_gif: data.is_gif ?? 0, is_view_once: data.is_view_once ?? 0,
           is_animated: data.is_animated ?? 0, quoted_id: data.quoted_id || null, quoted_body: data.quoted_body || null,
-          quoted_sender: data.quoted_sender || null, quoted_type: data.quoted_type || null,
+          quoted_sender: data.quoted_sender || null, quoted_sender_name: data.quoted_sender_name || null,
+          quoted_type: data.quoted_type || null,
           quoted_has_media: data.quoted_has_media ?? 0, is_forwarded: data.is_forwarded ?? 0, starred: data.starred ?? 0,
         })
+        // [FIX-AUTO-SCROLL] Scroll to bottom on new messages
+        // fromMe: always scroll (just sent), incoming: scroll only if near bottom
+        setTimeout(() => {
+          const area = areaRef.current
+          if (!area) return
+          const dist = area.scrollHeight - area.scrollTop - area.clientHeight
+          const isFromMe = data.from_me === 1 || data.from_me === true
+          if (isFromMe || dist < 300) {
+            bottomRef.current?.scrollIntoView({ behavior: "smooth" })
+            setUnreadCount(0)
+          } else {
+            setUnreadCount(prev => prev + 1)
+          }
+        }, 50)
         // [F3] Auto markRead untuk pesan masuk jika chat terbuka
         if (!data.from_me) {
           markChatRead(jid, [{ id: msgId, from_me: 0, status: 0 }])
@@ -326,17 +350,13 @@ export default function ChatWindow({ jid }) {
   }, [jid])
 
   // ── Auto-scroll ──────────────────────────────────────────────────────────
+  // NOTE: Live message auto-scroll is handled inline in appendMessage callback above.
+  // This effect handles: initial load, chat switch, and pagination edge cases.
   const prevMsgCountRef = useRef(0)
   useEffect(() => {
     if (loading) return
-    if (msgs.length > prevMsgCountRef.current) {
-      const area = areaRef.current
-      if (area) {
-        const distFromBottom = area.scrollHeight - area.scrollTop - area.clientHeight
-        if (distFromBottom < 200) setTimeout(() => bottomRef.current?.scrollIntoView({ behavior: "smooth" }), 60)
-        else setUnreadCount(prev => prev + (msgs.length - prevMsgCountRef.current))
-      }
-    }
+    // Only handles count increase from pagination/initial load — live messages
+    // handled by the inline setTimeout in onMessagesNew callback
     prevMsgCountRef.current = msgs.length
   }, [msgs.length, loading])
 
@@ -391,7 +411,17 @@ export default function ChatWindow({ jid }) {
         <div className="chat-header-actions">
           <button className="header-btn" title="Cari"><SearchIcon /></button>
           <button className="header-btn" title="Telepon"><PhoneIcon /></button>
-          <button className="header-btn" title="Lebih"><DotsIcon /></button>
+          <button className="header-btn" title="Dev Eval" onClick={() => {
+              // Open DevEval with last message in chat as context
+              const msgs_ = useChatStore.getState().messages[normalizeJid(jid)] || []
+              const last_ = msgs_[msgs_.length - 1] || null
+              setHeaderDevEvalMsg(last_)
+              setHeaderDevEvalOpen(true)
+            }} style={{ position: "relative" }}>
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/>
+              </svg>
+            </button>
         </div>
       </div>
 
@@ -460,6 +490,9 @@ export default function ChatWindow({ jid }) {
       <div ref={inputAreaRef}>
         <MessageInput chatJid={jid} chatName={name} replyTo={replyTo} onCancelReply={() => setReplyTo(null)} />
       </div>
+      {headerDevEvalOpen && (
+        <DevEvalModal msg={headerDevEvalMsg} onClose={() => setHeaderDevEvalOpen(false)} />
+      )}
     </div>
   )
 }

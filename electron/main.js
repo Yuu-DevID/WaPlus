@@ -368,6 +368,28 @@ ipcMain.handle("db:stats", () => {
   catch (err) { return { ok: false, error: err.message } }
 })
 
+// ── View Raw Message — fetch full DB row + raw message_json ──────────────────
+// Used by the "View Raw" context menu item to show unparsed proto data.
+ipcMain.handle("db:messages:raw", (_e, { id }) => {
+  try {
+    const db = getDB()
+    const row = db.getMessageById?.(id)
+    if (!row) return { ok: false, error: "Message not found" }
+    // Parse message_json if stored, so renderer sees real object
+    let parsedJson = null
+    if (row.message_json) {
+      try { parsedJson = JSON.parse(row.message_json) } catch (_) { parsedJson = row.message_json }
+    }
+    return {
+      ok: true,
+      data: {
+        ...row,
+        _message_json_parsed: parsedJson,
+      }
+    }
+  } catch (err) { return { ok: false, error: err.message } }
+})
+
 ipcMain.handle("db:reactions:list", (_e, { jid }) => {
   try {
     return { ok: true, data: getDB().getReactionsForChat(jid) }
@@ -764,6 +786,246 @@ ipcMain.handle("msg:mark-read", async (_e, { jid, msgIds }) => {
   } catch (e) {
     // Jika Baileys error, tetap update DB
     try { getDB().markChatRead(jid) } catch {}
+    return { ok: false, error: e.message }
+  }
+})
+
+// ════════════════════════════════════════════════════════════
+// DEV EVAL — Baileys Sandbox (v10)
+// Terinspirasi dari pattern > / => di case.js bot
+//
+// KEAMANAN:
+//   • Hanya bisa diakses dari renderer (contextIsolation = true)
+//   • Tidak ada akses dari luar proses Electron
+//   • Variabel yang di-inject terbatas: sock, db, baileys, util, path, fs
+//   • Tidak di-expose ke webContents dari window lain
+//
+// MODE:
+//   "expr"  → eval satu ekspresi, auto-return (seperti => di case.js)
+//   "block" → eval multi-statement block async (seperti > di case.js)
+// ════════════════════════════════════════════════════════════
+ipcMain.handle("dev:eval", async (_e, { code, mode, msgId, chatJid, fullOutput }) => {
+  if (!code || typeof code !== "string") return { ok: false, error: "Code kosong" }
+
+  const util    = require("util")
+  const sock    = baileysClient?.getSocket?.() || null
+  const db_     = getDB()
+  const { dialog } = require("electron")
+
+  let baileys = {}
+  try { baileys = require("wileys") } catch {}
+
+  const client = baileysClient || {}
+
+  // ── Build smsg-style "m" object identical to output JSON ──────────────────
+  // Matches: key, messageTimestamp, pushName, message, id, chatId, chatLid,
+  //   fromMe, from, isGroup, isUser, senderId, participant, mtype, msg,
+  //   quoted, body, mentionedJid, text, isCmd, cmd, args
+  //   + media fields when applicable
+  let mObj = null
+  if (msgId && db_) {
+    try {
+      const row = db_.getMessageById?.(msgId) || null
+      if (row) {
+        const cJid     = chatJid || row.remote_jid || ""
+        const msgType  = row.message_type || "conversation"
+        const isGroup  = cJid.endsWith("@g.us")
+        const fromMe   = row.from_me === 1
+        const senderJid = isGroup
+          ? (row.participant || "")
+          : (fromMe ? (sock?.user?.id || cJid) : cJid)
+
+        // Parse stored raw message JSON (WAMessage proto)
+        let msgJson = {}
+        try { if (row.message_json) msgJson = JSON.parse(row.message_json) } catch {}
+
+        // Strip transport-layer keys to get content keys only
+        const SKIP = new Set(["messageContextInfo", "senderKeyDistributionMessage",
+                               "botInvokeMessage", "nativeFlowMessage"])
+        const contentKeys = Object.keys(msgJson).filter(k => !SKIP.has(k))
+
+        // Inner msg = msgJson[contentType]
+        let innerMsg = {}
+        const innerKey = contentKeys[0] || msgType
+        innerMsg = msgJson[innerKey] || msgJson
+
+        // Parse mentioned JIDs
+        let mentionedJid = []
+        try { mentionedJid = JSON.parse(row.mentioned_jids || "[]") } catch {}
+        // Also pull from contextInfo
+        if (!mentionedJid.length && innerMsg?.contextInfo?.mentionedJid)
+          mentionedJid = innerMsg.contextInfo.mentionedJid || []
+
+        // Reconstruct key
+        const key = { remoteJid: cJid, fromMe, id: msgId }
+        if (isGroup && row.participant) key.participant = row.participant
+
+        // Reconstruct quoted
+        let quoted = null
+        if (row.context_stanza_id) {
+          let qMsgJson = {}
+          let qType = row.context_quoted_message || null
+          try { if (qType) qMsgJson = JSON.parse(qType) } catch {}
+          const qKey = {
+            remoteJid: cJid, fromMe: false, id: row.context_stanza_id
+          }
+          if (isGroup && row.context_participant) qKey.participant = row.context_participant
+          quoted = {
+            key: qKey,
+            message: qMsgJson,
+            sender: row.context_participant || null,
+            body: row.body ? "" : null,  // quoted body is separate in WA
+          }
+        }
+
+        const body = row.body || innerMsg?.text || innerMsg?.caption ||
+                     innerMsg?.conversation || ""
+
+        // cmd/args parsing (bot-style)
+        const cmdPrefix = /^[.!#/]/.test(body)
+        const parts = body.trim().split(/\s+/)
+        const cmd = parts[0] || ""
+        const args = parts.slice(1)
+
+        // Base smsg object
+        mObj = {
+          key,
+          messageTimestamp: row.message_timestamp || row.timestamp || 0,
+          pushName: row.push_name || null,
+          broadcast: false,
+          message: msgJson,
+          id: msgId,
+          isBaileys: !!(msgId?.length === 16 && /^[A-Z0-9]{16}$/.test(msgId)),
+          chatId: cJid,
+          chatLid: "",
+          fromMe,
+          from: cJid,
+          isBroadcast: cJid.includes("broadcast"),
+          isStatusBroadcast: cJid === "status@broadcast",
+          isNewsletter: cJid.endsWith("@newsletter"),
+          isGroup,
+          isUser: !isGroup && !cJid.endsWith("@newsletter"),
+          senderId: senderJid,
+          participant: isGroup ? (row.participant || null) : undefined,
+          mtype: msgType,
+          msg: innerMsg,
+          quoted,
+          body,
+          mentionedJid,
+          text: body,
+          isCmd: cmdPrefix,
+          cmd,
+          args,
+        }
+
+        // ── Media-type specific fields ─────────────────────────────────
+        if (row.media_mimetype || row.has_media) {
+          const mime = row.media_mimetype || ""
+          const isImage    = msgType === "imageMessage"    || mime.startsWith("image/")
+          const isVideo    = msgType === "videoMessage"    || mime.startsWith("video/")
+          const isAudio    = msgType === "audioMessage"    || mime.startsWith("audio/") || msgType === "pttMessage"
+          const isDoc      = msgType === "documentMessage"
+          const isSticker  = msgType === "stickerMessage"
+          const isViewOnce = msgType.includes("viewOnce")
+
+          mObj.hasMedia    = true
+          mObj.mimetype    = mime
+          mObj.mediaUrl    = row.media_url || null
+          mObj.mediaKey    = row.media_key || null
+          mObj.fileLength  = row.media_file_length || null
+          mObj.fileName    = row.media_file_name || row.media_filename || null
+          mObj.mediaSavedPath = row.media_saved_path || null
+
+          if (isImage || isVideo || isSticker) {
+            mObj.width   = row.media_width  || innerMsg?.width  || null
+            mObj.height  = row.media_height || innerMsg?.height || null
+          }
+          if (isAudio || isVideo) {
+            mObj.duration = row.media_duration || innerMsg?.seconds || null
+            mObj.isPtt    = msgType === "pttMessage" || !!(row.is_ptt)
+            mObj.isGif    = !!(row.is_gif)
+          }
+          if (isSticker) {
+            mObj.isAnimated = !!(row.is_animated)
+          }
+          if (isViewOnce) {
+            mObj.isViewOnce = true
+          }
+          if (isDoc) {
+            mObj.pageCount = innerMsg?.pageCount || null
+            mObj.title     = innerMsg?.title || row.media_filename || null
+          }
+        }
+      }
+    } catch (e) {
+      console.warn("[DevEval] m build error:", e.message)
+    }
+  }
+
+  // Fallback m stub
+  if (!mObj) mObj = {
+    id: msgId || null, chatId: chatJid || null, body: "", mtype: "unknown",
+    fromMe: false, isGroup: false, msg: {}, quoted: null, mentionedJid: [], text: ""
+  }
+
+  const ctx = {
+    sock, dims: sock, ws: sock,
+    db: db_, baileys, client, util,
+    path: require("path"), fs: require("fs"),
+    m: mObj, msg: mObj, message: mObj,
+    fmt:  (v) => util.inspect(v, { depth: 12, colors: false, compact: false, maxArrayLength: Infinity, maxStringLength: Infinity }),
+    json: (v) => JSON.stringify(v, null, 2),
+    log:  (v) => { console.log("[DevEval]", typeof v === "object" ? JSON.stringify(v, null, 2) : v); return v },
+  }
+
+  try {
+    let result
+    if (mode === "expr") {
+      const fn = new Function(...Object.keys(ctx), `"use strict"; return (async () => { return (${code}) })()`)
+      result = await fn(...Object.values(ctx))
+    } else {
+      const fn = new Function(...Object.keys(ctx), `"use strict"; return (async () => { ${code} })()`)
+      result = await fn(...Object.values(ctx))
+    }
+
+    let output
+    if (result === undefined) output = "undefined"
+    else if (result === null)  output = "null"
+    else {
+      try {
+        output = util.inspect(result, {
+          depth: 12,
+          colors: false,
+          compact: false,
+          maxArrayLength: fullOutput ? Infinity : 500,
+          maxStringLength: fullOutput ? Infinity : 20000,
+          breakLength: 140,
+        })
+      } catch { output = String(result) }
+    }
+
+    return { ok: true, result: output, type: typeof result }
+  } catch (err) {
+    return { ok: false, error: err.message || String(err), stack: err.stack || null }
+  }
+})
+
+// ── DevEval: save output to file ─────────────────────────────────────────────
+ipcMain.handle("dev:save-file", async (_e, { content, filename }) => {
+  try {
+    const { dialog } = require("electron")
+    const result = await dialog.showSaveDialog({
+      title: "Simpan Output DevEval",
+      defaultPath: filename || "deveval_output.txt",
+      filters: [
+        { name: "Text Files", extensions: ["txt", "json", "log"] },
+        { name: "All Files",  extensions: ["*"] },
+      ],
+    })
+    if (result.canceled || !result.filePath) return { ok: false, reason: "canceled" }
+    require("fs").writeFileSync(result.filePath, content, "utf-8")
+    return { ok: true, path: result.filePath }
+  } catch (e) {
     return { ok: false, error: e.message }
   }
 })

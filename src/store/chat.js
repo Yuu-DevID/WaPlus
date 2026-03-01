@@ -102,9 +102,25 @@ function resolveQuotedSender(sender, contacts, ownJid) {
 // [FIX-1] Normalize a DB row message — SQLite integers → JS types
 function normalizeMsg(m, contacts, ownJid) {
   if (!m) return m
+  // [FIX-FROM-ME] Normalize from_me to strict 0/1 integer
+  // Incoming IPC may send boolean true/false, DB sends 0/1
+  const fromMe = (m.from_me === 1 || m.from_me === true) ? 1 : 0
+
+  // [FIX-SENDER-NAME] If sender_name is missing/blank for incoming message,
+  // try to resolve from contacts store using sender_jid
+  let senderName = m.sender_name || null
+  if (!senderName && !fromMe && m.sender_jid && contacts) {
+    const jid = m.sender_jid
+    const contact = contacts.find?.(c => c.jid === jid)
+    if (contact?.name || contact?.push_name) {
+      senderName = contact.name || contact.push_name
+    }
+  }
+
   return {
     ...m,
-    from_me:          m.from_me         != null ? Number(m.from_me)         : 0,
+    from_me:          fromMe,
+    sender_name:      senderName,
     is_group:         m.is_group        != null ? Number(m.is_group)        : 0,
     is_forwarded:     m.is_forwarded    != null ? Number(m.is_forwarded)    : 0,
     is_ptt:           m.is_ptt          != null ? Number(m.is_ptt)          : 0,
@@ -196,22 +212,115 @@ export const useChatStore = create((set, get) => ({
       if (result?.ok) {
         const raw = result.data || []
 
-        // [FIX-DEDUP] Deduplicate by jid before storing.
-        // The DB query should never return duplicates (jid is PRIMARY KEY),
-        // but defend against any gap in the migration window or future schema changes.
-        // When duplicate jids appear, keep the one with the most recent timestamp.
+        // ══════════════════════════════════════════════════════════
+        // [FIX-DEDUP-v2] Deduplicate chats — handles ALL duplicate sources:
+        //
+        // Problem 1: DB returns @lid AND @s.whatsapp.net for same person.
+        //   WA creates two "chat" rows for same contact when @lid is used —
+        //   one from message history (@lid), one from contact store (@s.whatsapp.net).
+        //   These must be merged into a single chat item.
+        //
+        // Problem 2: Name conflicts — pushname vs phonebook name vs @lid alias.
+        //   Resolution priority: phonebook name > pushname > phone number > lid alias.
+        //
+        // Problem 3: @c.us vs @s.whatsapp.net duplicates (legacy history sync).
+        //
+        // Strategy:
+        //   Pass 1 — bucket by normalized JID. Merge duplicate JIDs (P3 above).
+        //   Pass 2 — detect @lid ↔ phone number correspondence via phone digits.
+        //            If lid user matches a phone user's number → merge into phone entry.
+        //   Pass 3 — resolve displayName using priority chain.
+        // ══════════════════════════════════════════════════════════
+
+        // ── Pass 1: Bucket by normalized JID ──────────────────
         const byJid = {}
         for (const c of raw) {
-          let jid = normalizeJid(c.jid)
-          // [FIX-LID] Jika JID masih @lid, strip ke format angka saja agar
-          // tidak double dengan entry @s.whatsapp.net dari kontak yang sama.
-          // Kita TIDAK bisa resolve @lid di sini tanpa lidMap, jadi kita
-          // simpan apa adanya tapi pastikan tidak ada duplikat string berbeda.
+          const jid = normalizeJid(c.jid)
           if (!jid) continue
           const norm = { ...c, jid }
           const prev = byJid[jid]
-          if (!prev || (norm.last_msg_at || 0) >= (prev.last_msg_at || 0)) {
-            byJid[jid] = prev ? mergeChat(prev, norm) : norm
+          if (!prev) {
+            byJid[jid] = norm
+          } else {
+            // Merge — keep richer data. Newer timestamp wins for msg preview fields.
+            const isNewer = (norm.last_msg_at || 0) >= (prev.last_msg_at || 0)
+            byJid[jid] = mergeChat(isNewer ? prev : norm, isNewer ? norm : prev)
+          }
+        }
+
+        // ── Pass 2: Cross-resolve @lid ↔ @s.whatsapp.net ─────────────────────
+        // Build phone → key map for non-lid entries so we can detect phone matches
+        const phoneToKey = {}   // "628xxx" → "@s.whatsapp.net key"
+        for (const [key, c] of Object.entries(byJid)) {
+          if (key.endsWith("@lid") || key.endsWith("@g.us") || key.endsWith("@newsletter")) continue
+          const user = key.split("@")[0].split(":")[0]
+          if (/^\d{6,}$/.test(user)) phoneToKey[user] = key
+        }
+
+        const lidKeysToRemove = []
+        for (const [key, c] of Object.entries(byJid)) {
+          if (!key.endsWith("@lid")) continue
+
+          // Try to find the phone-based entry that this @lid maps to.
+          // The DB should have stored the resolved phone in c.phone or c.contact_phone,
+          // or we can look it up via name/pushname cross-reference.
+          const lidUser  = key.split("@")[0]
+          const resolved =
+            // 1. DB stored resolved phone
+            (c.phone && phoneToKey[c.phone])       ||
+            (c.contact_phone && phoneToKey[c.contact_phone]) ||
+            // 2. The name field IS a phone number (stored as +628xxx)
+            (c.name && /^\+?\d{6,}$/.test(c.name.replace(/[\s\-]/g, "")) &&
+              phoneToKey[c.name.replace(/[^\d]/g, "")]) ||
+            // 3. Lid user digits happen to match known phone (rare but can occur
+            //    when lid is derived from phone in some WA regions)
+            (/^\d{10,}$/.test(lidUser) && phoneToKey[lidUser])
+
+          if (resolved && byJid[resolved]) {
+            // Merge @lid data into the phone entry — phone entry is canonical.
+            // @lid entry usually has more recent messages; phone entry has phonebook name.
+            const existing  = byJid[resolved]
+            const lidEntry  = c
+            const lidNewer  = (lidEntry.last_msg_at || 0) >= (existing.last_msg_at || 0)
+            // Name from phone entry wins over @lid if phone entry has a real name
+            const mergedName = (
+              (existing.name && !existing.name.includes("@"))
+                ? existing.name                                // phonebook name wins
+                : (lidEntry.name && !lidEntry.name.includes("@"))
+                    ? lidEntry.name                            // lid name fallback
+                    : existing.name || lidEntry.name
+            )
+            byJid[resolved] = {
+              ...mergeChat(lidNewer ? existing : lidEntry, lidNewer ? lidEntry : existing),
+              name: mergedName,
+              jid: resolved,   // always keep canonical phone JID
+              // Preserve unread count — take max (both entries may have unread)
+              unread_count: Math.max(
+                Number(existing.unread_count) || 0,
+                Number(lidEntry.unread_count)  || 0,
+              ),
+            }
+            lidKeysToRemove.push(key)
+          }
+        }
+        // Remove merged @lid entries
+        for (const k of lidKeysToRemove) delete byJid[k]
+
+        // ── Pass 3: Name resolution ────────────────────────────
+        // Ensure every chat has a human-readable displayName.
+        // The DB name field should already be resolved by the backend,
+        // but defend against any gaps (raw JIDs, missing pushnames, etc.)
+        for (const [key, c] of Object.entries(byJid)) {
+          if (c.name && !c.name.includes("@")) continue // already resolved
+          const server  = key.split("@")[1] || ""
+          const user    = key.split("@")[0].split(":")[0]
+          if (server === "g.us") {
+            byJid[key] = { ...c, name: c.name || c.subject || "Grup" }
+          } else if (server === "lid") {
+            // @lid with no resolved name — show partial number as last resort
+            byJid[key] = { ...c, name: c.push_name || c.last_sender_name || `~${user.slice(-8)}` }
+          } else if (/^\d{6,}$/.test(user)) {
+            byJid[key] = { ...c, name: c.push_name || c.name || `+${user}` }
           }
         }
         const allRaw      = Object.values(byJid)
@@ -247,16 +356,43 @@ export const useChatStore = create((set, get) => ({
             window.api?.dbChats?.({ limit: 100, offset: 0 }).then(r2 => {
               if (!r2?.ok) return
               const raw2 = r2.data || []
+              // [FIX-DEDUP-v2] Same dedup as primary load — normalize + merge @lid
               const byJid2 = {}
               for (const c of raw2) {
                 const jid2 = normalizeJid(c.jid)
                 if (!jid2) continue
                 const norm2 = { ...c, jid: jid2 }
                 const prev2 = byJid2[jid2]
-                if (!prev2 || (norm2.last_msg_at || 0) >= (prev2.last_msg_at || 0)) {
-                  byJid2[jid2] = prev2 ? mergeChat(prev2, norm2) : norm2
+                if (!prev2) {
+                  byJid2[jid2] = norm2
+                } else {
+                  const newer = (norm2.last_msg_at || 0) >= (prev2.last_msg_at || 0)
+                  byJid2[jid2] = mergeChat(newer ? prev2 : norm2, newer ? norm2 : prev2)
                 }
               }
+              // Cross-resolve @lid ↔ phone — reuse same logic as primary pass
+              const phoneToKey2 = {}
+              for (const [k, c] of Object.entries(byJid2)) {
+                if (k.endsWith("@lid") || k.endsWith("@g.us")) continue
+                const u = k.split("@")[0].split(":")[0]
+                if (/^\d{6,}$/.test(u)) phoneToKey2[u] = k
+              }
+              const lidDel2 = []
+              for (const [k, c] of Object.entries(byJid2)) {
+                if (!k.endsWith("@lid")) continue
+                const lu = k.split("@")[0]
+                const res2 = (c.phone && phoneToKey2[c.phone]) ||
+                  (/^\d{10,}$/.test(lu) && phoneToKey2[lu])
+                if (res2 && byJid2[res2]) {
+                  const e2 = byJid2[res2], li2 = c
+                  const ln2 = (li2.last_msg_at || 0) >= (e2.last_msg_at || 0)
+                  byJid2[res2] = { ...mergeChat(ln2 ? e2 : li2, ln2 ? li2 : e2), jid: res2,
+                    name: (e2.name && !e2.name.includes("@")) ? e2.name : li2.name || e2.name,
+                    unread_count: Math.max(Number(e2.unread_count)||0, Number(li2.unread_count)||0) }
+                  lidDel2.push(k)
+                }
+              }
+              for (const k of lidDel2) delete byJid2[k]
               const all2 = Object.values(byJid2)
                 .filter(c => !c.is_community)
                 .map(c => ({ ...c, from_me: c.from_me != null ? Number(c.from_me) : 0 }))
@@ -296,13 +432,71 @@ export const useChatStore = create((set, get) => ({
     if (!normalJid) return s
     const normalizedChat = { ...chat, jid: normalJid }
 
+    // [FIX-LID-UPSERT] If an @lid JID arrives via IPC and we already have the
+    // phone-based entry, merge into the phone entry rather than adding a duplicate.
+    const isLidIncoming = normalJid.endsWith("@lid")
+    if (isLidIncoming) {
+      const lidUser = normalJid.split("@")[0]
+      // Try to find a matching @s.whatsapp.net entry
+      const phoneMatch = s.chats.find(c => {
+        if (!c.jid || c.jid.endsWith("@lid") || c.jid.endsWith("@g.us")) return false
+        const cUser = c.jid.split("@")[0].split(":")[0]
+        return (
+          (normalizedChat.phone && cUser === normalizedChat.phone) ||
+          (/^\d{10,}$/.test(lidUser) && cUser === lidUser)
+        )
+      })
+      if (phoneMatch) {
+        // Merge incoming @lid data into existing phone entry
+        const idx2 = s.chats.findIndex(c => c.jid === phoneMatch.jid)
+        if (idx2 >= 0) {
+          const newChats2 = [...s.chats]
+          newChats2[idx2] = mergeChat(newChats2[idx2], {
+            ...normalizedChat,
+            jid: phoneMatch.jid, // keep canonical phone JID
+            name: phoneMatch.name || normalizedChat.name, // phonebook name wins
+          })
+          const getTs2 = c => c.last_msg_at || c.last_message_timestamp || 0
+          newChats2.sort((a, b) => (b.pinned - a.pinned) || (getTs2(b) - getTs2(a)))
+          return { chats: newChats2, groups: newChats2.filter(c => c.is_group) }
+        }
+      }
+    }
+
+    // [FIX-LID-UPSERT-REVERSE] If phone JID arrives and we have @lid version,
+    // replace the @lid entry with the canonical phone entry.
+    if (!isLidIncoming) {
+      const inUser = normalJid.split("@")[0].split(":")[0]
+      if (/^\d{6,}$/.test(inUser)) {
+        const lidIdx = s.chats.findIndex(c => {
+          if (!c.jid?.endsWith("@lid")) return false
+          const lu = c.jid.split("@")[0]
+          return lu === inUser || (normalizedChat.phone && lu === normalizedChat.phone)
+        })
+        if (lidIdx >= 0) {
+          // Replace @lid entry with phone entry, merging data
+          const newChats3 = [...s.chats]
+          newChats3[lidIdx] = mergeChat(newChats3[lidIdx], { ...normalizedChat })
+          // Also check if phone entry already exists somewhere else → remove duplicate
+          const dupIdx = newChats3.findIndex((c, i) => i !== lidIdx && c.jid === normalJid)
+          if (dupIdx >= 0) {
+            newChats3[lidIdx] = mergeChat(newChats3[dupIdx], newChats3[lidIdx])
+            newChats3.splice(dupIdx, 1)
+          } else {
+            newChats3[lidIdx] = { ...newChats3[lidIdx], jid: normalJid }
+          }
+          const getTs3 = c => c.last_msg_at || c.last_message_timestamp || 0
+          newChats3.sort((a, b) => (b.pinned - a.pinned) || (getTs3(b) - getTs3(a)))
+          return { chats: newChats3, groups: newChats3.filter(c => c.is_group) }
+        }
+      }
+    }
+
     const idx = s.chats.findIndex(c => c.jid === normalJid)
     let newChats
     if (idx >= 0) {
       newChats = [...s.chats]
       // [FIX-DEDUP] Use mergeChat — never let undefined/null wipe existing name or pic.
-      // Raw spread ({ ...old, ...new }) would set name=undefined if IPC payload
-      // omits the name field, erasing the contact name from the chat list.
       newChats[idx] = mergeChat(newChats[idx], normalizedChat)
     } else {
       newChats = [normalizedChat, ...s.chats]

@@ -49,7 +49,7 @@ const {
   downloadMediaMessage,
   proto,
   getAggregateVotesInPollMessage,
-} = require("baileys")
+} = require("wileys")
 
 // ADD MessageParser by Towartz
 const { parseMessage, buildRendererPayload, normalizeJid, buildLidMap, isLidJid, resolveLid, tryResolveLid } = require("./messageParser")
@@ -287,6 +287,12 @@ async function downloadAndSaveMedia(msg, messageType, isHistorySync = false) {
   if (isHistorySync) return { skipped: true, reason: "history_sync" }
 
   return _withDlSemaphore(async () => {
+    const msgId   = msg.key.id
+    const chatJid = msg.key.remoteJid
+
+    // ── Notify renderer: download started ──────────────────
+    send("media:download:start", { msgId, chatJid })
+
     try {
       // Unwrap inner message untuk viewOnce & wrappers lain
       const rawMsg = msg.message?.ephemeralMessage?.message
@@ -303,11 +309,15 @@ async function downloadAndSaveMedia(msg, messageType, isHistorySync = false) {
         })
       )
 
-      if (!buffer || buffer.length === 0) return null
+      if (!buffer || buffer.length === 0) {
+        send("media:download:error", { msgId, chatJid })
+        return null
+      }
 
       const sizeMB = buffer.length / (1024 * 1024)
       if (sizeMB > CONFIG.MAX_MEDIA_SIZE_MB) {
         logW(`Media too large: ${sizeMB.toFixed(2)}MB, skipping`)
+        send("media:download:error", { msgId, chatJid, reason: "too_large" })
         return { skipped: true, reason: "too_large", size: buffer.length }
       }
 
@@ -325,11 +335,7 @@ async function downloadAndSaveMedia(msg, messageType, isHistorySync = false) {
       // ── Notify renderer via main.js ──────────────────────
       try {
         const mainModule = require("../main")
-        mainModule?.onMediaDownloaded?.({
-          msgId: msg.key.id,
-          chatJid: msg.key.remoteJid,
-          localPath,
-        })
+        mainModule?.onMediaDownloaded?.({ msgId, chatJid, localPath })
       } catch (_) {}
 
       return { localPath, size: buffer.length, filename }
@@ -340,11 +346,12 @@ async function downloadAndSaveMedia(msg, messageType, isHistorySync = false) {
 
       if (!isExpired) {
         isNetwork
-          ? logW(`Media network error (${msg.key.id?.slice(0, 8)}…): ${msg_err.slice(0, 80)}`)
+          ? logW(`Media network error (${msgId?.slice(0, 8)}…): ${msg_err.slice(0, 80)}`)
           : logE(`Error downloading media: ${msg_err}`)
       }
 
-      try { db.updateMediaDownload?.(msg.key.id, null, null, "failed", msg_err.slice(0, 200)) } catch (_) {}
+      send("media:download:error", { msgId, chatJid, reason: msg_err.slice(0, 100) })
+      try { db.updateMediaDownload?.(msgId, null, null, "failed", msg_err.slice(0, 200)) } catch (_) {}
       return { error: msg_err }
     }
   })
@@ -500,8 +507,30 @@ async function handleMessage(msg, type, isHistorySync = false) {
   // ── [FIX-PUSHNAME] Persist sender pushname → contacts table ──
   // This is the source of truth for display names in chat list.
   // Without this, getChats() JOIN returns null and raw JID is shown.
-  if (!isHistorySync && parsed.pushname && parsed.sender_jid) {
+  if (!isHistorySync && parsed.pushname && parsed.sender_jid && !parsed.from_me) {
     db.upsertContactPushname?.(parsed.sender_jid, parsed.pushname)
+  }
+
+  // ── [FIX-SENDER-NAME] Resolve sender_name from contacts DB before pushing ──
+  // buildRendererPayload only has parsed.pushname (proto field).
+  // We need: phonebook name > push_name > pushname from proto > null
+  // This prevents duplicate/wrong name when contacts table has a better name.
+  if (!parsed.from_me && parsed.sender_jid) {
+    try {
+      const contact = db.getContact?.(parsed.sender_jid)
+      if (contact?.name || contact?.push_name) {
+        parsed._resolved_sender_name = contact.name || contact.push_name
+      }
+    } catch (_) {}
+  }
+  // Also resolve quoted sender name
+  if (parsed.quoted_sender && parsed.quoted_sender !== '__me__' && parsed.quoted_sender !== '__self__') {
+    try {
+      const qContact = db.getContact?.(parsed.quoted_sender)
+      if (qContact?.name || qContact?.push_name) {
+        parsed._resolved_quoted_sender_name = qContact.name || qContact.push_name
+      }
+    } catch (_) {}
   }
 
   // History sync: hanya save ke DB, tidak push ke renderer
@@ -817,17 +846,35 @@ async function connectToWhatsApp(phoneForPairing = null) {
       db.saveChat(chat)
     }
 
-    // Save messages (history)
-    for (const msg of messages) {
+  // Save messages (history) — OPTIMIZED: batch insert via transaction
+  // Process in chunks to avoid blocking the event loop
+  const BATCH_SIZE = 100
+  for (let i = 0; i < messages.length; i += BATCH_SIZE) {
+    const chunk = messages.slice(i, i + BATCH_SIZE)
+    for (const msg of chunk) {
       await handleMessage(msg, 'history', true)
     }
+    // Yield to event loop between chunks to keep UI responsive
+    if (i + BATCH_SIZE < messages.length) {
+      await new Promise(r => setImmediate(r))
+    }
+  }
 
-    // Update sync status
+    // ── 4. Update sync status ──
     send("sync:status", {
       isSyncing: true,
       progress,
       stats: syncStats
     })
+
+    // ── 5. Incremental chat list update every batch ──
+    // Push to UI progressively so chats show up as they sync
+    if (chats.length > 0) {
+      setImmediate(() => {
+        try { db.backfillChatLastMessages?.() } catch (_) {}
+        send("db:chats:updated")
+      })
+    }
 
     // If complete
     if (isLatest) {

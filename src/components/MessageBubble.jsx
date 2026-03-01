@@ -10,6 +10,42 @@ import { format } from "date-fns"
 import { useState, useRef, useCallback, useEffect, useMemo, memo } from "react"
 import { prefetchChat } from "../hooks/useMediaPrefetch"
 import { useAppStore } from "../store/app"
+import DevEvalModal from "./DevEvalModal"
+
+// ════════════════════════════════════════════════════════════
+// GLOBAL MEDIA DOWNLOAD LOADING STATE
+// Tracks which msgIds are currently being downloaded
+// Updated via IPC events: media:download:start / media:download:error / media:updated
+// ════════════════════════════════════════════════════════════
+const _dlLoading = new Set()
+const _dlListeners = new Set()
+
+function notifyDlListeners() {
+  for (const fn of _dlListeners) fn()
+}
+
+// Bootstrap IPC listeners once
+if (typeof window !== "undefined") {
+  window.api?.onMediaDownloadStart?.((e) => {
+    if (e?.msgId) { _dlLoading.add(e.msgId); notifyDlListeners() }
+  })
+  window.api?.onMediaDownloadError?.((e) => {
+    if (e?.msgId) { _dlLoading.delete(e.msgId); notifyDlListeners() }
+  })
+  window.api?.onMediaUpdated?.((e) => {
+    if (e?.msgId) { _dlLoading.delete(e.msgId); notifyDlListeners() }
+  })
+}
+
+function useIsDownloading(msgId) {
+  const [dl, setDl] = useState(() => _dlLoading.has(msgId))
+  useEffect(() => {
+    const fn = () => setDl(_dlLoading.has(msgId))
+    _dlListeners.add(fn)
+    return () => _dlListeners.delete(fn)
+  }, [msgId])
+  return dl
+}
 
 // ════════════════════════════════════════════════════════════
 // MODULE-LEVEL CONSTANTS
@@ -275,17 +311,62 @@ function useMediaSrc(msg) {
     window.api.fsExists({ rawPath }).then(exists => { if (!exists) { setVerifiedSrc(null); if (msg.chat_jid) prefetchChat(msg.chat_jid, 30, true) } }).catch(() => { })
   }, [rawPath])
   const src = verifiedSrc || msg.media_url || null
-  return { src, err, setErr }
+  // [INSTANT-THUMB] Embedded base64 thumbnail — renders immediately without download
+  const thumbnailSrc = msg.media_thumbnail_b64 || null
+  return { src, thumbnailSrc, err, setErr }
 }
 
 // ════════════════════════════════════════════════════════════
 // SMALL HELPERS
 // ════════════════════════════════════════════════════════════
+
+/**
+ * fmtPhone — convert any JID or raw string to human-readable phone/name.
+ * NEVER returns @lid suffix, raw JID format, or LID numeric IDs to the UI.
+ *
+ * Priority:
+ *   1. @s.whatsapp.net / @c.us → "+number"
+ *   2. @lid → try to detect LID numeric (not a real phone) → show "~lid" hint
+ *   3. Group JID → "" (shouldn't appear as sender)
+ *   4. Plain string without @ → return as-is if name, or +number if digits
+ *
+ * Note: LID numeric IDs are typically 15-digit numbers starting with high values
+ *       (like 108491511492861) — these are NOT real phone numbers.
+ *       Real phone numbers are 7-15 digits, with country code starting 1-9.
+ */
 function fmtPhone(raw) {
   if (!raw) return "?"
-  const n = raw.includes("@") ? raw.split("@")[0] : raw
-  if (!/^\d{6,}$/.test(n)) return raw
-  return `+${n}`
+  if (raw === "__me__") return "Kamu"
+  if (raw === "__self__") return "Kamu"
+
+  const atIdx = raw.lastIndexOf("@")
+  if (atIdx === -1) {
+    // No @, treat as phone/name directly
+    return /^\d{6,}$/.test(raw) ? `+${raw}` : raw
+  }
+
+  const user   = raw.slice(0, atIdx).split(":")[0]  // strip device suffix
+  const server = raw.slice(atIdx + 1)
+
+  // Group JIDs should never appear as sender display
+  if (server === "g.us" || server === "newsletter") return ""
+
+  // @lid server — this is a privacy-masked ID, NOT a phone number
+  // Even if user part is numeric, show a masked form to avoid confusion
+  if (server === "lid") {
+    const numericPart = user.replace(/\D/g, "")
+    // LID numbers are very long (>12 digits) and NOT real phone numbers
+    // Show last 6 digits with tilde prefix so devs know it's unresolved
+    if (numericPart.length > 12) return `~${numericPart.slice(-6)}`
+    if (numericPart.length >= 6) return `~${numericPart.slice(-6)}`
+    return `~${user.slice(0, 10)}`
+  }
+
+  // Numeric user → real phone number
+  if (/^\d{6,}$/.test(user)) return `+${user}`
+
+  // Fallback: just return user part (no @)
+  return user || "?"
 }
 function fmtTime(s) {
   if (!s || !isFinite(s)) return "0:00"
@@ -330,6 +411,43 @@ function MediaLoadingSpinner({ label = "Mengunduh..." }) {
   )
 }
 
+// DownloadingPulse — active download indicator with animated download arrow
+function DownloadingPulse({ label = "Mengunduh..." }) {
+  return (
+    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 6 }}>
+      <div style={{ position: "relative", width: 44, height: 44 }}>
+        {/* Outer pulsing ring */}
+        <div style={{
+          position: "absolute", inset: 0, borderRadius: "50%",
+          border: "2px solid var(--green)",
+          animation: "dl-pulse-ring 1.4s ease-out infinite",
+          opacity: 0.6,
+        }} />
+        {/* Inner circle */}
+        <div style={{
+          position: "absolute", inset: 4, borderRadius: "50%",
+          background: "rgba(37,211,102,0.18)",
+          display: "flex", alignItems: "center", justifyContent: "center",
+        }}>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--green)" strokeWidth="2.5" strokeLinecap="round">
+            <path d="M12 3v12M7 14l5 5 5-5" style={{ animation: "dl-arrow-bounce 1s ease infinite" }} />
+            <path d="M5 19h14" />
+          </svg>
+        </div>
+        {/* Spinning arc */}
+        <svg viewBox="0 0 44 44" width="44" height="44" style={{ position: "absolute", inset: 0, animation: "spin 1.5s linear infinite" }}>
+          <circle cx="22" cy="22" r="20" fill="none" stroke="var(--green)" strokeWidth="2" strokeLinecap="round" strokeDasharray="31 95" />
+        </svg>
+      </div>
+      <span style={{ fontSize: 10, color: "var(--green)", fontWeight: 500, letterSpacing: 0.3 }}>{label}</span>
+      <style>{`
+        @keyframes dl-pulse-ring { 0%{transform:scale(1);opacity:.6} 80%,100%{transform:scale(1.4);opacity:0} }
+        @keyframes dl-arrow-bounce { 0%,100%{transform:translateY(0)} 50%{transform:translateY(3px)} }
+      `}</style>
+    </div>
+  )
+}
+
 function MediaErrorPlaceholder({ label = "Gagal memuat konten media" }) {
   return (
     <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 6, minHeight: 80, padding: 16 }}>
@@ -353,8 +471,8 @@ const BubbleTime = memo(function BubbleTime({ ts }) {
 })
 
 // ─── Quoted message ───────────────────────────────────────────────────────────
-const QuotedMsg = memo(function QuotedMsg({ body, sender, type, hasMedia, mimetype, onClick, quotedFromMe }) {
-  if (!sender && !body && !hasMedia && !quotedFromMe) return null
+const QuotedMsg = memo(function QuotedMsg({ body, sender, senderName, type, hasMedia, mimetype, onClick, quotedFromMe }) {
+  if (!sender && !senderName && !body && !hasMedia && !quotedFromMe) return null
   const mediaIcon = (() => {
     if (!hasMedia) return null
     if (mimetype?.startsWith("image")) return <HiPhoto size={12} />
@@ -363,7 +481,27 @@ const QuotedMsg = memo(function QuotedMsg({ body, sender, type, hasMedia, mimety
     if (mimetype?.includes("pdf")) return <HiDocument size={12} />
     return <HiArchiveBox size={12} />
   })()
-  let displaySender = sender === "__me__" || quotedFromMe ? "Kamu" : sender ? (sender.includes("@") ? fmtPhone(sender) : sender) : null
+
+  // [FIX-LID] Display name resolution — NEVER show raw @lid or JID
+  // Priority: 1) explicit senderName from DB contacts  2) fmtPhone(sender JID)  3) "Kamu"
+  let displaySender = null
+  if (sender === "__me__" || sender === "__self__" || quotedFromMe) {
+    displaySender = "Kamu"
+  } else if (senderName && !senderName.includes("@")) {
+    // DB-resolved contact name — most reliable, use directly
+    displaySender = senderName
+  } else if (sender) {
+    if (!sender.includes("@")) {
+      displaySender = /^\d{6,}$/.test(sender) ? `+${sender}` : sender
+    } else {
+      displaySender = fmtPhone(sender)
+    }
+    // Final safety: strip any remaining @ (should never happen after fmtPhone)
+    if (displaySender?.includes("@")) {
+      const u = displaySender.split("@")[0].split(":")[0]
+      displaySender = /^\d{6,}$/.test(u) ? `+${u}` : u || null
+    }
+  }
   return (
     <div className="quoted" onClick={onClick} role={onClick ? "button" : undefined} tabIndex={onClick ? 0 : undefined} style={onClick ? { cursor: "pointer" } : undefined}>
       {displaySender && <div className="quoted-sender">{displaySender}</div>}
@@ -513,19 +651,36 @@ function AlbumBubble({ msgs, onMediaClick, openMedia }) {
 
 // ─── Image bubble ─────────────────────────────────────────────────────────────
 function ImageBubble({ msg, onMediaClick }) {
-  const { src, err, setErr } = useMediaSrc(msg)
+  const { src, thumbnailSrc, err, setErr } = useMediaSrc(msg)
   const { openMedia } = useAppStore()
   const [loaded, setLoaded] = useState(false)
+  const isDownloading = useIsDownloading(msg.id)
   const handleClick = useCallback(() => {
     if (!src) return
     if (onMediaClick) onMediaClick(msg, src, "image")
     else openMedia([{ src, type: "image", caption: msg.body || "", msgId: msg.id, filename: msg.media_filename }], 0)
   }, [src, msg, onMediaClick, openMedia])
 
+  // No full src yet — show thumbnail (instant) or loading spinner
   if (!src || err) {
     return (
       <div style={{ lineHeight: 0, borderRadius: 8, overflow: "hidden", background: "rgba(255,255,255,0.06)", minHeight: 120 }}>
-        {err ? <MediaErrorPlaceholder /> : <MediaLoadingSpinner />}
+        {err ? <MediaErrorPlaceholder /> : thumbnailSrc ? (
+          // [INSTANT-THUMB] data: URI renders immediately, blurred as placeholder
+          <div style={{ position: "relative", minHeight: 120 }}>
+            <img src={thumbnailSrc} alt="" draggable={false}
+              style={{ display: "block", maxWidth: "100%", maxHeight: 320, width: "100%", objectFit: "cover", filter: "blur(8px)", transform: "scale(1.05)", userSelect: "none" }} />
+            <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center" }}>
+              {isDownloading
+                ? <DownloadingPulse />
+                : <div className="spinner spinner-sm" style={{ borderTopColor: "var(--green)", borderColor: "rgba(37,211,102,.2)" }} />}
+            </div>
+          </div>
+        ) : (
+          <div style={{ minHeight: 120, display: "flex", alignItems: "center", justifyContent: "center" }}>
+            {isDownloading ? <DownloadingPulse /> : <MediaLoadingSpinner />}
+          </div>
+        )}
         {msg.body && <div className="media-caption" style={{ padding: "6px 10px 8px", fontSize: 13 }}><RichText text={msg.body} /></div>}
       </div>
     )
@@ -534,7 +689,12 @@ function ImageBubble({ msg, onMediaClick }) {
   return (
     <>
       <div style={{ lineHeight: 0, borderRadius: msg.body ? "8px 8px 0 0" : 8, overflow: "hidden", position: "relative" }}>
-        {!loaded && (
+        {!loaded && thumbnailSrc && (
+          // Show blurred thumbnail while full image loads
+          <img src={thumbnailSrc} alt="" draggable={false} aria-hidden
+            style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "cover", filter: "blur(8px)", transform: "scale(1.05)", userSelect: "none", pointerEvents: "none" }} />
+        )}
+        {!loaded && !thumbnailSrc && (
           <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", background: "rgba(255,255,255,0.04)", minHeight: 80 }}>
             <div className="spinner spinner-sm" style={{ borderTopColor: "var(--green)", borderColor: "rgba(37,211,102,.2)" }} />
           </div>
@@ -550,9 +710,10 @@ function ImageBubble({ msg, onMediaClick }) {
 
 // ─── Video bubble ─────────────────────────────────────────────────────────────
 function VideoBubble({ msg, onMediaClick }) {
-  const { src, err, setErr } = useMediaSrc(msg)
+  const { src, thumbnailSrc, err, setErr } = useMediaSrc(msg)
   const { openMedia } = useAppStore()
   const isGif = toBool(msg.is_gif)
+  const isDownloading = useIsDownloading(msg.id)
   const [thumbLoaded, setThumbLoaded] = useState(false)
   const handleClick = useCallback(() => {
     if (!src || isGif) return
@@ -563,8 +724,17 @@ function VideoBubble({ msg, onMediaClick }) {
   if (!src || err) {
     return (
       <div className="media-video">
-        <div className="media-video-thumb" style={{ cursor: "default", minHeight: 120, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 8 }}>
-          {err ? <MediaErrorPlaceholder label={isGif ? "Gagal memuat GIF" : "Gagal memuat video"} /> : <MediaLoadingSpinner label={isGif ? "Mengunduh GIF..." : "Mengunduh video..."} />}
+        <div className="media-video-thumb" style={{ cursor: "default", minHeight: 120, position: "relative", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 8, overflow: "hidden", borderRadius: 8 }}>
+          {thumbnailSrc && !err && (
+            // [INSTANT-THUMB] Show blurred video thumbnail immediately
+            <img src={thumbnailSrc} alt="" draggable={false} aria-hidden
+              style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "cover", filter: "blur(10px)", transform: "scale(1.08)", userSelect: "none", pointerEvents: "none" }} />
+          )}
+          <div style={{ position: "relative", zIndex: 1 }}>
+            {err ? <MediaErrorPlaceholder label={isGif ? "Gagal memuat GIF" : "Gagal memuat video"} />
+              : isDownloading ? <DownloadingPulse label={isGif ? "Mengunduh GIF..." : "Mengunduh video..."} />
+              : <MediaLoadingSpinner label={isGif ? "Mengunduh GIF..." : "Mengunduh video..."} />}
+          </div>
         </div>
       </div>
     )
@@ -735,19 +905,30 @@ function DocBubble({ msg }) {
 
 // ─── Sticker bubble ───────────────────────────────────────────────────────────
 function StickerBubble({ msg }) {
-  const { src, err, setErr } = useMediaSrc(msg)
+  const { src, thumbnailSrc, err, setErr } = useMediaSrc(msg)
   const [imgFailed, setImgFailed] = useState(false)
   const [videoFailed, setVideoFailed] = useState(false)
+  const isDownloading = useIsDownloading(msg.id)
   const prevSrcRef = useRef(src)
   if (prevSrcRef.current !== src) { prevSrcRef.current = src; setImgFailed(false); setVideoFailed(false) }
   const stickerStyle = { width: 150, height: 150, objectFit: "contain", display: "block", borderRadius: 4 }
 
-  if (!src) {
+  if (!src && !thumbnailSrc) {
     return (
       <div style={{ width: 150, height: 150, display: "flex", alignItems: "center", justifyContent: "center", flexDirection: "column", gap: 6, background: "rgba(255,255,255,0.04)", borderRadius: 12 }}>
-        <MediaLoadingSpinner label="Mengunduh stiker..." />
+        {isDownloading ? <DownloadingPulse label="Mengunduh stiker..." /> : <MediaLoadingSpinner label="Mengunduh stiker..." />}
       </div>
     )
+  }
+  // [INSTANT-THUMB] If sticker has embedded webp/jpeg thumbnail, render it directly
+  // as a blurred placeholder. Animated webp stickers often have a thumbnail too.
+  if (!src && thumbnailSrc) {
+    const isThumbWebp = thumbnailSrc.includes('image/webp')
+    // Render thumbnail directly — for webp try <video> loop for animation fallback
+    if (isThumbWebp) {
+      return <img src={thumbnailSrc} alt="Stiker" style={{ ...stickerStyle, filter: "blur(2px)" }} />
+    }
+    return <img src={thumbnailSrc} alt="Stiker" style={{ ...stickerStyle, filter: "blur(2px)" }} />
   }
   if (imgFailed && videoFailed) {
     return (
@@ -982,29 +1163,478 @@ function renderContent(msg, opts = {}) {
 // ════════════════════════════════════════════════════════════
 // CONTEXT MENU
 // ════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════
+// RAW MESSAGE VIEWER MODAL
+// ════════════════════════════════════════════════════════════
+// RAW MESSAGE VIEWER — Shows PURE Baileys proto object
+// ════════════════════════════════════════════════════════════
+// Reconstruct format persis seperti output smsg() di bot WA:
+//   { key, messageTimestamp, pushName, message, mtype, msg,
+//     body, text, isCmd, cmd, args, quoted, mentionedJid,
+//     chatId, fromMe, isGroup, senderId, participant, ... }
+//
+// Source: fetch db:messages:raw → message_json (stored Baileys proto)
+//         + SQLite row fields (key, pushName, timestamp, etc.)
+// ════════════════════════════════════════════════════════════
+
+// ── smsg-style reconstructor ────────────────────────────────
+// Input: SQLite row (all columns) + parsed message_json (Baileys proto)
+// Output: object matching the sample JSON files exactly
+function buildSmsgStyle(row, msgJson) {
+  if (!row) return null
+
+  const msgType  = row.message_type || "conversation"
+  const isGroup  = !!(row.remote_jid || "").endsWith("@g.us")
+  const fromMe   = row.from_me === 1
+  const chatJid  = row.remote_jid || ""
+  const sender   = isGroup
+    ? (row.participant || row.sender_jid || "")
+    : (fromMe ? row.remote_jid : row.remote_jid)
+
+  // Re-extract body from the Baileys message proto (like smsg does)
+  let body = row.body || ""
+  let msgContent = msgJson || {}
+
+  // If message_json is the full Baileys proto (has nested message content),
+  // extract the inner message content object for the "msg" field
+  let innerMsg = msgContent
+  if (msgContent[msgType]) {
+    innerMsg = msgContent[msgType]
+  } else {
+    // Try to find the inner content key
+    const keys = Object.keys(msgContent).filter(k =>
+      k !== "messageContextInfo" && k !== "senderKeyDistributionMessage"
+    )
+    if (keys.length > 0) innerMsg = msgContent[keys[0]]
+  }
+
+  // Parse text/body from inner message
+  const msgBody = body ||
+    innerMsg?.text ||
+    innerMsg?.caption ||
+    innerMsg?.conversation ||
+    ""
+
+  // Reconstruct "key" object (Baileys WAMessageKey)
+  const key = {
+    remoteJid: chatJid,
+    fromMe: !!fromMe,
+    id: row.id,
+    ...(isGroup && row.participant ? { participant: row.participant } : {}),
+  }
+
+  // Build args like smsg() does: split body by space, first = cmd
+  const bodyTrim = msgBody.trim()
+  const isCmd = false  // we don't know prefix here — keep false like bot does when not matched
+  const parts = bodyTrim.split(/\s+/)
+  const cmd = parts[0] || ""
+  const args = parts.slice(1)
+
+  // ── Reconstruct quoted message info ────────────────────────
+  let quoted = null
+  if (row.context_stanza_id) {
+    const quotedMsg = row.context_quoted_message || null
+    let quotedParsed = null
+    try { quotedParsed = typeof quotedMsg === "string" ? JSON.parse(quotedMsg) : quotedMsg } catch {}
+    quoted = {
+      key: {
+        remoteJid: chatJid,
+        fromMe: row.context_participant
+          ? (row.context_participant === row.remote_jid)
+          : false,
+        id: row.context_stanza_id,
+        ...(isGroup && row.context_participant ? { participant: row.context_participant } : {}),
+      },
+      message: quotedParsed,
+    }
+  }
+
+  // ── mentioned JIDs ──────────────────────────────────────────
+  let mentionedJid = []
+  try {
+    const raw = row.context_mentioned_jids || row.mentioned_jids || "[]"
+    mentionedJid = typeof raw === "string" ? JSON.parse(raw) : (Array.isArray(raw) ? raw : [])
+  } catch {}
+
+  // ── Final smsg-style object ─────────────────────────────────
+  // Field order matches the sample JSON files (output__1_.json etc.)
+  return {
+    key,
+    messageTimestamp: row.message_timestamp || 0,
+    pushName: row.push_name || null,
+    broadcast: !!(row.broadcast),
+    message: msgJson || null,       // ← FULL Baileys WAMessage proto, unmodified
+
+    // ── smsg enrichment fields ──────────────────────────────
+    id: row.id,
+    isBaileys: !!(row.id && row.id.startsWith("BAE5") && row.id.length === 16),
+    chatId: chatJid,
+    chatLid: "",
+    fromMe: !!fromMe,
+    from: chatJid,
+    isBroadcast: !!(row.broadcast),
+    isStatusBroadcast: chatJid === "status@broadcast",
+    isNewsletter: chatJid.endsWith("@newsletter"),
+    isGroup,
+    isUser: !isGroup && !chatJid.endsWith("@newsletter"),
+    senderId: sender,
+    participant: row.participant || null,
+    mtype: msgType,
+    msg: innerMsg,                  // ← inner message content (like smsg m.msg)
+    quoted,
+    body: msgBody,
+    mentionedJid,
+    text: msgBody,
+    isCmd,
+    cmd,
+    args,
+
+    // ── Status ──────────────────────────────────────────────
+    status: row.status,
+    starred: !!(row.starred),
+    is_history_sync: !!(row.is_history_sync),
+  }
+}
+
+// ── JSON syntax colorizer (token-based, no deps) ────────────
+// Applied to the <pre> via dangerouslySetInnerHTML so we get nice coloring
+function colorizeJson(text) {
+  if (!text || text.length > 80000) return escHtml(text)
+
+  // Escape HTML first, then apply color spans
+  const escaped = escHtml(text)
+
+  return escaped
+    // JSON string values → green
+    .replace(/(: )(&quot;)((?:[^&]|&(?!quot;))*?)(&quot;)/g,
+      '$1<span class="rv-s">$2$3$4</span>')
+    // JSON keys → blue
+    .replace(/^(\s*)(&quot;)([\w$\- .@]+)(&quot;)(\s*:)/gm,
+      '$1<span class="rv-k">$2$3$4</span>$5')
+    // Numbers → orange
+    .replace(/(:\s*)(-?\d+\.?\d*(?:e[+-]?\d+)?)/g,
+      '$1<span class="rv-n">$2</span>')
+    // Booleans + null → purple
+    .replace(/(:\s*)(true|false|null)/g,
+      '$1<span class="rv-b">$2</span>')
+}
+function escHtml(s) {
+  return (s || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+}
+
+// ── Tab selector ─────────────────────────────────────────────
+const RV_TABS = [
+  { id: "smsg",  label: "smsg()",  icon: "⚡", title: "Format smsg() seperti output bot — key, message, mtype, msg, body, dll." },
+  { id: "raw",   label: "Baileys", icon: "🔧", title: "Raw Baileys WAMessage proto — isi message_json dari DB" },
+  { id: "store", label: "Store",   icon: "📦", title: "Object WaPlus store — hasil parsing & normalisasi untuk UI" },
+]
+
+function RawViewerModal({ msg, onClose }) {
+  const [tab,    setTab]    = useState("smsg")
+  const [fetched, setFetched] = useState(null)   // { row, msgJson } or null
+  const [loading, setLoading] = useState(true)
+  const [error,   setError]   = useState(null)
+  const [copied,  setCopied]  = useState(false)
+  const preRef = useRef(null)
+
+  // ── Fetch full raw data from DB on mount ──────────────────
+  useEffect(() => {
+    let cancelled = false
+    async function fetchRaw() {
+      try {
+        if (!window.api?.dbMessageRaw) {
+          // Fallback if IPC not available
+          setFetched({ row: null, msgJson: null })
+          setLoading(false)
+          return
+        }
+        const res = await window.api.dbMessageRaw({ id: msg.id })
+        if (cancelled) return
+        if (!res?.ok) {
+          setError(res?.error || "Message tidak ditemukan di DB")
+          setLoading(false)
+          return
+        }
+        const row = res.data
+        // Parse message_json → full Baileys WAMessage proto
+        let msgJson = null
+        try {
+          const raw = row._message_json_parsed || row.message_json
+          msgJson = typeof raw === "string" ? JSON.parse(raw) : raw
+        } catch {}
+        setFetched({ row, msgJson })
+      } catch (e) {
+        if (!cancelled) setError(e.message)
+      } finally {
+        if (!cancelled) setLoading(false)
+      }
+    }
+    fetchRaw()
+    return () => { cancelled = true }
+  }, [msg.id])
+
+  // ── Close on Escape ───────────────────────────────────────
+  useEffect(() => {
+    const fn = e => { if (e.key === "Escape") onClose() }
+    document.addEventListener("keydown", fn)
+    return () => document.removeEventListener("keydown", fn)
+  }, [onClose])
+
+  // ── Build display object based on active tab ──────────────
+  const displayObj = useMemo(() => {
+    if (tab === "smsg") {
+      if (!fetched) return null
+      return buildSmsgStyle(fetched.row, fetched.msgJson)
+    }
+    if (tab === "raw") {
+      return fetched?.msgJson || null
+    }
+    // tab === "store" — WaPlus parsed/normalized object
+    const storeObj = { ...msg }
+    // Parse any JSON string fields
+    for (const k of ["mentioned_jids","poll_options","contacts_json","call_participants"]) {
+      try { if (typeof storeObj[k] === "string") storeObj[k] = JSON.parse(storeObj[k]) } catch {}
+    }
+    // Truncate huge thumbnails
+    if (storeObj.media_thumbnail_b64?.length > 200) {
+      storeObj.media_thumbnail_b64 = storeObj.media_thumbnail_b64.slice(0, 80)
+        + `… [${storeObj.media_thumbnail_b64.length} chars total]`
+    }
+    return storeObj
+  }, [tab, fetched, msg])
+
+  const rawText = useMemo(() => {
+    if (!displayObj) return loading ? "Loading…" : (error ? `Error: ${error}` : "null")
+    try { return JSON.stringify(displayObj, null, 2) }
+    catch (e) {
+      // Handle circular refs
+      const seen = new WeakSet()
+      return JSON.stringify(displayObj, (k, v) => {
+        if (typeof v === "object" && v !== null) {
+          if (seen.has(v)) return "[Circular]"
+          seen.add(v)
+        }
+        return v
+      }, 2)
+    }
+  }, [displayObj, loading, error])
+
+  const handleCopy = () => {
+    navigator.clipboard?.writeText(rawText).then(() => {
+      setCopied(true); setTimeout(() => setCopied(false), 2000)
+    })
+  }
+
+  const handleSave = () => {
+    const blob = new Blob([rawText], { type: "application/json" })
+    const url  = URL.createObjectURL(blob)
+    const a    = document.createElement("a")
+    a.href     = url
+    a.download = `msg-${tab}-${msg.id?.slice(0, 12) || "raw"}.json`
+    a.click()
+    URL.revokeObjectURL(url)
+  }
+
+  const tabMeta = RV_TABS.find(t => t.id === tab)
+  const lineCount = rawText.split("\n").length
+
+  return (
+    <div
+      className="rawviewer-backdrop"
+      onClick={e => { if (e.target === e.currentTarget) onClose() }}
+      role="dialog" aria-modal="true" aria-label="Raw Message"
+    >
+      <div className="rawviewer-modal">
+
+        {/* ── Header ───────────────────────────────────────── */}
+        <div className="rawviewer-header">
+          <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0 }}>
+            <div style={{ width: 32, height: 32, borderRadius: 8, background: "rgba(37,211,102,0.12)", border: "1px solid rgba(37,211,102,0.3)", display: "flex", alignItems: "center", justifyContent: "center", color: "var(--green)", flexShrink: 0 }}>
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                <polyline points="14 2 14 8 20 8"/>
+              </svg>
+            </div>
+            <div style={{ minWidth: 0 }}>
+              <div style={{ fontSize: 14, fontWeight: 700, color: "var(--text-1)", lineHeight: 1 }}>Raw Message</div>
+              <div style={{ fontSize: 10.5, color: "var(--text-3)", marginTop: 3, fontFamily: "monospace",
+                whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", maxWidth: 380 }}>
+                {msg.id || "?"} · {msg.msg_type || "?"} · {msg.chat_jid || "?"}
+              </div>
+            </div>
+          </div>
+          <button className="rawviewer-close" onClick={onClose} aria-label="Close">
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
+              <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+            </svg>
+          </button>
+        </div>
+
+        {/* ── Tab bar ──────────────────────────────────────── */}
+        <div className="rv-tabs" role="tablist">
+          {RV_TABS.map(t => (
+            <button
+              key={t.id}
+              role="tab"
+              aria-selected={tab === t.id}
+              className={`rv-tab${tab === t.id ? " active" : ""}`}
+              onClick={() => { setTab(t.id); setCopied(false) }}
+              title={t.title}
+            >
+              <span className="rv-tab-icon">{t.icon}</span>
+              {t.label}
+              {tab === t.id && t.id !== "store" && loading && (
+                <span className="rv-tab-spinner" />
+              )}
+            </button>
+          ))}
+          {/* Status tag */}
+          {!loading && tab !== "store" && (
+            <span className={`rv-status-tag${!displayObj ? " err" : ""}`}>
+              {!displayObj ? (error ? "not found" : "empty") : "ok"}
+            </span>
+          )}
+        </div>
+
+        {/* ── Toolbar ──────────────────────────────────────── */}
+        <div className="rawviewer-toolbar">
+          <div style={{ fontSize: 11, color: "var(--text-3)", fontFamily: "monospace", display: "flex", alignItems: "center", gap: 8 }}>
+            {loading ? (
+              <><span className="spinner spinner-sm" style={{ borderTopColor: "var(--green)", borderColor: "rgba(37,211,102,.2)" }} /> Fetching…</>
+            ) : (
+              <>{lineCount} lines · {rawText.length.toLocaleString()} chars · <span style={{ color: "var(--text-2)" }}>{tabMeta?.title}</span></>
+            )}
+          </div>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button
+              className={`rawviewer-btn${copied ? " success" : ""}`}
+              onClick={handleCopy}
+              disabled={loading || !displayObj}
+              title="Copy JSON ke clipboard"
+            >
+              {copied ? (
+                <><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round"><polyline points="20 6 9 17 4 12"/></svg> Copied!</>
+              ) : (
+                <><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg> Copy</>
+              )}
+            </button>
+            <button
+              className="rawviewer-btn"
+              onClick={handleSave}
+              disabled={loading || !displayObj}
+              title="Simpan sebagai file .json"
+            >
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                <polyline points="7 10 12 15 17 10"/>
+                <line x1="12" y1="15" x2="12" y2="3"/>
+              </svg>
+              Save .json
+            </button>
+          </div>
+        </div>
+
+        {/* ── Code area ────────────────────────────────────── */}
+        <div className="rawviewer-code-wrap">
+          {loading ? (
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "center",
+              height: 200, gap: 10, color: "var(--text-3)", fontSize: 13 }}>
+              <span className="spinner" style={{ borderTopColor: "var(--green)", borderColor: "rgba(37,211,102,.2)" }} />
+              Memuat data dari database…
+            </div>
+          ) : error && !displayObj ? (
+            <div style={{ padding: "24px 28px" }}>
+              <div style={{ fontSize: 12, color: "#ef5350", fontFamily: "monospace",
+                background: "rgba(239,83,80,0.08)", border: "1px solid rgba(239,83,80,0.2)",
+                borderRadius: 8, padding: "12px 16px" }}>
+                ⚠ {error}
+              </div>
+              <div style={{ fontSize: 11, color: "var(--text-3)", marginTop: 10 }}>
+                message_json mungkin tidak disimpan untuk tipe ini, atau pesan belum ada di DB.
+              </div>
+            </div>
+          ) : (
+            <pre
+              ref={preRef}
+              className="rawviewer-code rv-code-colored"
+              dangerouslySetInnerHTML={{ __html: colorizeJson(rawText) }}
+            />
+          )}
+        </div>
+
+      </div>
+    </div>
+  )
+}
+
+// ════════════════════════════════════════════════════════════
+// CONTEXT MENU — WhatsApp-style with icons + Raw View
+// ════════════════════════════════════════════════════════════
 function ContextMenu({ x, y, items, onClose }) {
   const ref = useRef(null)
   useEffect(() => {
-    const close = e => { if (ref.current && !ref.current.contains(e.target)) onClose() }
-    document.addEventListener("mousedown", close)
-    document.addEventListener("contextmenu", close)
-    return () => { document.removeEventListener("mousedown", close); document.removeEventListener("contextmenu", close) }
+    const close = e => {
+      if (ref.current && !ref.current.contains(e.target)) onClose()
+    }
+    // Close on outside mousedown, right-click, or Escape
+    const onKey = e => { if (e.key === "Escape") onClose() }
+    document.addEventListener("mousedown", close, true)
+    document.addEventListener("contextmenu", close, true)
+    document.addEventListener("keydown", onKey)
+    return () => {
+      document.removeEventListener("mousedown", close, true)
+      document.removeEventListener("contextmenu", close, true)
+      document.removeEventListener("keydown", onKey)
+    }
   }, [onClose])
-  const style = { left: Math.min(x, window.innerWidth - 180), top: Math.min(y, window.innerHeight - items.length * 38 - 20) }
+
+  // Smart positioning — flip direction if near viewport edge
+  useEffect(() => {
+    if (!ref.current) return
+    const el = ref.current
+    const rect = el.getBoundingClientRect()
+    const vw = window.innerWidth, vh = window.innerHeight
+    if (rect.right > vw - 8)  el.style.left = `${x - rect.width}px`
+    if (rect.bottom > vh - 8) el.style.top  = `${y - rect.height}px`
+  })
+
   return (
-    <div ref={ref} className="ctx-menu" role="menu" style={{ position: "fixed", ...style }}>
-      {items.map((item, i) =>
-        item === "divider" ? (
-          <div key={i} className="ctx-menu-divider" role="separator" />
-        ) : (
-          <div key={i} className={`ctx-menu-item${item.danger ? " danger" : ""}`} role="menuitem" tabIndex={0}
-            onMouseDown={e => { e.stopPropagation(); item.action(); onClose() }}
-            onKeyDown={e => { if (e.key === "Enter") { item.action(); onClose() } }}>
-            {item.icon && <span style={{ fontSize: 15, display: "flex", alignItems: "center" }} aria-hidden="true">{item.icon}</span>}
-            {item.label}
+    <div
+      ref={ref}
+      className="ctx-menu"
+      role="menu"
+      aria-label="Opsi pesan"
+      style={{ left: x, top: y }}
+      onContextMenu={e => e.preventDefault()}
+    >
+      {items.map((item, i) => {
+        if (item === "divider") return <div key={i} className="ctx-menu-divider" role="separator" />
+        const cls = [
+          "ctx-menu-item",
+          item.danger ? "danger" : "",
+          item.raw    ? "raw"    : "",
+          item.muted  ? "muted"  : "",
+        ].filter(Boolean).join(" ")
+        return (
+          <div
+            key={i}
+            className={cls}
+            role="menuitem"
+            tabIndex={0}
+            onMouseDown={e => { e.preventDefault(); e.stopPropagation(); item.action(); onClose() }}
+            onKeyDown={e => { if (e.key === "Enter" || e.key === " ") { item.action(); onClose() } }}
+          >
+            <span className="ctx-item-icon" aria-hidden="true">{item.icon}</span>
+            <span className="ctx-item-label">{item.label}</span>
+            {item.badge && <span className="ctx-item-badge">{item.badge}</span>}
+            {item.hint  && <span className="ctx-item-hint">{item.hint}</span>}
           </div>
         )
-      )}
+      })}
     </div>
   )
 }
@@ -1048,7 +1678,25 @@ function AlbumBubbleWrapper({ msgs, isMe, isGroup, onMediaClick, openMedia, onRe
   }, [isMe, handleReply])
   const onMouseUp = useCallback(() => { mouseDown.current = false; mouseStartX.current = null }, [])
 
-  const senderInitial = (first.sender_name || first.sender_jid || "?")[0].toUpperCase()
+  // ── [FIX-LID] Same resolution logic as MessageBubble senderDisplay ──
+  const albumSenderDisplay = (() => {
+    if (!isGroup) return null
+    if (first.sender_name && !first.sender_name.includes("@")) return first.sender_name
+    const jidRaw = first.sender_jid || ""
+    const isLid  = jidRaw.endsWith("@lid")
+    const user   = jidRaw.includes("@") ? jidRaw.split("@")[0].split(":")[0] : jidRaw
+    if (/^\d{6,}$/.test(user)) return `+${user}`
+    if (isLid) {
+      const num = user.replace(/\D/g, "")
+      return `~${num.length > 6 ? num.slice(-6) : num}`
+    }
+    if (first.sender_name?.includes("@")) {
+      const u = first.sender_name.split("@")[0].split(":")[0]
+      if (/^\d{6,}$/.test(u)) return `+${u}`
+    }
+    return first.sender_name || user || null
+  })()
+  const senderInitial = (albumSenderDisplay || "?")[0].toUpperCase()
   const caption = msgs.map(m => m.body).filter(Boolean).join(" · ")
   return (
     <div ref={wrapRef} className={`msg-row-wrap ${isMe ? "me" : "them"}${swiping ? " swiping" : ""}`}
@@ -1061,7 +1709,7 @@ function AlbumBubbleWrapper({ msgs, isMe, isGroup, onMediaClick, openMedia, onRe
       </button>
 
       <div className={`msg-row${isMe ? " me" : " them"}${highlighted ? " highlighted" : ""}`} style={{ flex: 1, minWidth: 0 }}>
-        {!isMe && isGroup && first.sender_name && <div className="msg-sender-name">{first.sender_name}</div>}
+        {!isMe && isGroup && albumSenderDisplay && <div className="msg-sender-name">{albumSenderDisplay}</div>}
         <div className={`msg-inner${isMe ? " me" : ""}`}>
           {!isMe && isGroup && (
             <div className="msg-mini-avatar" aria-hidden="true" style={{ background: "#1565c0", flexShrink: 0 }}>
@@ -1100,18 +1748,49 @@ export default function MessageBubble({ msg, onReply, onScrollToMsg, onMediaClic
   const hasNoPad = NO_PAD_TYPES.has(t)
   const hasQuoted = !!(msg.quoted_id || msg.quoted_body || msg.quoted_sender)
 
-  // [FIX-7] For group messages, prefer phone number from JID over sender_name
+  // ── [FIX-LID] Resolve group sender display name
+  // Priority: saved name → push_name → phone from JID → partial fallback
+  // NEVER show raw @lid JID or weird numeric IDs in UI
   const senderDisplay = (() => {
-    if (!isGroup) return msg.sender_name
+    if (!isGroup) return msg.sender_name || null
+
+    // 1. Best case: we have a real contact name or pushname
+    if (msg.sender_name && !msg.sender_name.includes("@")) {
+      return msg.sender_name
+    }
+
+    // 2. Derive from sender_jid — at this point jid should already be resolved
+    //    by DB query (clid join) to @s.whatsapp.net if it was @lid
     const jidRaw = msg.sender_jid || ""
-    const user = jidRaw.includes("@") ? jidRaw.split("@")[0].split(":")[0] : ""
+    const isLid  = jidRaw.endsWith("@lid")
+    const user   = jidRaw.includes("@")
+      ? jidRaw.split("@")[0].split(":")[0]
+      : jidRaw
+
+    // Pure phone number (unsaved contact) → show as +phone
     if (/^\d{6,}$/.test(user)) return `+${user}`
+
+    // Still a raw @lid (shouldn't happen after DB fix, but safety fallback)
+    if (isLid) {
+      const numericPart = user.replace(/\D/g, "")
+      if (numericPart.length >= 6) return `+${numericPart}`
+      return msg.sender_name || `~${user.slice(0, 10)}`
+    }
+
+    // sender_name with @ is a leaked JID — try to extract phone
+    if (msg.sender_name?.includes("@")) {
+      const u = msg.sender_name.split("@")[0].split(":")[0]
+      if (/^\d{6,}$/.test(u)) return `+${u}`
+    }
+
     return msg.sender_name || user || "?"
   })()
   const senderInitial = (senderDisplay || msg.sender_jid || "?")[0].toUpperCase()
   const [highlighted, setHighlighted] = useState(false)
   const [swiping, setSwiping] = useState(false)
   const [ctxMenu, setCtxMenu] = useState(null)
+  const [rawViewer,  setRawViewer]  = useState(false)
+  const [devEvalOpen, setDevEvalOpen] = useState(false)
   const swipeStartX = useRef(null)
   const swipeTriggered = useRef(false)
   const wrapRef = useRef(null)
@@ -1156,21 +1835,191 @@ export default function MessageBubble({ msg, onReply, onScrollToMsg, onMediaClic
     return msg.body || "Pesan"
   }
 
+  // ── WhatsApp-style context menu — matches screenshot exactly ──────────────
+  // Icons: SVG Heroicons/Lucide matching WA's own iconography
+  const isStarred  = toBool(msg.starred)
+  const hasBodyTxt = !!(msg.body || t === "conversation" || t === "extendedTextMessage")
+  const hasDownloadedMedia = toBool(msg.has_media) && !!msg.media_saved_path
+
   const ctxItems = [
-    { icon: <ReplyIcon />, label: "Balas", action: handleReply },
+    // ── Reply ───────────────────────────────────────────────
+    {
+      icon: (
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <polyline points="9 17 4 12 9 7"/>
+          <path d="M20 18v-2a4 4 0 0 0-4-4H4"/>
+        </svg>
+      ),
+      label: "Reply",
+      action: handleReply,
+    },
+
+    // ── Copy (text only) ────────────────────────────────────
+    ...(hasBodyTxt ? [{
+      icon: (
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+          <rect x="9" y="9" width="13" height="13" rx="2"/>
+          <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+        </svg>
+      ),
+      label: "Copy",
+      action: () => navigator.clipboard?.writeText(msg.body || getPreviewText()),
+    }] : []),
+
+    // ── React ───────────────────────────────────────────────
+    {
+      icon: (
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+          <circle cx="12" cy="12" r="10"/>
+          <path d="M8 14s1.5 2 4 2 4-2 4-2"/>
+          <line x1="9" y1="9" x2="9.01" y2="9" strokeWidth="3"/>
+          <line x1="15" y1="9" x2="15.01" y2="9" strokeWidth="3"/>
+        </svg>
+      ),
+      label: "React",
+      action: () => {
+        // TODO: open emoji picker — placeholder shows toast for now
+        console.log("[WaPlus] React picker: not yet implemented")
+      },
+    },
+
+    // ── Forward ─────────────────────────────────────────────
+    {
+      icon: (
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+          <polyline points="15 17 20 12 15 7"/>
+          <path d="M4 18v-2a4 4 0 0 1 4-4h12"/>
+        </svg>
+      ),
+      label: "Forward",
+      action: () => window.api?.forwardMessage?.({ id: msg.id, chatJid: msg.chat_jid }),
+    },
+
+    // ── Pin ─────────────────────────────────────────────────
+    {
+      icon: (
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+          <line x1="12" y1="17" x2="12" y2="22"/>
+          <path d="M5 17h14v-1.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V6h1a2 2 0 0 0 0-4H8a2 2 0 0 0 0 4h1v4.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24Z"/>
+        </svg>
+      ),
+      label: "Pin",
+      action: () => window.api?.pinMessage?.({ id: msg.id, chatJid: msg.chat_jid }),
+    },
+
+    // ── Star / Unstar ───────────────────────────────────────
+    {
+      icon: (
+        <svg width="16" height="16" viewBox="0 0 24 24"
+          fill={isStarred ? "currentColor" : "none"}
+          stroke="currentColor" strokeWidth="2" strokeLinecap="round"
+          style={{ color: isStarred ? "#f59e0b" : undefined }}>
+          <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>
+        </svg>
+      ),
+      label: isStarred ? "Unstar" : "Star",
+      action: () => window.api?.starMessage?.({ id: msg.id, chatJid: msg.chat_jid, star: !isStarred }),
+    },
+
     "divider",
-    { icon: "📋", label: "Salin", action: () => navigator.clipboard?.writeText(msg.body || getPreviewText()) },
-    ...(hasQuoted && onScrollToMsg ? [{ icon: "⬆", label: "Lihat pesan dikutip", action: () => onScrollToMsg(msg.quoted_id) }] : []),
+
+    // ── View Quoted (conditional) ────────────────────────────
+    ...(hasQuoted && onScrollToMsg ? [{
+      icon: (
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+          <polyline points="9 14 4 9 9 4"/>
+          <path d="M20 20v-7a4 4 0 0 0-4-4H4"/>
+        </svg>
+      ),
+      label: "View Quoted",
+      action: () => onScrollToMsg(msg.quoted_id),
+    }] : []),
+
+    // ── Save Media (conditional) ─────────────────────────────
+    ...(hasDownloadedMedia ? [{
+      icon: (
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+          <polyline points="7 10 12 15 17 10"/>
+          <line x1="12" y1="15" x2="12" y2="3"/>
+        </svg>
+      ),
+      label: "Save Media",
+      action: () => window.api?.saveFile?.({ path: msg.media_saved_path }),
+    }] : []),
+
+    "divider",
+
+    // ── View Raw JSON ────────────────────────────────────────
+    {
+      icon: (
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round">
+          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+          <polyline points="14 2 14 8 20 8"/>
+          <line x1="16" y1="13" x2="8" y2="13"/>
+          <line x1="16" y1="17" x2="8" y2="17"/>
+          <polyline points="10 9 9 9 8 9"/>
+        </svg>
+      ),
+      label: "View Raw JSON",
+      raw: true,
+      hint: "JSON",
+      action: () => setRawViewer(true),
+    },
+
+    // ── Dev Eval — Baileys Sandbox ───────────────────────────
+    {
+      icon: (
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round">
+          <polyline points="16 18 22 12 16 6"/>
+          <polyline points="8 6 2 12 8 18"/>
+        </svg>
+      ),
+      label: "Dev Eval",
+      raw: true,
+      hint: "JS",
+      action: () => setDevEvalOpen(true),
+    },
+
+    "divider",
+
+    // ── Report ─────────────────────────────────────────────
+    {
+      icon: (
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+          <path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/>
+          <line x1="4" y1="22" x2="4" y2="15"/>
+        </svg>
+      ),
+      label: "Report",
+      danger: true,
+      action: () => window.api?.reportMessage?.({ id: msg.id, chatJid: msg.chat_jid }),
+    },
+
+    // ── Delete ──────────────────────────────────────────────
+    {
+      icon: (
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+          <polyline points="3 6 5 6 21 6"/>
+          <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/>
+          <line x1="10" y1="11" x2="10" y2="17"/>
+          <line x1="14" y1="11" x2="14" y2="17"/>
+        </svg>
+      ),
+      label: "Delete",
+      danger: true,
+      action: () => window.api?.deleteMessage?.({ id: msg.id, chatJid: msg.chat_jid }),
+    },
   ]
 
   // Reaction float display
   if (isReaction) {
     const emoji = msg.body || msg.reaction_emoji || "❤️"
     return (
-      <div ref={wrapRef} style={{ display: "flex", justifyContent: isMe ? "flex-end" : "flex-start", padding: "1px 14px", userSelect: "none" }}>
+      <div ref={wrapRef} style={{ display: "flex", justifyContent: isMe ? "flex-end" : "flex-start", padding: "1px 14px", userSelect: "none" }} onContextMenu={onContextMenu}>
         <div style={{ display: "flex", flexDirection: "column", alignItems: isMe ? "flex-end" : "flex-start", gap: 2 }}>
-          {!isMe && isGroup && msg.sender_name && <div style={{ fontSize: 11, color: "var(--text-3)", paddingLeft: 2 }}>{msg.sender_name}</div>}
-          <div title={`Reaksi • ${msg.sender_name || (isMe ? "Kamu" : "Mereka")}`}
+          {!isMe && isGroup && senderDisplay && <div style={{ fontSize: 11, color: "var(--text-3)", paddingLeft: 2 }}>{senderDisplay}</div>}
+          <div title={`Reaksi • ${senderDisplay || (isMe ? "Kamu" : "Mereka")}`}
             style={{ fontSize: 28, lineHeight: 1, cursor: "default", filter: "drop-shadow(0 1px 3px rgba(0,0,0,0.4))", transition: "transform 0.12s" }}
             onMouseEnter={e => { e.currentTarget.style.transform = "scale(1.18)" }}
             onMouseLeave={e => { e.currentTarget.style.transform = "scale(1)" }}>
@@ -1181,6 +2030,9 @@ export default function MessageBubble({ msg, onReply, onScrollToMsg, onMediaClic
             {isMe && <span style={{ marginLeft: 3, opacity: 0.7 }}>{Number(msg.status) >= 3 ? "✓✓" : "✓"}</span>}
           </div>
         </div>
+        {ctxMenu && <ContextMenu x={ctxMenu.x} y={ctxMenu.y} items={ctxItems} onClose={() => setCtxMenu(null)} />}
+        {rawViewer  && <RawViewerModal msg={msg} onClose={() => setRawViewer(false)} />}
+      {devEvalOpen && <DevEvalModal  msg={msg} onClose={() => setDevEvalOpen(false)} />}
       </div>
     )
   }
@@ -1196,6 +2048,8 @@ export default function MessageBubble({ msg, onReply, onScrollToMsg, onMediaClic
       </button>
 
       {ctxMenu && <ContextMenu x={ctxMenu.x} y={ctxMenu.y} items={ctxItems} onClose={() => setCtxMenu(null)} />}
+      {rawViewer  && <RawViewerModal msg={msg} onClose={() => setRawViewer(false)} />}
+      {devEvalOpen && <DevEvalModal  msg={msg} onClose={() => setDevEvalOpen(false)} />}
 
       <div className={`msg-row${isMe ? " me" : " them"}${highlighted ? " highlighted" : ""}`} onContextMenu={onContextMenu} style={{ flex: 1, minWidth: 0 }}>
         {!isMe && isGroup && senderDisplay && <div className="msg-sender-name">{senderDisplay}</div>}
@@ -1209,7 +2063,7 @@ export default function MessageBubble({ msg, onReply, onScrollToMsg, onMediaClic
             <div className={bubbleClass} style={{ position: "relative" }}>
               {isForwarded && <ForwardBadge score={msg.forwarding_score} />}
               {hasQuoted && (
-                <QuotedMsg body={msg.quoted_body} sender={msg.quoted_sender} type={msg.quoted_type} hasMedia={toBool(msg.quoted_has_media)} mimetype={msg.quoted_mimetype}
+                <QuotedMsg body={msg.quoted_body} sender={msg.quoted_sender} senderName={msg.quoted_sender_name} type={msg.quoted_type} hasMedia={toBool(msg.quoted_has_media)} mimetype={msg.quoted_mimetype}
                   onClick={() => onScrollToMsg && msg.quoted_id && onScrollToMsg(msg.quoted_id)}
                   quotedFromMe={msg.quoted_sender === "__me__"} />
               )}

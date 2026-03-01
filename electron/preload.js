@@ -87,6 +87,7 @@ contextBridge.exposeInMainWorld("api", {
   dbReactions: ({ jid }) =>
     ipcRenderer.invoke("db:reactions:list", { jid }),
   dbBackfillPreviews: () => ipcRenderer.invoke("db:backfill:previews"),
+  dbMessageRaw: ({ id }) => ipcRenderer.invoke("db:messages:raw", { id }),
 
   // Message events
   onNewMessage: createListener("db:messages:new"),
@@ -102,6 +103,8 @@ contextBridge.exposeInMainWorld("api", {
   // FIX: Event baru — dipanggil main.js setelah media berhasil didownload
   // Renderer listen ini untuk update image bubble secara realtime
   onMediaUpdated: createListener("media:updated"),
+  onMediaDownloadStart: createListener("media:download:start"),
+  onMediaDownloadError: createListener("media:download:error"),
 
   // [PREFETCH] Trigger background media download for a chat (fire-and-forget)
   // Call this when a chat scrolls into view or is clicked.
@@ -178,6 +181,13 @@ contextBridge.exposeInMainWorld("api", {
   triggerEmojiPicker: ()              => ipcRenderer.invoke("ui:emoji-picker"),
   // [F3] Mark messages read via Baileys sock.readMessages
   markMessagesRead: ({ jid, msgIds }) => ipcRenderer.invoke("msg:mark-read", { jid, msgIds }),
+
+  // ══════════════════════════════════════════════════════════
+  // DEV EVAL — Baileys Sandbox
+  // mode: "expr" | "block"
+  // ══════════════════════════════════════════════════════════
+  devEval: (opts) => ipcRenderer.invoke("dev:eval", { mode: "expr", ...opts }),
+  saveFile: ({ content, filename }) => ipcRenderer.invoke("dev:save-file", { content, filename }),
 })
 // NOTE: Below lines injected by fix script — appended separately
 // These are added to window.api via contextBridge above, but since the file

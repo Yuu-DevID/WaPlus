@@ -79,14 +79,34 @@ export default function Main() {
     loadContacts()
     if (!window.api) return
 
-    // Connection events
-    window.api.onConnected?.(()    => setConnStatus("connected"))
-    window.api.onReconnecting?.(() => setConnStatus("reconnecting"))
-    window.api.onConnectionClose?.((data) => {
-      if (data?.willReconnect) setConnStatus("reconnecting")
-      else setConnStatus("failed")
+    // ── Connection events ──────────────────────────────────────
+    // FIX: Track actual connection state — prevent stuck "Menghubungkan" loop
+    // connection:open  → always means connected (reset any reconnecting state)
+    // connection:reconnecting → only show if not yet connected
+    // connection:close → only go to reconnecting if willReconnect flag set
+    window.api.onConnected?.((data) => {
+      setConnStatus("connected")
     })
+
+    window.api.onReconnecting?.((data) => {
+      // Only show reconnecting if we are NOT currently connected
+      // This prevents the UI flickering to "reconnecting" on transient events
+      setConnStatus(prev => prev === "connected" ? prev : "reconnecting")
+    })
+
+    window.api.onConnectionClose?.((data) => {
+      // willReconnect means baileys will retry — show reconnecting
+      // otherwise show failed
+      if (data?.statusCode === 428 || data?.statusCode === 440) {
+        // These codes mean: session mismatch / phone disconnected — fatal
+        setConnStatus("failed")
+      } else {
+        setConnStatus("reconnecting")
+      }
+    })
+
     window.api.onConnectionFailed?.(() => setConnStatus("failed"))
+    window.api.onConnectionError?.(() => setConnStatus(prev => prev === "connected" ? "connected" : "failed"))
 
     // Sync status (progressive Baileys sync indicator)
     window.api.onSyncStatus?.((d) => {

@@ -15,7 +15,7 @@
 
 "use strict"
 
-const { getContentType, jidNormalizedUser, isJidGroup } = require("baileys")
+const { getContentType, jidNormalizedUser, isJidGroup } = require("wileys")
 
 // ════════════════════════════════════════════════════════════
 // JID NORMALIZATION — single gate for ALL JIDs entering the system
@@ -153,6 +153,114 @@ function formatJidAsPhone(jid) {
 
   return user
 }
+
+/**
+ * decodeJid — decode JID to normalized form, compatible with Baileys dims.decodeJid().
+ * Strips multi-device suffix and normalizes server.
+ * Used in smsg-style message enrichment (from myfunc.js / case.js pattern).
+ *
+ * @param {string} jid
+ * @returns {string}
+ */
+function decodeJid(jid) {
+  if (!jid) return ''
+  if (/:d+@/.test(jid)) {
+    // Strip device suffix: 628xxx:5@s.whatsapp.net → 628xxx@s.whatsapp.net
+    const [user, rest] = jid.split(':')
+    const server = rest?.split('@')[1] || 's.whatsapp.net'
+    return normalizeJid(user + '@' + server)
+  }
+  return normalizeJid(jid)
+}
+
+/**
+ * getJidDisplayPhone — human-readable phone from JID for display in UI.
+ * Returns "+628xxx" for phone JIDs, group subject placeholder for groups.
+ */
+function getJidDisplayPhone(jid) {
+  const n = normalizeJid(jid)
+  if (!n) return ''
+  const [user, server] = n.split('@')
+  if (server === 'g.us') return ''   // group — use group name instead
+  if (server === 'lid') return '+' + user  // unresolved lid fallback
+  return /^d+$/.test(user) ? '+' + user : user
+}
+
+/**
+ * enrichMessage — smsg()-style enrichment of a parsed flat message object.
+ * Adds computed helper fields that case.js / bot handlers rely on.
+ *
+ * Call this after parseMessage() if you need the bot-style fields.
+ * This is optional — WaPlus doesn't need all bot fields, but having them
+ * makes it easy to port bot commands or mod plugins.
+ *
+ * Inspired by smsg() in myfunc.js and the case.js handler pattern.
+ *
+ * @param {object} parsed - Output of parseMessage()
+ * @param {object} opts
+ * @param {string} opts.myJid       - Our own JID (normalized)
+ * @param {Map}    opts.lidMap      - lid → real JID map
+ * @returns {object} - Same object, mutated with extra fields
+ */
+function enrichMessage(parsed, opts = {}) {
+  if (!parsed) return parsed
+
+  const myJid = opts.myJid ? normalizeJid(opts.myJid) : null
+  const lidMap = opts.lidMap || null
+
+  // ── isGroup / isMe already set by parseMessage ──────────
+  // These are the bot-style boolean versions (vs 0/1 integers)
+  parsed.isGroup   = parsed.is_group === 1
+  parsed.fromMe    = parsed.from_me === 1
+  parsed.hasMedia  = parsed.has_media === 1
+  parsed.isGif     = parsed.is_gif === 1
+  parsed.isPtt     = parsed.is_ptt === 1
+  parsed.isViewOnce = parsed.is_view_once === 1
+  parsed.isForwarded = parsed.is_forwarded === 1
+  parsed.isBaileys = parsed.id
+    ? (parsed.id.startsWith('BAE5') && parsed.id.length === 16)
+    : false
+
+  // ── Sender display ────────────────────────────────────────
+  // Follow case.js pattern: senderNumber, senderJid
+  const rawSender = parsed.sender_jid || ''
+  const resolvedSender = (isLidJid(rawSender) && lidMap)
+    ? resolveLid(rawSender, lidMap)
+    : rawSender
+  parsed.sender        = resolvedSender                    // full normalized JID
+  parsed.senderNumber  = resolvedSender.split('@')[0]      // numeric part
+  parsed.senderDisplay = parsed.pushname || getJidDisplayPhone(resolvedSender) || resolvedSender
+
+  // ── isBot — sender is our own account ─────────────────────
+  if (myJid) {
+    parsed.isBot     = normalizeJid(resolvedSender) === normalizeJid(myJid)
+    parsed.itsMeYumi = parsed.isBot  // bot-style alias
+  }
+
+  // ── Message type helpers (case.js style) ─────────────────
+  const t = parsed.msg_type || 'conversation'
+  parsed.type = t
+  parsed.isImage    = t === 'imageMessage'
+  parsed.isVideo    = t === 'videoMessage'
+  parsed.isAudio    = t === 'audioMessage' || t === 'pttMessage'
+  parsed.isSticker  = t === 'stickerMessage'
+  parsed.isDocument = t === 'documentMessage'
+  parsed.isText     = t === 'conversation' || t === 'extendedTextMessage'
+  parsed.isPoll     = t === 'pollCreationMessage'
+  parsed.isReaction = t === 'reactionMessage'
+  parsed.isLocation = t === 'locationMessage' || t === 'liveLocationMessage'
+  parsed.isContact  = t === 'contactMessage' || t === 'contactsArrayMessage'
+
+  // ── Quoted detection (case.js style) ─────────────────────
+  parsed.isQuotedImage    = !!(parsed.quoted_type === 'imageMessage')
+  parsed.isQuotedVideo    = !!(parsed.quoted_type === 'videoMessage')
+  parsed.isQuotedAudio    = !!(parsed.quoted_type === 'audioMessage' || parsed.quoted_type === 'pttMessage')
+  parsed.isQuotedSticker  = !!(parsed.quoted_type === 'stickerMessage')
+  parsed.isQuotedDocument = !!(parsed.quoted_type === 'documentMessage')
+
+  return parsed
+}
+
 
 // normalizeJid is exported at the bottom with all other exports
 
@@ -707,6 +815,23 @@ function extractMediaInfo(message, msgType) {
 
   if (!mediaObj) return null
 
+  // ── jpegThumbnail → base64 data URL ──────────────────────────────────────
+  // WhatsApp embeds a low-res JPEG preview in every media message.
+  // Surfaced as a ready-to-use data: URI so the renderer can show an
+  // instant placeholder without waiting for the full media download.
+  let thumbnailDataUrl = null
+  const rawThumb = mediaObj.jpegThumbnail
+  if (rawThumb && rawThumb.length > 0) {
+    try {
+      const buf = Buffer.isBuffer(rawThumb) ? rawThumb : Buffer.from(rawThumb)
+      if (buf.length > 0) {
+        const isWebp = buf[0] === 0x52 && buf[1] === 0x49 // RIFF = webp
+        const thumbMime = isWebp ? 'image/webp' : 'image/jpeg'
+        thumbnailDataUrl = 'data:' + thumbMime + ';base64,' + buf.toString('base64')
+      }
+    } catch (_) {}
+  }
+
   return {
     actualType,
     mimetype: mediaObj.mimetype || null,
@@ -715,14 +840,14 @@ function extractMediaInfo(message, msgType) {
     fileName: mediaObj.fileName || null,
     width: mediaObj.width || null,
     height: mediaObj.height || null,
-    // URL dari WA CDN (sementara, bisa expired)
     url: mediaObj.url || null,
-    // Direct path tidak ada — akan diisi setelah download
-    mediaKey: mediaObj.mediaKey ? Buffer.from(mediaObj.mediaKey).toString("base64") : null,
+    mediaKey: mediaObj.mediaKey ? Buffer.from(mediaObj.mediaKey).toString('base64') : null,
+    // [INSTANT-THUMB] Low-res data: URI for immediate rendering before full download
+    thumbnailDataUrl,
     isAnimated: mediaObj.isAnimated || false,
-    isPtt: actualType === "pttMessage",
-    isGif: msgType === "videoMessage" && (mediaObj.gifPlayback === true),
-    isViewOnce: msgType === "viewOnceMessage" || msgType === "viewOnceMessageV2",
+    isPtt: actualType === 'pttMessage',
+    isGif: msgType === 'videoMessage' && (mediaObj.gifPlayback === true),
+    isViewOnce: msgType === 'viewOnceMessage' || msgType === 'viewOnceMessageV2',
   }
 }
 
@@ -1232,6 +1357,10 @@ function parseMessage(msg, opts = {}) {
     is_ptt: mediaInfo?.isPtt ? 1 : 0,
     is_gif: mediaInfo?.isGif ? 1 : 0,
     is_view_once: mediaInfo?.isViewOnce ? 1 : 0,
+    // [INSTANT-THUMB] Embedded JPEG/WebP thumbnail as data: URI.
+    // Renderer can use this immediately — no file download required.
+    // Example: <img src={media_thumbnail_b64} /> renders before full download.
+    media_thumbnail_b64: mediaInfo?.thumbnailDataUrl || null,
 
     // ── Reply/Quoted ───────────────────────────────────
     quoted_id: quoted?.id || null,
@@ -1352,7 +1481,7 @@ function buildRendererPayload(parsed) {
     id: parsed.id,
     chat_jid: parsed.chat_jid,
     sender_jid: parsed.sender_jid,
-    sender_name: parsed.pushname,
+    sender_name: parsed._resolved_sender_name || parsed.pushname || null,
     is_group: parsed.is_group,
     from_me: parsed.from_me,
 
@@ -1371,10 +1500,12 @@ function buildRendererPayload(parsed) {
     is_ptt: parsed.is_ptt,
     is_gif: parsed.is_gif,
     is_view_once: parsed.is_view_once,
+    media_thumbnail_b64: parsed.media_thumbnail_b64,
 
     quoted_id: parsed.quoted_id,
     quoted_body: parsed.quoted_body,
     quoted_sender: parsed.quoted_sender,
+    quoted_sender_name: parsed._resolved_quoted_sender_name || null,
     quoted_type: parsed.quoted_type,
     quoted_has_media: parsed.quoted_has_media,
 
@@ -1475,6 +1606,9 @@ module.exports = {
   tryResolveLid,
   buildLidMap,
   formatJidAsPhone,
+  decodeJid,           // Baileys dims.decodeJid() compatible helper
+  getJidDisplayPhone,  // Human-readable phone from JID
+  enrichMessage,       // smsg()-style message enrichment (bot/mod helpers)
 
   // Utils yang mungkin dibutuhkan di tempat lain
   getRealContentType,

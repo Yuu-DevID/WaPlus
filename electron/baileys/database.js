@@ -655,11 +655,20 @@ const statements = {
             msg.id,
             msg.remote_jid              AS chat_jid,
             msg.from_me,
-            msg.participant             AS sender_jid,
-            -- [FIX-SENDER-NAME] For group msgs: prefer phonebook name > push_name
-            -- For DM from_me=1: c is NULL (participant=NULL), so sender_name = push_name = ours
-            -- For DM from_me=0: c.name = their phonebook name
-            COALESCE(c.name, c.push_name, msg.push_name) AS sender_name,
+            -- [FIX-LID-SENDER-JID] For @lid participants: resolve to real JID via clid join.
+            -- NEVER return raw @lid to the renderer.
+            CASE
+                WHEN msg.participant IS NULL THEN NULL
+                WHEN msg.participant NOT LIKE '%@lid' THEN msg.participant
+                WHEN clid.jid IS NOT NULL THEN clid.jid
+                -- Fallback: strip @lid suffix and treat user part as phone number
+                ELSE SUBSTR(msg.participant, 1, INSTR(msg.participant, '@') - 1) || '@s.whatsapp.net'
+            END AS sender_jid,
+            -- [FIX-SENDER-NAME] Priority:
+            --   1. Phonebook name from contacts (c.name / clid.name)
+            --   2. Push name from contacts (c.push_name / clid.push_name)
+            --   3. Push name stored with message (msg.push_name)
+            COALESCE(c.name, clid.name, c.push_name, clid.push_name, msg.push_name) AS sender_name,
             msg.message_type            AS msg_type,
             msg.body,
             msg.message_timestamp       AS timestamp,
@@ -675,17 +684,37 @@ const statements = {
             msg.poll_options,
             msg.poll_votes,
             msg.context_stanza_id       AS quoted_id,
-            -- [FIX-QUOTED-SENDER] Return raw JID — chat.js resolveQuotedSender handles display.
-            -- Untuk DMs: context_participant NULL, jadi pakai remote_jid sebagai sender
-            -- saat ada quoted msg dan msg BUKAN from_me (lawan bicara quote kita atau reply).
-            -- Sentinel __self__ di-emit saat from_me=1 ada quote (kita quote seseorang).
+            -- [FIX-QUOTED-SENDER] NEVER expose raw @lid.
+            -- Resolution order:
+            --   @lid + clid match  -> real @s.whatsapp.net JID
+            --   @lid + no match    -> convert user part to @s.whatsapp.net (shows as +number in UI)
+            --   normal participant -> use as-is
+            --   no participant (group) -> NULL
+            --   DM self-quote      -> __self__
+            --   DM other-quote     -> remote_jid
             CASE
-                WHEN msg.context_participant IS NOT NULL THEN msg.context_participant
+                WHEN msg.context_participant IS NOT NULL AND msg.context_participant LIKE '%@lid'
+                    AND clid.jid IS NOT NULL
+                    THEN clid.jid
+                WHEN msg.context_participant IS NOT NULL AND msg.context_participant LIKE '%@lid'
+                    THEN SUBSTR(msg.context_participant, 1, INSTR(msg.context_participant, '@') - 1) || '@s.whatsapp.net'
+                WHEN msg.context_participant IS NOT NULL
+                    THEN msg.context_participant
                 WHEN msg.context_stanza_id IS NULL THEN NULL
                 WHEN msg.remote_jid LIKE '%@g.us' THEN NULL
                 WHEN msg.from_me = 1 THEN '__self__'
                 ELSE msg.remote_jid
             END AS quoted_sender,
+            -- [FIX-QUOTED-NAME] Resolved display name for quoted sender (for QuotedMsg component)
+            CASE
+                WHEN msg.context_participant IS NULL THEN NULL
+                WHEN msg.context_participant LIKE '%@lid' AND clid.jid IS NOT NULL
+                    THEN COALESCE(clid.name, clid.push_name)
+                WHEN msg.context_participant LIKE '%@lid'
+                    THEN NULL
+                ELSE
+                    (SELECT COALESCE(name, push_name) FROM contacts WHERE jid = msg.context_participant LIMIT 1)
+            END AS quoted_sender_name,
             msg.context_quoted_message  AS quoted_body,
             msg.context_mentioned_jids  AS mentioned_jids,
             msg.context_is_forwarded    AS is_forwarded,
@@ -695,9 +724,10 @@ const statements = {
             msg.reaction_target_id,
             CASE WHEN msg.remote_jid LIKE '%@g.us' THEN 1 ELSE 0 END AS is_group
         FROM messages msg
-        -- Sender contact join (group member or DM opponent)
+        -- Non-lid participant direct join
         LEFT JOIN contacts c    ON c.jid = msg.participant
-        -- [FIX-LID] Also try matching participant @lid via number
+                                AND msg.participant NOT LIKE '%@lid'
+        -- [FIX-LID] Resolve @lid -> real JID: strip @lid suffix, append @s.whatsapp.net
         LEFT JOIN contacts clid ON msg.participant LIKE '%@lid'
                                 AND clid.jid = SUBSTR(msg.participant, 1, INSTR(msg.participant, '@') - 1) || '@s.whatsapp.net'
         WHERE msg.remote_jid = ? AND msg.is_deleted = 0
@@ -705,7 +735,7 @@ const statements = {
         LIMIT ? OFFSET ?
     `),
 
-    // [FIX-6] Ganti named @jid/@query → positional ? ?
+    // [FIX-6] Ganti named @jid/@query -> positional ? ?
     searchMessages: db.prepare(`
         SELECT * FROM messages
         WHERE remote_jid = ? AND body LIKE ? AND is_deleted = 0
@@ -906,7 +936,7 @@ const statements = {
             -- [FIX-SENDER-NAME] For group msgs: show sender name of last message
             CASE
                 WHEN COALESCE(m.from_me, 0) = 1 THEN NULL
-                WHEN c.is_group = 1 THEN COALESCE(msender.name, msender.push_name, m.push_name)
+                WHEN c.is_group = 1 THEN COALESCE(msender.name, msender.push_name, msenderlid.name, msenderlid.push_name, m.push_name)
                 ELSE NULL
             END AS last_sender_name
         FROM chats c
@@ -915,7 +945,12 @@ const statements = {
         LEFT JOIN contacts ctlid   ON c.jid LIKE '%@lid'
                                    AND ctlid.jid = SUBSTR(c.jid, 1, INSTR(c.jid, '@') - 1) || '@s.whatsapp.net'
         LEFT JOIN messages m       ON m.id   = c.last_message_id
+        -- Direct participant join (non-lid)
         LEFT JOIN contacts msender ON msender.jid = m.participant
+                                   AND m.participant NOT LIKE '%@lid'
+        -- [FIX-LID] Resolve @lid participants to real JID for sender name
+        LEFT JOIN contacts msenderlid ON m.participant LIKE '%@lid'
+                                      AND msenderlid.jid = SUBSTR(m.participant, 1, INSTR(m.participant, '@') - 1) || '@s.whatsapp.net'
         WHERE
             -- [FIX-DEDUP-LID] Exclude @lid rows when @s.whatsapp.net row exists
             NOT (
@@ -955,6 +990,7 @@ const statements = {
 
     // [FIX-5] Ganti @limit/@offset → positional ? ?
     getContacts: db.prepare('SELECT * FROM contacts ORDER BY COALESCE(name, push_name, jid) ASC LIMIT ? OFFSET ?'),
+    getContactByJid: db.prepare('SELECT jid, name, push_name, short_name FROM contacts WHERE jid = ? LIMIT 1'),
 
     // [FIX-7] Ganti @query → positional 4x ? untuk name/push_name/number/jid
     searchContacts: db.prepare(`
@@ -1943,6 +1979,7 @@ const database = {
     // [FIX-5] Positional params
     getContacts:      (limit = 100, offset = 0) => statements.getContacts.all(limit, offset),
     getContactCount:  ()                         => (db.prepare('SELECT COUNT(*) as n FROM contacts').get()?.n) || 0,
+    getContact:       (jid) => statements.getContactByJid.get(jid) || null,
 
     // [FIX-7] Positional 4-param search
     searchContacts(query) {

@@ -275,44 +275,204 @@ export default function MediaViewer() {
     )
   }
 
-  // ── Video Display Component ──
+  // ── Video Display Component — Full Custom Controls ──
   function VideoDisplay({ src }) {
     const [ready, setReady] = useState(false)
     const [error, setError] = useState(false)
+    const [playing, setPlaying] = useState(false)
+    const [progress, setProgress] = useState(0)
+    const [elapsed, setElapsed] = useState(0)
+    const [duration, setDuration] = useState(0)
+    const [volume, setVolume] = useState(1)
+    const [muted, setMuted] = useState(false)
+    const [fullscreen, setFullscreen] = useState(false)
+    const [showControls, setShowControls] = useState(true)
+    const [buffering, setBuffering] = useState(false)
+    const videoRef = useRef(null)
+    const containerRef = useRef(null)
+    const rafRef = useRef(null)
+    const hideTimer = useRef(null)
 
-    useEffect(() => { setReady(false); setError(false) }, [src])
+    useEffect(() => { setReady(false); setError(false); setPlaying(false); setProgress(0); setElapsed(0) }, [src])
 
-    if (error) {
-      return (
-        <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 10, color: "rgba(255,255,255,0.5)" }}>
-          <span style={{ fontSize: 48 }}>🎬</span>
-          <span style={{ fontSize: 13 }}>Gagal memuat video</span>
-        </div>
-      )
+    // Auto-hide controls
+    const resetHideTimer = useCallback(() => {
+      setShowControls(true)
+      if (hideTimer.current) clearTimeout(hideTimer.current)
+      hideTimer.current = setTimeout(() => {
+        if (playing) setShowControls(false)
+      }, 2800)
+    }, [playing])
+
+    useEffect(() => { return () => { if (hideTimer.current) clearTimeout(hideTimer.current) } }, [])
+
+    const startRaf = useCallback(() => {
+      const tick = () => {
+        const v = videoRef.current
+        if (!v) return
+        setElapsed(v.currentTime)
+        setProgress(v.currentTime / (v.duration || 1))
+        rafRef.current = requestAnimationFrame(tick)
+      }
+      rafRef.current = requestAnimationFrame(tick)
+    }, [])
+    const stopRaf = useCallback(() => { if (rafRef.current) cancelAnimationFrame(rafRef.current) }, [])
+
+    const togglePlay = useCallback(() => {
+      const v = videoRef.current; if (!v) return
+      if (playing) { v.pause(); stopRaf(); setPlaying(false) }
+      else { v.play().then(() => { setPlaying(true); startRaf() }).catch(() => {}) }
+      resetHideTimer()
+    }, [playing, startRaf, stopRaf, resetHideTimer])
+
+    const handleEnded = useCallback(() => {
+      setPlaying(false); setProgress(0); setElapsed(0); stopRaf()
+      const v = videoRef.current; if (v) v.currentTime = 0
+    }, [stopRaf])
+
+    const handleSeek = useCallback((e) => {
+      const bar = e.currentTarget
+      const rect = bar.getBoundingClientRect()
+      const frac = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width))
+      const v = videoRef.current; if (!v?.duration) return
+      v.currentTime = frac * v.duration
+      setProgress(frac); setElapsed(v.currentTime)
+      resetHideTimer()
+    }, [resetHideTimer])
+
+    const handleVolume = useCallback((e) => {
+      const v = parseFloat(e.target.value)
+      setVolume(v); setMuted(v === 0)
+      if (videoRef.current) { videoRef.current.volume = v; videoRef.current.muted = v === 0 }
+    }, [])
+
+    const toggleMute = useCallback(() => {
+      const next = !muted; setMuted(next)
+      if (videoRef.current) videoRef.current.muted = next
+    }, [muted])
+
+    const toggleFullscreen = useCallback(() => {
+      const el = containerRef.current; if (!el) return
+      if (!document.fullscreenElement) { el.requestFullscreen?.(); setFullscreen(true) }
+      else { document.exitFullscreen?.(); setFullscreen(false) }
+    }, [])
+
+    const skip = useCallback((sec) => {
+      const v = videoRef.current; if (!v) return
+      v.currentTime = Math.max(0, Math.min(v.duration || 0, v.currentTime + sec))
+      resetHideTimer()
+    }, [resetHideTimer])
+
+    const fmtTime = (s) => {
+      if (!s || isNaN(s)) return "0:00"
+      const m = Math.floor(s / 60), ss = Math.floor(s % 60)
+      return `${m}:${ss.toString().padStart(2, "0")}`
     }
 
+    if (error) return (
+      <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 10, color: "rgba(255,255,255,0.5)" }}>
+        <span style={{ fontSize: 48 }}>🎬</span>
+        <span style={{ fontSize: 13 }}>Gagal memuat video</span>
+      </div>
+    )
+
     return (
-      <div style={{ position: "relative", display: "flex", alignItems: "center", justifyContent: "center", width: "100%", height: "100%" }}>
-        {!ready && (
-          <div style={{ position: "absolute", zIndex: 2, display: "flex", flexDirection: "column", alignItems: "center", gap: 10 }}>
-            <div className="spinner" style={{ width: 36, height: 36, borderTopColor: "var(--green)", borderColor: "rgba(37,211,102,.2)" }} />
-            <span style={{ fontSize: 12, color: "rgba(255,255,255,0.4)" }}>Memuat video...</span>
+      <div
+        ref={containerRef}
+        style={{ position: "relative", display: "flex", alignItems: "center", justifyContent: "center", width: "100%", height: "100%", background: "#000", cursor: showControls ? "default" : "none" }}
+        onMouseMove={resetHideTimer}
+        onClick={togglePlay}
+      >
+        {/* Loading spinner */}
+        {(!ready || buffering) && (
+          <div style={{ position: "absolute", zIndex: 4, display: "flex", flexDirection: "column", alignItems: "center", gap: 10, pointerEvents: "none" }}>
+            <div className="spinner" style={{ width: 40, height: 40, borderTopColor: "var(--green)", borderColor: "rgba(37,211,102,.2)" }} />
+            {!ready && <span style={{ fontSize: 12, color: "rgba(255,255,255,0.5)" }}>Memuat video...</span>}
           </div>
         )}
+
         <video
+          ref={videoRef}
           src={src}
-          controls
-          autoPlay
-          onCanPlay={() => setReady(true)}
+          preload="auto"
+          onCanPlay={() => { setReady(true); setBuffering(false) }}
+          onWaiting={() => setBuffering(true)}
+          onPlaying={() => setBuffering(false)}
+          onLoadedMetadata={() => setDuration(videoRef.current?.duration || 0)}
+          onEnded={handleEnded}
           onError={() => setError(true)}
-          style={{
-            maxWidth: "88vw", maxHeight: "78vh",
-            borderRadius: 8,
-            outline: "none",
-            opacity: ready ? 1 : 0,
-            transition: "opacity 0.2s",
-          }}
+          onClick={e => e.stopPropagation()}
+          muted={muted}
+          style={{ maxWidth: "88vw", maxHeight: "78vh", borderRadius: 4, outline: "none", opacity: ready ? 1 : 0, transition: "opacity 0.2s", display: "block" }}
         />
+
+        {/* Big play/pause center overlay */}
+        {ready && !playing && !buffering && (
+          <div style={{ position: "absolute", pointerEvents: "none", zIndex: 3, width: 72, height: 72, borderRadius: "50%", background: "rgba(0,0,0,0.6)", display: "flex", alignItems: "center", justifyContent: "center", backdropFilter: "blur(6px)", border: "2px solid rgba(255,255,255,0.3)" }}>
+            <svg width="28" height="28" viewBox="0 0 24 24" fill="white"><polygon points="8,5 20,12 8,19" /></svg>
+          </div>
+        )}
+
+        {/* Controls overlay */}
+        <div
+          onClick={e => e.stopPropagation()}
+          style={{
+            position: "absolute", bottom: 0, left: 0, right: 0, zIndex: 5,
+            background: "linear-gradient(transparent, rgba(0,0,0,0.85))",
+            padding: "32px 16px 12px",
+            opacity: showControls ? 1 : 0,
+            transition: "opacity 0.25s",
+            pointerEvents: showControls ? "auto" : "none",
+          }}
+        >
+          {/* Progress bar */}
+          <div
+            onClick={handleSeek}
+            style={{ width: "100%", height: 4, background: "rgba(255,255,255,0.2)", borderRadius: 2, cursor: "pointer", marginBottom: 10, position: "relative" }}
+          >
+            <div style={{ width: `${progress * 100}%`, height: "100%", background: "var(--green)", borderRadius: 2, position: "relative", transition: "width 0.1s linear" }}>
+              <div style={{ position: "absolute", right: -6, top: -5, width: 14, height: 14, borderRadius: "50%", background: "white", boxShadow: "0 1px 4px rgba(0,0,0,0.5)" }} />
+            </div>
+          </div>
+
+          {/* Bottom controls row */}
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            {/* Play/Pause */}
+            <button onClick={togglePlay} style={{ background: "none", border: "none", color: "#fff", cursor: "pointer", padding: 4, display: "flex", alignItems: "center" }}>
+              {playing
+                ? <svg width="18" height="18" viewBox="0 0 24 24" fill="white"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>
+                : <svg width="18" height="18" viewBox="0 0 24 24" fill="white"><polygon points="5,3 19,12 5,21"/></svg>
+              }
+            </button>
+            {/* Skip -10 */}
+            <button onClick={() => skip(-10)} title="-10s" style={{ background: "none", border: "none", color: "rgba(255,255,255,0.7)", cursor: "pointer", fontSize: 11, padding: 4 }}>-10s</button>
+            {/* Skip +10 */}
+            <button onClick={() => skip(10)} title="+10s" style={{ background: "none", border: "none", color: "rgba(255,255,255,0.7)", cursor: "pointer", fontSize: 11, padding: 4 }}>+10s</button>
+
+            {/* Time */}
+            <span style={{ fontSize: 12, color: "rgba(255,255,255,0.7)", minWidth: 80 }}>{fmtTime(elapsed)} / {fmtTime(duration)}</span>
+
+            <div style={{ flex: 1 }} />
+
+            {/* Volume */}
+            <button onClick={toggleMute} style={{ background: "none", border: "none", color: "#fff", cursor: "pointer", padding: 4, display: "flex" }}>
+              {muted || volume === 0
+                ? <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/></svg>
+                : <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg>
+              }
+            </button>
+            <input type="range" min={0} max={1} step={0.05} value={muted ? 0 : volume} onChange={handleVolume}
+              style={{ width: 70, accentColor: "var(--green)", cursor: "pointer" }} />
+
+            {/* Fullscreen */}
+            <button onClick={toggleFullscreen} style={{ background: "none", border: "none", color: "#fff", cursor: "pointer", padding: 4, display: "flex" }}>
+              {fullscreen
+                ? <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2"><path d="M8 3v3a2 2 0 0 1-2 2H3m18 0h-3a2 2 0 0 1-2-2V3m0 18v-3a2 2 0 0 1 2-2h3M3 16h3a2 2 0 0 1 2 2v3"/></svg>
+                : <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2"><path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/></svg>
+              }
+            </button>
+          </div>
+        </div>
       </div>
     )
   }

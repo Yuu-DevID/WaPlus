@@ -167,8 +167,17 @@ function MiniTick({ status, fromMe }) {
 function PreviewText({ chat }) {
   const preview = chat.last_msg || ""
   const isGroup = !!(chat.is_group)
-  const senderPrefix = isGroup && chat.last_sender_name && !Number(chat.from_me)
-    ? `${chat.last_sender_name}: `
+  // [FIX-LID] Never show raw JID or @lid in sender prefix
+  const safeSenderName = (() => {
+    const n = chat.last_sender_name
+    if (!n) return null
+    if (!n.includes("@")) return n
+    // It's a JID — extract phone
+    const u = n.split("@")[0].split(":")[0]
+    return /^\d{6,}$/.test(u) ? `+${u}` : u || null
+  })()
+  const senderPrefix = isGroup && safeSenderName && !Number(chat.from_me)
+    ? `${safeSenderName}: `
     : (Number(chat.from_me) ? "Kamu: " : "")
 
   if (!preview) {
