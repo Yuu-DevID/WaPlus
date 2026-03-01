@@ -31,6 +31,7 @@
 import { format } from "date-fns"
 import { useState, useRef, useCallback, useEffect, useMemo, memo } from "react"
 import { prefetchChat } from "../hooks/useMediaPrefetch"
+import { useAppStore } from "../store/app"
 
 // ════════════════════════════════════════════════════════════
 // MODULE-LEVEL CONSTANTS (created once, never re-allocated)
@@ -423,75 +424,22 @@ function ForwardBadge({ score }) {
   )
 }
 
-// ─── Image Lightbox ───────────────────────────────────────────────────────────
-function ImageLightbox({ src, alt, onClose }) {
-  const [imgLoaded, setImgLoaded] = useState(false)
-
-  useEffect(() => {
-    const handler = (e) => { if (e.key === "Escape") onClose() }
-    document.addEventListener("keydown", handler)
-    return () => document.removeEventListener("keydown", handler)
-  }, [onClose])
-
-  return (
-    <div
-      role="dialog"
-      aria-modal="true"
-      aria-label="Image preview"
-      style={{
-        position: "fixed", inset: 0, zIndex: 9999,
-        background: "rgba(0,0,0,0.92)",
-        display: "flex", alignItems: "center", justifyContent: "center",
-        cursor: "zoom-out",
-      }}
-      onClick={onClose}
-    >
-      {!imgLoaded && (
-        <div style={{ position: "absolute", display: "flex", flexDirection: "column", alignItems: "center", gap: 10 }}>
-          <div className="spinner" style={{ borderTopColor: "var(--green)", borderColor: "rgba(37,211,102,.2)", width: 36, height: 36 }} />
-          <span style={{ color: "rgba(255,255,255,0.5)", fontSize: 12 }}>Memuat gambar...</span>
-        </div>
-      )}
-      <img
-        src={src}
-        alt={alt || "Foto"}
-        onLoad={() => setImgLoaded(true)}
-        onClick={(e) => e.stopPropagation()}
-        style={{
-          maxWidth: "90vw", maxHeight: "90vh",
-          borderRadius: 10, objectFit: "contain",
-          boxShadow: "0 12px 60px rgba(0,0,0,0.8)",
-          cursor: "default",
-          opacity: imgLoaded ? 1 : 0,
-          transition: "opacity 0.25s",
-        }}
-      />
-      <button
-        onClick={onClose}
-        title="Tutup (Esc)"
-        style={{
-          position: "fixed", top: 16, right: 18,
-          background: "rgba(255,255,255,0.14)", border: "1px solid rgba(255,255,255,0.15)",
-          backdropFilter: "blur(8px)",
-          borderRadius: "50%", width: 36, height: 36,
-          color: "#fff", fontSize: 18, cursor: "pointer",
-          display: "flex", alignItems: "center", justifyContent: "center",
-          transition: "background 0.15s",
-        }}
-        onMouseEnter={(e) => { e.currentTarget.style.background = "rgba(255,255,255,0.25)" }}
-        onMouseLeave={(e) => { e.currentTarget.style.background = "rgba(255,255,255,0.14)" }}
-      >
-        &#215;
-      </button>
-    </div>
-  )
-}
+// ImageLightbox replaced by MediaViewer component
 
 // ─── Image bubble ─────────────────────────────────────────────────────────────
-function ImageBubble({ msg }) {
+function ImageBubble({ msg, onMediaClick }) {
   const { src, err, setErr } = useMediaSrc(msg)
-  const [lightbox, setLightbox] = useState(false)
+  const { openMedia } = useAppStore()
   const [loaded, setLoaded] = useState(false)
+
+  const handleClick = useCallback(() => {
+    if (!src) return
+    if (onMediaClick) {
+      onMediaClick(msg, src, "image")
+    } else {
+      openMedia([{ src, type: "image", caption: msg.body || "", msgId: msg.id, filename: msg.media_filename }], 0)
+    }
+  }, [src, msg, onMediaClick, openMedia])
 
   if (!src || err) {
     return (
@@ -521,9 +469,6 @@ function ImageBubble({ msg }) {
 
   return (
     <>
-      {lightbox && (
-        <ImageLightbox src={src} alt={msg.body} onClose={() => setLightbox(false)} />
-      )}
       <div style={{ lineHeight: 0, borderRadius: msg.body ? "8px 8px 0 0" : 8, overflow: "hidden", position: "relative" }}>
         {!loaded && (
           <div style={{
@@ -540,7 +485,7 @@ function ImageBubble({ msg }) {
           alt={msg.body || "Foto"}
           onLoad={() => setLoaded(true)}
           onError={() => setErr(true)}
-          onClick={() => setLightbox(true)}
+          onClick={handleClick}
           style={{
             display: "block",
             maxWidth: "100%",
@@ -564,18 +509,30 @@ function ImageBubble({ msg }) {
 }
 
 // ─── Video bubble ─────────────────────────────────────────────────────────────
-function VideoBubble({ msg }) {
+function VideoBubble({ msg, onMediaClick }) {
   const { src, err, setErr } = useMediaSrc(msg)
+  const { openMedia } = useAppStore()
   const isGif = toBool(msg.is_gif)
+  const [thumbLoaded, setThumbLoaded] = useState(false)
+
+  const handleClick = useCallback(() => {
+    if (!src || isGif) return
+    if (onMediaClick) {
+      onMediaClick(msg, src, "video")
+    } else {
+      openMedia([{ src, type: "video", caption: msg.body || "", msgId: msg.id, filename: msg.media_filename }], 0)
+    }
+  }, [src, msg, isGif, onMediaClick, openMedia])
 
   if (!src || err) {
     return (
       <div className="media-video">
-        <div className="media-video-thumb">
-          <div className="play-btn">{isGif ? "GIF" : "▶️"}</div>
-          <span style={{ fontSize: 12, color: "var(--text-3)" }}>
-            {msg.body ? <RichText text={msg.body} /> : (isGif ? "GIF" : "Video")}
+        <div className="media-video-thumb" style={{ cursor: "default", minHeight: 120, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 8 }}>
+          <span style={{ fontSize: 32 }}>{isGif ? "GIF" : "🎬"}</span>
+          <span style={{ fontSize: 11, color: "var(--text-3)" }}>
+            {src ? "Gagal memuat" : "Mengunduh..."}
           </span>
+          {!src && <div className="spinner spinner-sm" style={{ borderTopColor: "var(--green)", borderColor: "rgba(37,211,102,.2)" }} />}
         </div>
       </div>
     )
@@ -596,16 +553,49 @@ function VideoBubble({ msg }) {
     )
   }
 
+  // Non-GIF video: show thumbnail with play button overlay, click → MediaViewer
   return (
-    <div className="media-video">
+    <div
+      className="media-video"
+      onClick={handleClick}
+      style={{ cursor: "pointer", position: "relative", borderRadius: 8, overflow: "hidden" }}
+      title="Klik untuk putar"
+    >
       <video
-        src={src}
-        controls
+        src={src + "#t=0.5"}
         preload="metadata"
+        muted
+        onLoadedData={() => setThumbLoaded(true)}
         onError={() => setErr(true)}
-        style={{ maxWidth: "100%", maxHeight: 280, borderRadius: 8, display: "block" }}
+        style={{ maxWidth: "100%", maxHeight: 280, display: "block", borderRadius: 8, width: "100%" }}
       />
-      {msg.body && <div className="media-caption"><RichText text={msg.body} /></div>}
+      {/* Play button overlay */}
+      <div style={{
+        position: "absolute", inset: 0,
+        display: "flex", alignItems: "center", justifyContent: "center",
+        background: "rgba(0,0,0,0.25)",
+        borderRadius: 8,
+        transition: "background 0.15s",
+      }}
+        onMouseEnter={e => e.currentTarget.style.background = "rgba(0,0,0,0.4)"}
+        onMouseLeave={e => e.currentTarget.style.background = "rgba(0,0,0,0.25)"}
+      >
+        <div style={{
+          width: 52, height: 52, borderRadius: "50%",
+          background: "rgba(0,0,0,0.6)",
+          border: "2px solid rgba(255,255,255,0.4)",
+          display: "flex", alignItems: "center", justifyContent: "center",
+          backdropFilter: "blur(4px)",
+          transition: "transform 0.15s",
+        }}>
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="white"><polygon points="8,5 20,12 8,19"/></svg>
+        </div>
+      </div>
+      {msg.body && (
+        <div className="media-caption" onClick={e => e.stopPropagation()}>
+          <RichText text={msg.body} />
+        </div>
+      )}
     </div>
   )
 }
@@ -1150,7 +1140,7 @@ function NewsletterBubble({ msg }) {
 // ════════════════════════════════════════════════════════════
 // MAIN CONTENT RENDERER
 // ════════════════════════════════════════════════════════════
-function renderContent(msg) {
+function renderContent(msg, opts = {}) {
   const t = msg.msg_type || "conversation"
 
   if (toBool(msg.is_view_once) || t === "viewOnceMessage" || t === "viewOnceMessageV2") {
@@ -1162,8 +1152,8 @@ function renderContent(msg) {
     case "extendedTextMessage":
       return <div className="bubble-text"><RichText text={msg.body || ""} /></div>
 
-    case "imageMessage":    return <ImageBubble msg={msg} />
-    case "videoMessage":    return <VideoBubble msg={msg} />
+    case "imageMessage":    return <ImageBubble msg={msg} onMediaClick={opts?.onMediaClick} />
+    case "videoMessage":    return <VideoBubble msg={msg} onMediaClick={opts?.onMediaClick} />
     case "audioMessage":
     case "pttMessage":      return <AudioBubble msg={msg} />
     case "documentMessage": return <DocBubble msg={msg} />
@@ -1302,7 +1292,7 @@ function ContextMenu({ x, y, items, onClose }) {
 // ════════════════════════════════════════════════════════════
 // MAIN COMPONENT
 // ════════════════════════════════════════════════════════════
-export default function MessageBubble({ msg, onReply, onScrollToMsg }) {
+export default function MessageBubble({ msg, onReply, onScrollToMsg, onMediaClick }) {
   // ── [FIX-1+FIX-5] Normalize ALL SQLite integer booleans ──────────────────
   const isMe        = toBool(msg.from_me)
   const isGroup     = toBool(msg.is_group)
@@ -1404,7 +1394,7 @@ export default function MessageBubble({ msg, onReply, onScrollToMsg }) {
     hasNoPad ? "no-pad" : null,
   ].filter(Boolean).join(" ")
 
-  const content = renderContent(msg)
+  const content = renderContent(msg, { onMediaClick })
 
   // System messages render nothing
   if (content === null) return null

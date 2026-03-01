@@ -41,6 +41,7 @@ contextBridge.exposeInMainWorld("api", {
   // SYNC STATUS (History Sync)
   // ═══════════════════════════════════════════════════════════
   onSyncStatus: createListener("sync:status"),
+  onSyncProgress: createListener("sync:progress"),
 
   // ═══════════════════════════════════════════════════════════
   // DATABASE: CHATS

@@ -7,6 +7,7 @@ import ChatList from "../components/ChatList"
 import ChatWindow from "../components/ChatWindow"
 import ModManagerPage from "./ModManager"
 import StatusUploader from "./StatusUploader"
+import MediaViewer from "../components/MediaViewer"
 
 const CONN_STATUS = { connected:"connected", open:"connected", reconnecting:"reconnecting", close:"failed", connecting:"connecting" }
 
@@ -117,6 +118,7 @@ export default function Main() {
 
   return (
     <div className="app-root">
+      <MediaViewer />
       <Sidebar/>
       {navTab === "mods" ? (
         <div style={{ flex: 1, overflow: "hidden" }}>

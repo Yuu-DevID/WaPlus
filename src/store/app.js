@@ -32,4 +32,9 @@ export const useAppStore = create((set) => ({
     setRightPanelOpen: (v) => set({ rightPanelOpen: v }),
     setConnectedUser: (u) => set({ connectedUser: u }),
     toggleRightPanel: () => set((s) => ({ rightPanelOpen: !s.rightPanelOpen })),
+
+    // Media viewer — { items: [{src, type, caption, msgId}], index: number }
+    mediaViewer: null,
+    openMedia: (items, index = 0) => set({ mediaViewer: { items, index } }),
+    closeMedia: () => set({ mediaViewer: null }),
 }))

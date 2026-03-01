@@ -21,7 +21,89 @@ import { useMediaPrefetch } from "../hooks/useMediaPrefetch"
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 const toBool = (v) => v === 1 || v === true
-const toInt  = (v) => (v === 1 || v === true ? 1 : 0)
+
+// Album detection: find consecutive image/video messages within 90s of each other
+// Returns array of {src, type, caption, msgId, filename} items + index of clicked msg
+function buildAlbumItems(msgs, clickedId) {
+  const MEDIA_TYPES = new Set(["imageMessage", "videoMessage"])
+  const ALBUM_WINDOW_S = 90
+
+  // Find the clicked message and its timestamp
+  const clickedIdx = msgs.findIndex(m => m.id === clickedId)
+  if (clickedIdx === -1) return null
+
+  const clicked = msgs[clickedIdx]
+  if (!MEDIA_TYPES.has(clicked.msg_type)) return null
+  if (!clicked.media_saved_path && !clicked.media_url) return null
+
+  const refTs = clicked.timestamp || 0
+
+  // Expand to adjacent messages within the time window and same from_me direction
+  // (Albums in WA are from same sender, sent within a short window)
+  const isFromSameAlbum = (m) => {
+    if (!MEDIA_TYPES.has(m.msg_type)) return false
+    if (!m.media_saved_path && !m.media_url) return false
+    if (m.from_me !== clicked.from_me) return false
+    const diff = Math.abs((m.timestamp || 0) - refTs)
+    return diff <= ALBUM_WINDOW_S
+  }
+
+  // Find contiguous block around clicked
+  let start = clickedIdx
+  let end = clickedIdx
+
+  // Expand backwards
+  for (let i = clickedIdx - 1; i >= 0; i--) {
+    if (isFromSameAlbum(msgs[i])) start = i
+    else break
+  }
+  // Expand forwards
+  for (let i = clickedIdx + 1; i < msgs.length; i++) {
+    if (isFromSameAlbum(msgs[i])) end = i
+    else break
+  }
+
+  const group = msgs.slice(start, end + 1)
+
+  // Only treat as album if 2+ items
+  if (group.length < 2) return null
+
+  const pathToSrc = (raw) => {
+    if (!raw) return null
+    if (raw.startsWith("file://")) return raw
+    let p = raw.replace(/\\/g, "/")
+    if (/^[A-Za-z]:\//.test(p)) {
+      const enc = p.split("/").map((s, i) => i === 0 ? s : encodeURIComponent(s)).join("/")
+      return `file://${enc}`
+    }
+    const w = p.startsWith("/") ? p : `/${p}`
+    return `file://${w.split("/").map((s, i) => i === 0 ? s : encodeURIComponent(s)).join("/")}`
+  }
+
+  const items = group.map(m => ({
+    src: pathToSrc(m.media_saved_path) || m.media_url || null,
+    type: m.msg_type === "videoMessage" ? "video" : "image",
+    caption: m.body || "",
+    msgId: m.id,
+    filename: m.media_filename,
+  }))
+
+  const albumIndex = group.findIndex(m => m.id === clickedId)
+  return { items, index: albumIndex }
+}
+
+function pathToSrc(raw) {
+  if (!raw) return null
+  if (raw.startsWith("file://")) return raw
+  let p = raw.replace(/\\/g, "/")
+  if (/^[A-Za-z]:\//.test(p)) {
+    const enc = p.split("/").map((s, i) => i === 0 ? s : encodeURIComponent(s)).join("/")
+    return `file://${enc}`
+  }
+  const w = p.startsWith("/") ? p : `/${p}`
+  return `file://${w.split("/").map((s, i) => i === 0 ? s : encodeURIComponent(s)).join("/")}`
+}
+const toInt = (v) => (v === 1 || v === true ? 1 : 0)
 
 // [FIX-MESSAGES] Normalize JID agar cocok dengan store key yang dipakai loadMessages()
 // Mirror normalizeJid() di store/chat.js — mencegah messages[jid] miss
@@ -30,7 +112,7 @@ function normalizeJid(jid) {
   if (!jid || typeof jid !== "string") return ""
   const atIdx = jid.lastIndexOf("@")
   if (atIdx === -1) return jid
-  let user   = jid.slice(0, atIdx)
+  let user = jid.slice(0, atIdx)
   let server = jid.slice(atIdx + 1)
   const colonIdx = user.indexOf(":")
   if (colonIdx !== -1) user = user.slice(0, colonIdx)
@@ -38,8 +120,8 @@ function normalizeJid(jid) {
   return `${user}@${server}`
 }
 
-const COLORS = ["#1a5c3e","#1565c0","#6a1b9a","#b71c1c","#e65100",
-                "#2e7d32","#00695c","#4527a0","#00838f","#ad1457"]
+const COLORS = ["#1a5c3e", "#1565c0", "#6a1b9a", "#b71c1c", "#e65100",
+  "#2e7d32", "#00695c", "#4527a0", "#00838f", "#ad1457"]
 function getColor(s) {
   if (!s) return COLORS[0]
   let h = 0
@@ -65,13 +147,13 @@ function initials(n) {
 function resolveDisplayName(jid, chat) {
   // Support legacy call with (jid, string) for backwards compat
   const savedName = typeof chat === "string" ? chat : (chat?.name || "")
-  const chatObj   = typeof chat === "object" && chat !== null ? chat : {}
+  const chatObj = typeof chat === "object" && chat !== null ? chat : {}
 
-  const atIdx     = jid ? jid.lastIndexOf("@") : -1
-  const server    = atIdx !== -1 ? jid.slice(atIdx + 1) : ""
-  const user      = atIdx !== -1 ? jid.slice(0, atIdx) : (jid || "")
+  const atIdx = jid ? jid.lastIndexOf("@") : -1
+  const server = atIdx !== -1 ? jid.slice(atIdx + 1) : ""
+  const user = atIdx !== -1 ? jid.slice(0, atIdx) : (jid || "")
   const cleanUser = user.split(":")[0]
-  const isLid     = server === "lid"
+  const isLid = server === "lid"
 
   // Groups / newsletters
   if (server === "g.us" || server === "newsletter") {
@@ -216,30 +298,48 @@ export default function ChatWindow({ jid }) {
     chats, appendMessage, setActiveJid,
     contacts, updateReactions, prependMessages, loadReactions,
   } = useChatStore()
-  const { setRightPanel } = useAppStore()
+  const { toggleRightPanel, openMedia } = useAppStore()
 
   const [loading, setLoading] = useState(true)
   const [loadingMore, setLoadingMore] = useState(false)  // [FIX-SCROLL] loading older msgs
   const [hasMore, setHasMore] = useState(true)           // [FIX-SCROLL] more msgs to fetch
   const [replyTo, setReplyTo] = useState(null)   // [REPLY] message being replied to
-  const bottomRef  = useRef(null)
-  const areaRef    = useRef(null)
+  const [showScrollBtn, setShowScrollBtn] = useState(false) // scroll-to-bottom button
+  const [unreadCount, setUnreadCount] = useState(0)          // unread badge count
+  const bottomRef = useRef(null)
+  const areaRef = useRef(null)
   const prevJidRef = useRef(null)
   // [REPLY] Map msgId → DOM element ref for scroll-to-message
   const msgRefsMap = useRef({})
   // [FIX-SCROLL] Track pagination offset per JID
-  const offsetRef  = useRef(0)
-
-  // Resolve chat info
-  // [FIX-MESSAGES] Normalize JID saat cari chat — @c.us vs @s.whatsapp.net bisa beda
-  const chat = chats.find(c => normalizeJid(c.jid) === normalizeJid(jid))
-  // [FIX-LID] resolveDisplayName handles @lid, @s.whatsapp.net, unsaved contacts
-  const name = resolveDisplayName(jid, chat || {})
+  const offsetRef = useRef(0)
 
   // [FIX-MESSAGES] Lookup pakai normalized key — loadMessages() simpan di normalizeJid(jid)
   const normalizedJid = normalizeJid(jid)
   const msgs = messages[normalizedJid] || []
   const isGroup = (jid || "").endsWith("@g.us")
+
+  // Resolve chat info
+  // [FIX-MESSAGES] Normalize JID saat cari chat — @c.us vs @s.whatsapp.net bisa beda
+  const chat = chats.find(c => normalizeJid(c.jid) === normalizedJid)
+  // [FIX-LID] resolveDisplayName handles @lid, @s.whatsapp.net, unsaved contacts
+  const name = resolveDisplayName(jid, chat || {})
+
+  // ── Media click handler: detect album or open single ────────────────────
+  const handleMediaClick = useCallback((msg, src, type) => {
+    const album = buildAlbumItems(msgs, msg.id)
+    if (album) {
+      openMedia(album.items, album.index)
+    } else {
+      openMedia([{
+        src: src || pathToSrc(msg.media_saved_path) || msg.media_url,
+        type,
+        caption: msg.body || "",
+        msgId: msg.id,
+        filename: msg.media_filename,
+      }], 0)
+    }
+  }, [msgs, openMedia])
 
   // [PREFETCH] Fire high-priority media prefetch when this chat opens.
   // Downloads pending images/videos/stickers in background before user scrolls.
@@ -258,7 +358,7 @@ export default function ChatWindow({ jid }) {
     console.log(`[ChatWindow] opening jid=${jid}`)
     loadMessages(jid, 50, 0).then(msgs => {
       if (prevJidRef.current !== jid) {
-        console.log(`[ChatWindow] stale result for ${jid}, current=${prevJidRef.current}, skipping`)
+        console.log(`[ChatWindow] stale result for ${jid}, current = ${prevJidRef.current}, skipping`)
         return
       }
       setLoading(false)
@@ -308,35 +408,35 @@ export default function ChatWindow({ jid }) {
         }
 
         appendMessage(jid, {
-          id:               msgId,
-          chat_jid:         jid,
-          body:             data.body             || "",
-          msg_type:         data.msg_type         || "conversation",
-          timestamp:        data.timestamp        || Math.floor(Date.now() / 1000),
-          from_me:          data.from_me          ?? 0,
-          status:           data.status           ?? 0,
-          sender_name:      data.sender_name      || "",
-          sender_jid:       data.sender_jid       || null,
-          is_group:         toInt(isGroup),
-          has_media:        data.has_media        ?? 0,
-          mimetype:         data.mimetype         || null,
-          media_duration:   data.media_duration   || null,
-          media_filename:   data.media_filename   || null,
+          id: msgId,
+          chat_jid: jid,
+          body: data.body || "",
+          msg_type: data.msg_type || "conversation",
+          timestamp: data.timestamp || Math.floor(Date.now() / 1000),
+          from_me: data.from_me ?? 0,
+          status: data.status ?? 0,
+          sender_name: data.sender_name || "",
+          sender_jid: data.sender_jid || null,
+          is_group: toInt(isGroup),
+          has_media: data.has_media ?? 0,
+          mimetype: data.mimetype || null,
+          media_duration: data.media_duration || null,
+          media_filename: data.media_filename || null,
           media_saved_path: data.media_saved_path || null,
-          media_url:        data.media_url        || null,
-          is_ptt:           data.is_ptt           ?? 0,
-          is_gif:           data.is_gif           ?? 0,
-          is_view_once:     data.is_view_once     ?? 0,
-          is_animated:      data.is_animated      ?? 0,
-          quoted_id:        data.quoted_id        || null,
-          quoted_body:      data.quoted_body      || null,
-          quoted_sender:    data.quoted_sender    || null,
-          quoted_type:      data.quoted_type      || null,
+          media_url: data.media_url || null,
+          is_ptt: data.is_ptt ?? 0,
+          is_gif: data.is_gif ?? 0,
+          is_view_once: data.is_view_once ?? 0,
+          is_animated: data.is_animated ?? 0,
+          quoted_id: data.quoted_id || null,
+          quoted_body: data.quoted_body || null,
+          quoted_sender: data.quoted_sender || null,
+          quoted_type: data.quoted_type || null,
           quoted_has_media: data.quoted_has_media ?? 0,
-          reaction_emoji:   data.reaction_emoji   || null,
+          reaction_emoji: data.reaction_emoji || null,
           reaction_target_id: data.reaction_target_id || null,
-          is_forwarded:     data.is_forwarded     ?? 0,
-          starred:          data.starred          ?? 0,
+          is_forwarded: data.is_forwarded ?? 0,
+          starred: data.starred ?? 0,
         })
       }))
     }
@@ -350,19 +450,19 @@ export default function ChatWindow({ jid }) {
         if (!m?.id) return
 
         appendMessage(jid, {
-          id:               m.id,
-          chat_jid:         jid,
-          body:             m.body             || "",
-          msg_type:         m.msg_type         || "conversation",
-          timestamp:        m.timestamp        || Math.floor(Date.now() / 1000),
-          from_me:          m.from_me          ?? 0,
-          status:           m.status           ?? 0,
-          sender_name:      m.sender_name      || "",
-          is_group:         toInt(isGroup),
-          mimetype:         m.mimetype         || null,
-          duration:         m.duration         || null,
+          id: m.id,
+          chat_jid: jid,
+          body: m.body || "",
+          msg_type: m.msg_type || "conversation",
+          timestamp: m.timestamp || Math.floor(Date.now() / 1000),
+          from_me: m.from_me ?? 0,
+          status: m.status ?? 0,
+          sender_name: m.sender_name || "",
+          is_group: toInt(isGroup),
+          mimetype: m.mimetype || null,
+          duration: m.duration || null,
           media_saved_path: m.media_saved_path || null,
-          media_url:        m.media_url        || null,
+          media_url: m.media_url || null,
         })
       }))
     }
@@ -391,9 +491,9 @@ export default function ChatWindow({ jid }) {
         for (const item of (reactions || [])) {
           const reactionData = item.reaction || item
           const targetId = reactionData.key?.id || item.key?.id
-          const chatJid  = reactionData.key?.remoteJid || item.key?.remoteJid || jid
-          const emoji    = reactionData.text || ""
-          const sender   = reactionData.key?.participant || reactionData.key?.remoteJid || ""
+          const chatJid = reactionData.key?.remoteJid || item.key?.remoteJid || jid
+          const emoji = reactionData.text || ""
+          const sender = reactionData.key?.participant || reactionData.key?.remoteJid || ""
           if (!targetId) continue
           // [REALTIME] Update langsung tanpa tunggu refresh
           useChatStore.getState().updateReactions(normalizeJid(chatJid || jid), targetId, sender, emoji)
@@ -451,7 +551,7 @@ export default function ChatWindow({ jid }) {
   // [REPLY] Scroll to a message by ID and flash highlight it
   const scrollToMsg = useCallback((msgId) => {
     if (!msgId) return
-    const el = document.querySelector(`[data-msgid="${msgId}"]`)
+    const el = document.querySelector(`[data - msgid= "${msgId}"]`)
     if (el) {
       el.scrollIntoView({ behavior: "smooth", block: "center" })
       // Trigger highlight animation via custom event
@@ -475,25 +575,25 @@ export default function ChatWindow({ jid }) {
       const currentOffset = offsetRef.current
       const LOAD_COUNT = 30
 
-    const scrollHeightBefore = area.scrollHeight
+      const scrollHeightBefore = area.scrollHeight
 
-    const older = await prependMessages(jid, LOAD_COUNT, currentOffset)
-    offsetRef.current = currentOffset + older.length
+      const older = await prependMessages(jid, LOAD_COUNT, currentOffset)
+      offsetRef.current = currentOffset + older.length
 
-    if (older.length < LOAD_COUNT) setHasMore(false)
+      if (older.length < LOAD_COUNT) setHasMore(false)
 
-    // Trigger media prefetch untuk messages yang baru di-load
-    if (older.length > 0 && jid) {
-      const { prefetchChat } = await import("../hooks/useMediaPrefetch")
-      prefetchChat(jid, LOAD_COUNT + 10, false)
-    }
+      // Trigger media prefetch untuk messages yang baru di-load
+      if (older.length > 0 && jid) {
+        const { prefetchChat } = await import("../hooks/useMediaPrefetch")
+        prefetchChat(jid, LOAD_COUNT + 10, false)
+      }
 
-    // Restore scroll position agar viewport tidak loncat
-    requestAnimationFrame(() => {
-      if (!area) return
-      const scrollHeightAfter = area.scrollHeight
-      area.scrollTop += (scrollHeightAfter - scrollHeightBefore)
-    })
+      // Restore scroll position agar viewport tidak loncat
+      requestAnimationFrame(() => {
+        if (!area) return
+        const scrollHeightAfter = area.scrollHeight
+        area.scrollTop += (scrollHeightAfter - scrollHeightBefore)
+      })
 
       setLoadingMore(false)
     }
@@ -511,7 +611,7 @@ export default function ChatWindow({ jid }) {
         <div
           className="chat-header-info"
           style={{ cursor: "pointer" }}
-          onClick={() => setRightPanel("contact")}
+          onClick={() => toggleRightPanel()}
         >
           <div className="chat-header-name">{name}</div>
           <div className="chat-header-status">
@@ -562,6 +662,7 @@ export default function ChatWindow({ jid }) {
                   msg={item.msg}
                   onReply={setReplyTo}
                   onScrollToMsg={scrollToMsg}
+                  onMediaClick={handleMediaClick}
                 />
               </div>
             )
@@ -587,7 +688,7 @@ export default function ChatWindow({ jid }) {
           )}
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none"
             stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M12 5v14M5 12l7 7 7-7"/>
+            <path d="M12 5v14M5 12l7 7 7-7" />
           </svg>
         </button>
       )}
