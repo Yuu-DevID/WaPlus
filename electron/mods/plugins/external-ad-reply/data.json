@@ -1,0 +1,14 @@
+{
+  "config": {
+    "title": "WaPlus",
+    "body": "Powered by WaPlus",
+    "thumbnailUrl": "https://avatars.githubusercontent.com/u/89240312?v=4",
+    "sourceUrl": "https://github.com/Towartz",
+    "mediaUrl": "",
+    "mediaType": 1,
+    "renderLargerThumbnail": false,
+    "showAdAttribution": true,
+    "containsAutoReply": false,
+    "_customFields": []
+  }
+}

@@ -1,7 +1,7 @@
-// DevEvalModal.jsx — WaPlus DevEval Sandbox v3
-// Features: smsg "m" object, unlimited output, Full View, Save to File,
-//   Templates panel (Reflect.ownKeys, sock, db, baileys, msg), more context pills
-import { useState, useRef, useEffect, useCallback, memo } from "react"
+// DevEvalModal.jsx — WaPlus DevEval Sandbox v4
+// Features: output search (Ctrl+F, ↑↓ navigate), line numbers, exec time,
+//   pin/compare output, smsg "m" object, Full View, Save, Templates, history
+import { useState, useRef, useEffect, useCallback, memo, useMemo } from "react"
 
 // ─── Syntax colorizer ─────────────────────────────────────────────────────────
 function colorize(text) {
@@ -14,6 +14,28 @@ function colorize(text) {
     .replace(/([a-zA-Z_$][\w$]*)(\s*:)/g, '<span class="devc-key">$1</span>$2')
     .replace(/(\[Function(?:: [^\]]+)?\])/g, '<span class="devc-fn">$1</span>')
     .replace(/(\[(?:Array|Object|Map|Set|Buffer|Error)[^\]]*\])/g, '<span class="devc-type">$1</span>')
+}
+
+// ─── Highlight search matches in colorized html ───────────────────────────────
+function highlightSearch(html, query, currentIdx) {
+  if (!query) return html
+  const escaped = query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+  let idx = 0
+  return html.replace(
+    new RegExp(`(?![^<]*>)(${escaped})`, "gi"),
+    (match) => {
+      const cls = idx === currentIdx ? "devc-search-current" : "devc-search-match"
+      idx++
+      return `<mark class="${cls}">${match}</mark>`
+    }
+  )
+}
+
+// ─── Count plain-text matches (strip tags first) ─────────────────────────────
+function countMatches(text, query) {
+  if (!query || !text) return 0
+  const escaped = query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+  return (text.match(new RegExp(escaped, "gi")) || []).length
 }
 
 const E = "expr"
@@ -85,45 +107,79 @@ const PILLS = [
   { t: "log(v)",   d: "console.log + return v" },
 ]
 
-const HIST_KEY = "__wpe_hist_v3__"
+const HIST_KEY = "__wpe_hist_v4__"
 const loadHist = () => { try { return JSON.parse(sessionStorage.getItem(HIST_KEY) || "[]") } catch { return [] } }
 const saveHist = h => { try { sessionStorage.setItem(HIST_KEY, JSON.stringify(h.slice(-100))) } catch {} }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 const DevEvalModal = memo(function DevEvalModal({ msg, onClose }) {
-  const [mode,      setMode]      = useState(E)
-  const [code,      setCode]      = useState("m")
-  const [running,   setRunning]   = useState(false)
-  const [result,    setResult]    = useState(null)
-  const [hist,      setHist]      = useState(loadHist)
-  const [hIdx,      setHIdx]      = useState(-1)
-  const [copied,    setCopied]    = useState(false)
-  const [saved,     setSaved]     = useState(false)
-  const [fullView,  setFullView]  = useState(false)
-  const [tab,       setTab]       = useState("msg")
-  const [showTpl,   setShowTpl]   = useState(false)
+  const [mode,        setMode]        = useState(E)
+  const [code,        setCode]        = useState("m")
+  const [running,     setRunning]     = useState(false)
+  const [result,      setResult]      = useState(null)
+  const [execMs,      setExecMs]      = useState(null)
+  const [hist,        setHist]        = useState(loadHist)
+  const [hIdx,        setHIdx]        = useState(-1)
+  const [copied,      setCopied]      = useState(false)
+  const [saved,       setSaved]       = useState(false)
+  const [fullView,    setFullView]    = useState(false)
+  const [tab,         setTab]         = useState("msg")
+  const [showTpl,     setShowTpl]     = useState(false)
+  const [showLines,   setShowLines]   = useState(true)
+  // ── Search state ────────────────────────────────────────────────────────────
+  const [showSearch,  setShowSearch]  = useState(false)
+  const [searchQ,     setSearchQ]     = useState("")
+  const [searchIdx,   setSearchIdx]   = useState(0)
+  // ── Pinned output ───────────────────────────────────────────────────────────
+  const [pinned,      setPinned]      = useState(null)
 
-  const edRef  = useRef(null)
-  const outRef = useRef(null)
+  const edRef      = useRef(null)
+  const outRef     = useRef(null)
+  const searchRef  = useRef(null)
 
   useEffect(() => { setTimeout(() => edRef.current?.focus(), 80) }, [])
 
-  // Escape to close
+  // Global keydown — Escape closes search first, then modal
   useEffect(() => {
-    const fn = e => { if (e.key === "Escape" && !running) onClose() }
+    const fn = e => {
+      if (e.key === "Escape" && !running) {
+        if (showSearch) { setShowSearch(false); setSearchQ(""); edRef.current?.focus() }
+        else onClose()
+      }
+      if ((e.ctrlKey || e.metaKey) && e.key === "f" && result !== null) {
+        e.preventDefault()
+        setShowSearch(v => { if (!v) setTimeout(() => searchRef.current?.focus(), 60); return !v })
+      }
+      if ((e.ctrlKey || e.metaKey) && e.key === "l") {
+        e.preventDefault()
+        setCode(""); setResult(null); setExecMs(null); edRef.current?.focus()
+      }
+    }
     document.addEventListener("keydown", fn)
     return () => document.removeEventListener("keydown", fn)
-  }, [onClose, running])
+  }, [onClose, running, showSearch, result])
 
-  // Reset full view on new result
-  useEffect(() => { setFullView(false); if (outRef.current) outRef.current.scrollTop = 0 }, [result])
+  // Reset search & full view on new result
+  useEffect(() => {
+    setFullView(false)
+    setSearchIdx(0)
+    if (outRef.current) outRef.current.scrollTop = 0
+  }, [result])
+
+  // Auto-scroll to current match
+  useEffect(() => {
+    if (!showSearch || !searchQ) return
+    const el = outRef.current?.querySelector(".devc-search-current")
+    el?.scrollIntoView({ block: "center", behavior: "smooth" })
+  }, [searchIdx, showSearch, searchQ])
 
   const run = useCallback(async () => {
     const trimmed = code.trim()
     if (!trimmed || running) return
-    setRunning(true); setResult(null)
+    setRunning(true); setResult(null); setExecMs(null)
     const newH = [trimmed, ...hist.filter(h => h !== trimmed)]
     setHist(newH); saveHist(newH); setHIdx(-1)
+    const t0 = performance.now()
     try {
       if (!window.api?.devEval) {
         setResult({ ok: false, error: "window.api.devEval not available — update preload.js" })
@@ -137,7 +193,7 @@ const DevEvalModal = memo(function DevEvalModal({ msg, onClose }) {
       })
       setResult(res)
     } catch (e) { setResult({ ok: false, error: e.message || String(e) }) }
-    finally { setRunning(false) }
+    finally { setExecMs(Math.round(performance.now() - t0)); setRunning(false) }
   }, [code, mode, running, hist, msg])
 
   const onKeyDown = useCallback(e => {
@@ -160,6 +216,16 @@ const DevEvalModal = memo(function DevEvalModal({ msg, onClose }) {
     }
   }, [run, code, hist, hIdx])
 
+  const onSearchKeyDown = useCallback(e => {
+    if (e.key === "Enter" || e.key === "ArrowDown") {
+      e.preventDefault()
+      setSearchIdx(i => (i + 1) % Math.max(1, matchCount))
+    } else if (e.key === "ArrowUp" || (e.shiftKey && e.key === "Enter")) {
+      e.preventDefault()
+      setSearchIdx(i => (i - 1 + Math.max(1, matchCount)) % Math.max(1, matchCount))
+    }
+  }, [])
+
   const insertAt = useCallback(text => {
     const el = edRef.current
     if (!el) { setCode(c => c + text); return }
@@ -169,7 +235,7 @@ const DevEvalModal = memo(function DevEvalModal({ msg, onClose }) {
   }, [])
 
   const applyTpl = useCallback(tpl => {
-    setCode(tpl.code); if (tpl.mode) setMode(tpl.mode); setResult(null); setShowTpl(false)
+    setCode(tpl.code); if (tpl.mode) setMode(tpl.mode); setResult(null); setExecMs(null); setShowTpl(false)
     setTimeout(() => edRef.current?.focus(), 50)
   }, [])
 
@@ -182,6 +248,29 @@ const DevEvalModal = memo(function DevEvalModal({ msg, onClose }) {
   const display = isBig
     ? outText.slice(0, TRUNC) + `\n\n... ▲ TRUNCATED — click "Full View" to show all ${outText.length.toLocaleString()} chars`
     : outText
+
+  // Match count on plain text
+  const matchCount = useMemo(() => countMatches(display, searchQ), [display, searchQ])
+
+  // Reset searchIdx when query/display changes
+  useEffect(() => { setSearchIdx(0) }, [searchQ, display])
+
+  // Build colorized + search-highlighted html
+  const outputHtml = useMemo(() => {
+    const base = colorize(display || "")
+    return showSearch && searchQ ? highlightSearch(base, searchQ, searchIdx) : base
+  }, [display, showSearch, searchQ, searchIdx])
+
+  // Build line-numbered html
+  const outputWithLines = useMemo(() => {
+    if (!showLines || !display) return outputHtml
+    const lines = outputHtml.split("\n")
+    const pad = String(lines.length).length
+    return lines.map((l, i) => {
+      const n = String(i + 1).padStart(pad, " ")
+      return `<span class="devc-ln">${n}</span>${l}`
+    }).join("\n")
+  }, [outputHtml, showLines, display])
 
   const copyOut = useCallback(() => {
     if (!outText) return
@@ -197,7 +286,6 @@ const DevEvalModal = memo(function DevEvalModal({ msg, onClose }) {
         const r = await window.api.saveFile({ content: outText, filename })
         if (r?.ok) { setSaved(true); setTimeout(() => setSaved(false), 2500) }
       } else {
-        // Fallback: browser download
         const blob = new Blob([outText], { type: "text/plain" })
         const url = URL.createObjectURL(blob)
         const a = document.createElement("a"); a.href = url; a.download = filename; a.click()
@@ -207,20 +295,23 @@ const DevEvalModal = memo(function DevEvalModal({ msg, onClose }) {
     } catch {}
   }, [outText, msg])
 
-  // ── SVGs ──────────────────────────────────────────────────────────────────
-  const IconCode   = () => <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
-  const IconCheck  = () => <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round"><polyline points="20 6 9 17 4 12"/></svg>
-  const IconCopy   = () => <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
-  const IconSave   = () => <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
-  const IconExpand = () => <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg>
-  const IconCollapse=()=><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><line x1="10" y1="14" x2="21" y2="3"/><line x1="3" y1="21" x2="14" y2="10"/></svg>
-  const IconGrid   = () => <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
-  const IconPlay   = () => <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
-  const IconTrash  = () => <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
+  // ── SVGs ────────────────────────────────────────────────────────────────────
+  const IconCode     = () => <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
+  const IconCheck    = () => <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round"><polyline points="20 6 9 17 4 12"/></svg>
+  const IconCopy     = () => <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+  const IconSave     = () => <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
+  const IconExpand   = () => <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg>
+  const IconCollapse = () => <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><line x1="10" y1="14" x2="21" y2="3"/><line x1="3" y1="21" x2="14" y2="10"/></svg>
+  const IconGrid     = () => <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+  const IconPlay     = () => <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+  const IconTrash    = () => <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
+  const IconSearch   = () => <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+  const IconPin      = () => <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><line x1="12" y1="17" x2="12" y2="22"/><path d="M5 17h14v-1.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V6h1a2 2 0 0 0 0-4H8a2 2 0 0 0 0 4h1v4.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24Z"/></svg>
+  const IconLines    = () => <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>
 
   return (
     <div className="deveval-backdrop" onClick={e => e.target === e.currentTarget && !running && onClose()} role="dialog" aria-modal="true">
-      <div className="deveval-modal" style={{ maxWidth: 860, width: "96vw" }}>
+      <div className="deveval-modal" style={{ maxWidth: 900, width: "96vw" }}>
 
         {/* ── Header ──────────────────────────────────────────────────── */}
         <div className="deveval-header">
@@ -241,7 +332,7 @@ const DevEvalModal = memo(function DevEvalModal({ msg, onClose }) {
             </button>
             <div className="deveval-mode-toggle">
               <button className={`deveval-mode-btn${mode === E ? " active" : ""}`} onClick={() => { setMode(E); setResult(null) }}>{"=>"}&nbsp;Expr</button>
-              <button className={`deveval-mode-btn${mode === B ? " active" : ""}`} onClick={() => { setMode(B); setResult(null) }}>{"{"+"}"}&nbsp;Block</button>
+              <button className={`deveval-mode-btn${mode === B ? " active" : ""}`} onClick={() => { setMode(B); setResult(null) }}>{"{}"}&nbsp;Block</button>
             </div>
             <button className="deveval-close" onClick={onClose}>
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
@@ -304,12 +395,14 @@ const DevEvalModal = memo(function DevEvalModal({ msg, onClose }) {
         <div className="deveval-action-bar">
           <div className="deveval-shortcuts">
             <span><kbd>Ctrl+Enter</kbd> Run</span>
+            <span><kbd>Ctrl+L</kbd> Clear</span>
             <span><kbd>Alt+↑↓</kbd> History</span>
+            <span><kbd>Ctrl+F</kbd> Search</span>
             <span><kbd>Tab</kbd> Indent</span>
             <span><kbd>Esc</kbd> Close</span>
           </div>
           <div className="deveval-action-btns">
-            <button className="deveval-btn ghost" disabled={running} onClick={() => { setCode(""); setResult(null); edRef.current?.focus() }}>
+            <button className="deveval-btn ghost" disabled={running} onClick={() => { setCode(""); setResult(null); setExecMs(null); edRef.current?.focus() }}>
               <IconTrash />&nbsp;Clear
             </button>
             <button className={`deveval-btn run${running ? " loading" : ""}`} onClick={run} disabled={running || !code.trim()}>
@@ -330,9 +423,32 @@ const DevEvalModal = memo(function DevEvalModal({ msg, onClose }) {
                 <span className="deveval-output-len">
                   {outText?.length?.toLocaleString()} chars
                   {isBig && <span style={{ color: "#f59e0b", marginLeft: 6, fontSize: 10 }}>showing {TRUNC.toLocaleString()}</span>}
+                  {execMs !== null && <span style={{ color: "var(--muted, #666)", marginLeft: 8, fontSize: 10 }}>⏱ {execMs}ms</span>}
                 </span>
               </div>
+
               <div style={{ display: "flex", gap: 5, alignItems: "center" }}>
+                {/* Search toggle */}
+                <button
+                  className={`deveval-copy-btn${showSearch ? " copied" : ""}`}
+                  onClick={() => { setShowSearch(v => { if (!v) setTimeout(() => searchRef.current?.focus(), 60); return !v }) }}
+                  title="Search in output (Ctrl+F)">
+                  <IconSearch />&nbsp;Search
+                </button>
+                {/* Line numbers toggle */}
+                <button
+                  className={`deveval-copy-btn${showLines ? " copied" : ""}`}
+                  onClick={() => setShowLines(v => !v)}
+                  title="Toggle line numbers">
+                  <IconLines />&nbsp;Lines
+                </button>
+                {/* Pin output */}
+                <button
+                  className={`deveval-copy-btn${pinned ? " copied" : ""}`}
+                  onClick={() => setPinned(p => p ? null : outText)}
+                  title={pinned ? "Unpin" : "Pin this output to compare"}>
+                  <IconPin />&nbsp;{pinned ? "Unpin" : "Pin"}
+                </button>
                 {/* Full view */}
                 {outText && outText.length > TRUNC && (
                   <button className="deveval-copy-btn" onClick={() => setFullView(v => !v)}
@@ -351,13 +467,94 @@ const DevEvalModal = memo(function DevEvalModal({ msg, onClose }) {
                 </button>
               </div>
             </div>
+
+            {/* ── Search bar ────────────────────────────────────────── */}
+            {showSearch && (
+              <div style={{
+                display: "flex", alignItems: "center", gap: 6,
+                padding: "5px 10px", borderBottom: "1px solid var(--border)",
+                background: "rgba(0,0,0,.2)"
+              }}>
+                <IconSearch />
+                <input
+                  ref={searchRef}
+                  value={searchQ}
+                  onChange={e => setSearchQ(e.target.value)}
+                  onKeyDown={onSearchKeyDown}
+                  placeholder="Search in output…"
+                  spellCheck={false}
+                  style={{
+                    flex: 1, background: "transparent", border: "none", outline: "none",
+                    color: "inherit", fontSize: 12, fontFamily: "monospace"
+                  }}
+                />
+                {searchQ && (
+                  <span style={{ fontSize: 11, opacity: 0.6, whiteSpace: "nowrap" }}>
+                    {matchCount === 0 ? "no match" : `${searchIdx + 1} / ${matchCount}`}
+                  </span>
+                )}
+                <button
+                  className="deveval-copy-btn"
+                  onClick={() => setSearchIdx(i => (i - 1 + Math.max(1, matchCount)) % Math.max(1, matchCount))}
+                  title="Previous match (↑ / Shift+Enter)"
+                  disabled={matchCount === 0}
+                  style={{ padding: "2px 6px" }}>↑</button>
+                <button
+                  className="deveval-copy-btn"
+                  onClick={() => setSearchIdx(i => (i + 1) % Math.max(1, matchCount))}
+                  title="Next match (↓ / Enter)"
+                  disabled={matchCount === 0}
+                  style={{ padding: "2px 6px" }}>↓</button>
+                <button
+                  className="deveval-copy-btn"
+                  onClick={() => { setShowSearch(false); setSearchQ(""); edRef.current?.focus() }}
+                  title="Close search (Esc)"
+                  style={{ padding: "2px 6px" }}>✕</button>
+              </div>
+            )}
+
+            {/* ── Main output ───────────────────────────────────────── */}
             <div ref={outRef} className="deveval-output-wrap"
               style={{ maxHeight: fullView ? "70vh" : "42vh", overflowY: "auto" }}>
-              <pre className="deveval-output-pre"
-                dangerouslySetInnerHTML={{ __html: colorize(display || "") }} />
+              <pre className={`deveval-output-pre${showLines ? " has-lines" : ""}`}
+                dangerouslySetInnerHTML={{ __html: outputWithLines }} />
             </div>
+
+            {/* ── Pinned compare panel ──────────────────────────────── */}
+            {pinned && pinned !== outText && (
+              <div style={{ borderTop: "1px solid var(--border)" }}>
+                <div style={{
+                  padding: "4px 10px", fontSize: 10, opacity: 0.5,
+                  display: "flex", justifyContent: "space-between"
+                }}>
+                  <span>📌 Pinned output</span>
+                  <button className="deveval-copy-btn" style={{ fontSize: 10 }} onClick={() => setPinned(null)}>clear pin</button>
+                </div>
+                <div style={{ maxHeight: "20vh", overflowY: "auto" }}>
+                  <pre className={`deveval-output-pre${showLines ? " has-lines" : ""}`}
+                    style={{ opacity: 0.6 }}
+                    dangerouslySetInnerHTML={{ __html: colorize(pinned || "") }} />
+                </div>
+              </div>
+            )}
           </div>
         )}
+
+        {/* ── Inline CSS for new features ─────────────────────────────────── */}
+        <style>{`
+          .devc-search-match { background: rgba(250,200,0,.35); border-radius: 2px; }
+          .devc-search-current { background: rgba(250,200,0,.85); color: #000 !important; border-radius: 2px; }
+          .devc-ln {
+            display: inline-block;
+            min-width: 3ch;
+            margin-right: 12px;
+            color: rgba(255,255,255,.2);
+            user-select: none;
+            text-align: right;
+            font-size: 0.9em;
+          }
+          .deveval-output-pre.has-lines { padding-left: 6px; }
+        `}</style>
       </div>
     </div>
   )

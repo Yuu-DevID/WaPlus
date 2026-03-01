@@ -772,6 +772,7 @@ const statements = {
     `),
 
     updateMessageStatus:  db.prepare('UPDATE messages SET status = ? WHERE id = ?'),
+    updateMessageRaw:     db.prepare('UPDATE messages SET message_json = ? WHERE id = ?'),
     updateMessageStarred: db.prepare('UPDATE messages SET starred = ? WHERE id = ?'),
     markMessageDeleted:   db.prepare('UPDATE messages SET is_deleted = 1 WHERE id = ?'),
 
@@ -1620,6 +1621,11 @@ const database = {
     updateMessageStatus(id, status) {
         if (!id) return;
         statements.updateMessageStatus.run(status, id);
+    },
+
+    updateMessageRaw(id, rawJson) {
+        if (!id) return;
+        statements.updateMessageRaw.run(rawJson, id);
     },
 
     updateMediaSavedPath(id, localPath) {

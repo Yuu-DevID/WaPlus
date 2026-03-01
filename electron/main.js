@@ -166,8 +166,8 @@ ipcMain.handle("msg:send", async (_e, { jid, body, type = "text", quotedMsgId = 
         if (row) {
           // Parse raw message JSON yang disimpan saat receive
           let rawMessage = null
-          if (row.message_json) {
-            try { rawMessage = JSON.parse(row.message_json) } catch (_) {}
+          if (row.raw) {
+            try { rawMessage = JSON.parse(row.raw) } catch (_) {}
           }
 
           // Fallback: buat minimal message object dari field DB
@@ -250,7 +250,7 @@ ipcMain.handle("msg:send-media", async (_e, { jid, items, quotedMsgId }) => {
         const row = d.getMessageById?.(quotedMsgId)
         if (row) {
           let rawMessage = null
-          try { rawMessage = JSON.parse(row.message_json) } catch (_) {}
+          try { rawMessage = JSON.parse(row.raw) } catch (_) {}
           if (!rawMessage) rawMessage = row.body ? { conversation: row.body } : { conversation: "" }
           const isGrp = (row.remote_jid || "").endsWith("@g.us")
           const part  = isGrp && !row.from_me && row.participant ? row.participant : undefined
@@ -368,23 +368,23 @@ ipcMain.handle("db:stats", () => {
   catch (err) { return { ok: false, error: err.message } }
 })
 
-// ── View Raw Message — fetch full DB row + raw message_json ──────────────────
+// ── View Raw Message — fetch full DB row + raw WAMessage proto ───────────────
 // Used by the "View Raw" context menu item to show unparsed proto data.
 ipcMain.handle("db:messages:raw", (_e, { id }) => {
   try {
     const db = getDB()
     const row = db.getMessageById?.(id)
     if (!row) return { ok: false, error: "Message not found" }
-    // Parse message_json if stored, so renderer sees real object
+    // Parse raw column — full WAMessage proto JSON
     let parsedJson = null
-    if (row.message_json) {
-      try { parsedJson = JSON.parse(row.message_json) } catch (_) { parsedJson = row.message_json }
+    if (row.raw) {
+      try { parsedJson = JSON.parse(row.raw) } catch (_) { parsedJson = row.raw }
     }
     return {
       ok: true,
       data: {
         ...row,
-        _message_json_parsed: parsedJson,
+        _raw_parsed: parsedJson,
       }
     }
   } catch (err) { return { ok: false, error: err.message } }
@@ -839,12 +839,90 @@ ipcMain.handle("dev:eval", async (_e, { code, mode, msgId, chatJid, fullOutput }
         let msgJson = {}
         try { if (row.message_json) msgJson = JSON.parse(row.message_json) } catch {}
 
-        // Strip transport-layer keys to get content keys only
+        // Kalau message_json NULL (pesan lama), reconstruct dari kolom DB
+        if (!msgJson || !Object.keys(msgJson).length) {
+          const inner = {}
+          const body = row.body || ""
+          const mime = row.media_mimetype || ""
+
+          // Text fields
+          if (msgType === "conversation") {
+            inner.conversation = body
+          } else if (msgType === "extendedTextMessage") {
+            inner.text = body
+          } else if (mime.startsWith("image/") || msgType === "imageMessage") {
+            inner.caption = body
+            if (row.media_url)        inner.url          = row.media_url
+            if (row.media_key)        inner.mediaKey     = row.media_key
+            if (row.media_mimetype)   inner.mimetype     = row.media_mimetype
+            if (row.media_file_length) inner.fileLength  = row.media_file_length
+            if (row.media_width)      inner.width        = row.media_width
+            if (row.media_height)     inner.height       = row.media_height
+            if (row.media_direct_path) inner.directPath  = row.media_direct_path
+            if (row.media_sha256)     inner.fileSha256   = row.media_sha256
+            if (row.media_enc_sha256) inner.fileEncSha256 = row.media_enc_sha256
+          } else if (mime.startsWith("video/") || msgType === "videoMessage") {
+            inner.caption = body
+            if (row.media_url)        inner.url          = row.media_url
+            if (row.media_key)        inner.mediaKey     = row.media_key
+            if (row.media_mimetype)   inner.mimetype     = row.media_mimetype
+            if (row.media_file_length) inner.fileLength  = row.media_file_length
+            if (row.media_width)      inner.width        = row.media_width
+            if (row.media_height)     inner.height       = row.media_height
+            if (row.media_duration)   inner.seconds      = row.media_duration
+            if (row.media_direct_path) inner.directPath  = row.media_direct_path
+            if (row.is_gif)           inner.gifPlayback  = !!(row.is_gif)
+          } else if (mime.startsWith("audio/") || msgType === "audioMessage" || msgType === "pttMessage") {
+            if (row.media_url)        inner.url          = row.media_url
+            if (row.media_key)        inner.mediaKey     = row.media_key
+            if (row.media_mimetype)   inner.mimetype     = row.media_mimetype
+            if (row.media_duration)   inner.seconds      = row.media_duration
+            if (row.is_ptt)           inner.ptt          = !!(row.is_ptt)
+          } else if (msgType === "documentMessage") {
+            inner.caption = body
+            if (row.media_url)        inner.url          = row.media_url
+            if (row.media_key)        inner.mediaKey     = row.media_key
+            if (row.media_mimetype)   inner.mimetype     = row.media_mimetype
+            if (row.media_file_name)  inner.fileName     = row.media_file_name
+            if (row.media_file_length) inner.fileLength  = row.media_file_length
+          } else if (msgType === "stickerMessage") {
+            if (row.media_url)        inner.url          = row.media_url
+            if (row.media_key)        inner.mediaKey     = row.media_key
+            if (row.media_mimetype)   inner.mimetype     = row.media_mimetype
+            if (row.is_animated)      inner.isAnimated   = !!(row.is_animated)
+          } else if (msgType === "reactionMessage") {
+            inner.text         = row.reaction_text || ""
+            inner.key          = { id: row.reaction_target_id, remoteJid: row.reaction_target_remote_jid, fromMe: !!(row.reaction_target_from_me) }
+          } else if (msgType === "locationMessage") {
+            inner.degreesLatitude  = row.location_lat  || 0
+            inner.degreesLongitude = row.location_lng  || 0
+            inner.name             = body || ""
+          }
+
+          // Quoted / contextInfo
+          if (row.context_stanza_id) {
+            inner.contextInfo = {
+              stanzaId:    row.context_stanza_id,
+              participant: row.context_participant || undefined,
+              isForwarded: !!(row.context_is_forwarded),
+              forwardingScore: row.context_forwarding_score || 0,
+            }
+            try {
+              if (row.context_quoted_message) inner.contextInfo.quotedMessage = JSON.parse(row.context_quoted_message)
+            } catch {}
+            try {
+              if (row.context_mentioned_jids) inner.contextInfo.mentionedJid = JSON.parse(row.context_mentioned_jids)
+            } catch {}
+          }
+
+          msgJson = { [msgType]: inner }
+          msgJson._reconstructed = true  // tandai ini hasil reconstruct bukan proto asli
+        }
+
+        // Inner msg = first content key (skip transport-layer wrappers for msg field only)
         const SKIP = new Set(["messageContextInfo", "senderKeyDistributionMessage",
                                "botInvokeMessage", "nativeFlowMessage"])
         const contentKeys = Object.keys(msgJson).filter(k => !SKIP.has(k))
-
-        // Inner msg = msgJson[contentType]
         let innerMsg = {}
         const innerKey = contentKeys[0] || msgType
         innerMsg = msgJson[innerKey] || msgJson

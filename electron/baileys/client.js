@@ -147,6 +147,13 @@ const msgRetryCache = new NodeCache({
   maxKeys: CONFIG.MSG_CACHE_MAX,
 })
 
+// Cache full WAMessage proto (msg) untuk DevEval full dump
+// Simpan 200 pesan terakhir, TTL 10 menit
+const rawMsgCache = new NodeCache({
+  stdTTL: 600,
+  maxKeys: 200,
+})
+
 // Ensure media directory exists
 if (!fs.existsSync(CONFIG.MEDIA_DIR)) {
   fs.mkdirSync(CONFIG.MEDIA_DIR, { recursive: true })
@@ -214,11 +221,27 @@ const logger = pino({
 // HELPERS
 // ════════════════════════════════════════════════════════════
 
+// Sanitize data before IPC — handles BigInt, Buffer, undefined, circular refs
+function sanitize(obj) {
+  try {
+    return JSON.parse(JSON.stringify(obj, (_, v) => {
+      if (typeof v === 'bigint') return Number(v)
+      if (v instanceof Uint8Array || Buffer.isBuffer(v)) return v.toString('base64')
+      if (v === undefined) return null
+      return v
+    }))
+  } catch (_) {
+    return null
+  }
+}
+
 function send(channel, data) {
   if (mainWindow && !mainWindow.isDestroyed()) {
     try {
-      mainWindow.webContents.send(channel, data)
-    } catch (_) { }
+      mainWindow.webContents.send(channel, data === undefined ? null : sanitize(data))
+    } catch (e) {
+      console.warn(`[IPC] Failed to send "${channel}":`, e.message)
+    }
   }
 }
 
@@ -541,6 +564,9 @@ async function handleMessage(msg, type, isHistorySync = false) {
 
   // ── Cache for retry ───────────────────────────────────────
   if (msg.message) msgRetryCache.set(msg.key.id, msg.message)
+
+  // ── Cache full proto untuk DevEval full dump ───────────────
+  if (msg.key?.id) rawMsgCache.set(msg.key.id, msg)
 
   // ── Log ───────────────────────────────────────────────────
   if (!parsed.from_me && parsed.body) {
@@ -938,7 +964,7 @@ async function connectToWhatsApp(phoneForPairing = null) {
       if (update.pollUpdates) {
         const pollMsg = db.getMessageById(key.id)
         if (pollMsg && pollMsg.poll_options) {
-          const pollCreation = JSON.parse(pollMsg.message_json)
+          const pollCreation = JSON.parse(pollMsg.raw || '{}')
           const pollResults = getAggregateVotesInPollMessage({
             message: pollCreation,
             pollUpdates: update.pollUpdates,
@@ -961,6 +987,16 @@ async function connectToWhatsApp(phoneForPairing = null) {
 
       // Handle message edits
       if (update.message) {
+        // Save raw proto — critical for fromMe messages that arrive in two steps:
+        // step 1: handleMessage gets msg with empty message field (just key+timestamp)
+        // step 2: messages.update delivers the actual message content
+        try {
+          const existing = db.getMessageById?.(key.id)
+          if (existing && (!existing.message_json || existing.message_json === '{}')) {
+            db.updateMessageRaw(key.id, JSON.stringify(update.message))
+          }
+        } catch (_) {}
+
         // Check if edited message
         const editedType = Object.keys(update.message).find(k => k.includes('edited'))
         if (editedType) {
@@ -1795,6 +1831,11 @@ function getSocket() {
   return sock
 }
 
+// Ambil full WAMessage proto dari in-memory cache (untuk DevEval full dump)
+function getRawMsg(msgId) {
+  return msgId ? rawMsgCache.get(msgId) || null : null
+}
+
 function getConnectionStatus() {
   return {
     connected: isConnected,
@@ -1813,6 +1854,7 @@ module.exports = {
   init,
   forceReconnect,
   getSocket,
+  getRawMsg,
   getConnectionStatus,
 
   requestPairingCode,

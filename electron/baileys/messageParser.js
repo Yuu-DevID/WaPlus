@@ -1436,11 +1436,8 @@ function parseMessage(msg, opts = {}) {
     starred: msg.starred ? 1 : 0,
     is_history_sync: opts.isHistorySync ? 1 : 0,
 
-    // ── Raw untuk debugging/future use ────────────────
-    // Simpan raw hanya untuk tipe yang mungkin butuh re-parse
-    raw_json: shouldStoreRaw(msgType)
-      ? JSON.stringify(rawMessage)
-      : null,
+    // ── Raw: simpan selalu untuk semua tipe — dibutuhkan DevEval & re-parse ──
+    raw_json: JSON.stringify(rawMessage),
   }
 }
 
