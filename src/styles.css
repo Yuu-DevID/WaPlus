@@ -2506,3 +2506,88 @@ textarea {
   flex-direction: column;
   flex-shrink: 0;
 }
+
+/* ═══════════════════════════════════════════════════════
+   [F6] Loading progress animation — spin-progress
+   ═══════════════════════════════════════════════════════ */
+@keyframes spin-progress {
+  from { stroke-dashoffset: 100.5; transform: rotate(0deg); transform-origin: center; }
+  to   { stroke-dashoffset: 100.5; transform: rotate(360deg); transform-origin: center; }
+}
+@keyframes spin-anim {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+/* Applied to SVG circle in MediaLoadingSpinner */
+circle.anim-spin {
+  animation: spin-anim 1s linear infinite;
+  transform-origin: center;
+}
+
+/* ═══════════════════════════════════════════════════════
+   [F1] Album grid bubble
+   ═══════════════════════════════════════════════════════ */
+.album-grid {
+  border-radius: 8px;
+  overflow: hidden;
+  gap: 2px !important;
+}
+.album-grid > div {
+  background: rgba(255,255,255,0.04);
+  position: relative;
+  overflow: hidden;
+}
+.album-grid > div img,
+.album-grid > div video {
+  width: 100%;
+  height: 140px;
+  object-fit: cover;
+  display: block;
+  transition: transform 0.2s;
+}
+.album-grid > div:hover img,
+.album-grid > div:hover video {
+  transform: scale(1.03);
+}
+.album-grid .album-overlay {
+  position: absolute;
+  inset: 0;
+  background: rgba(0,0,0,0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 26px;
+  font-weight: 700;
+  color: #fff;
+}
+
+/* ═══════════════════════════════════════════════════════
+   [F4] Newsletter channel list item badge
+   ═══════════════════════════════════════════════════════ */
+.channel-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 9px;
+  font-weight: 700;
+  background: rgba(37,211,102,0.15);
+  color: var(--green);
+  border-radius: 6px;
+  padding: 1px 5px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+/* [F7] Doc icon container using heroicon */
+.doc-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+/* [F6] MediaLoadingSpinner progress circle animation */
+@keyframes progress-spin {
+  0% { stroke-dashoffset: 100; transform: rotate(-90deg); transform-box: fill-box; transform-origin: center; }
+  100% { stroke-dashoffset: 0; transform: rotate(270deg); transform-box: fill-box; transform-origin: center; }
+}

@@ -323,7 +323,36 @@ export default function MessageInput({ chatJid, chatName, replyTo, onCancelReply
       )}
 
       <div className="input-area">
-        <button className="input-action-btn" title="Emoji"><EmojiIcon/></button>
+        <button
+          className="input-action-btn"
+          title="Emoji (Win+. atau Ctrl+Cmd+Space)"
+          onClick={() => {
+            // [F2] Buka OS native emoji picker
+            ref.current?.focus()
+            if (window.api?.openEmojiPicker) {
+              // Jika ada IPC handler khusus di main.js
+              window.api.openEmojiPicker()
+            } else {
+              // Trigger via Electron webContents.executeJavaScript keyboard simulation
+              // Windows: Win+. | macOS: Ctrl+Cmd+Space
+              const isMac = navigator.platform?.toLowerCase().includes("mac") || navigator.userAgent?.includes("Mac")
+              if (window.api?.triggerEmojiPicker) {
+                window.api.triggerEmojiPicker()
+              } else {
+                // Minimal fallback: dispatch keyboard shortcut ke window
+                // Electron akan forward ke OS jika shortcut tidak dikonsumsi
+                const key = isMac ? "." : "."
+                window.dispatchEvent(new KeyboardEvent("keydown", {
+                  key,
+                  metaKey: isMac,
+                  ctrlKey: false,
+                  bubbles: true,
+                  cancelable: true,
+                }))
+              }
+            }
+          }}
+        ><EmojiIcon/></button>
         <button className="input-action-btn" title="Lampiran / drag & drop / paste gambar" onClick={openFilePicker}>
           <AttachIcon/>
         </button>

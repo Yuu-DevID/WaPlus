@@ -1,21 +1,49 @@
-Project : WaPlus-dev
-Generated: 2026-02-28 05:44:31
+Project : AuroraChat
+Generated: 2026-03-01 09:37:06
 ==================================================
-WaPlus-dev/
+AuroraChat/
 ├── .git/
 │   └── ...
 ├── electron/
 │   ├── baileys/
-│   │   ├── media/
-│   │   │   └── ...
-│   │   ├── session/
-│   │   │   └── ...
 │   │   ├── client.js
 │   │   ├── database.js
 │   │   ├── lid_map.json
 │   │   └── messageParser.js
 │   ├── db/
 │   │   └── database.js
+│   ├── mods/
+│   │   ├── plugins/
+│   │   │   ├── auto-reply/
+│   │   │   │   ├── index.js
+│   │   │   │   └── manifest.json
+│   │   │   ├── business-message/
+│   │   │   │   ├── index.js
+│   │   │   │   └── manifest.json
+│   │   │   ├── command-handler/
+│   │   │   │   ├── index.js
+│   │   │   │   └── manifest.json
+│   │   │   ├── external-ad-reply/
+│   │   │   │   ├── index.js
+│   │   │   │   └── manifest.json
+│   │   │   ├── forwarded-score/
+│   │   │   │   ├── data.json
+│   │   │   │   ├── index.js
+│   │   │   │   └── manifest.json
+│   │   │   ├── interactive-button/
+│   │   │   │   ├── index.js
+│   │   │   │   └── manifest.json
+│   │   │   ├── is-forwarded/
+│   │   │   │   ├── index.js
+│   │   │   │   └── manifest.json
+│   │   │   ├── message-logger/
+│   │   │   │   ├── index.js
+│   │   │   │   └── manifest.json
+│   │   │   └── newsletter-forward/
+│   │   │       ├── index.js
+│   │   │       └── manifest.json
+│   │   ├── modManager.js
+│   │   └── mods_state.json
 │   ├── main.js
 │   └── preload.js
 ├── node_modules/
@@ -27,6 +55,7 @@ WaPlus-dev/
 │   │   ├── ChatWindow.jsx
 │   │   ├── ContactPanel.jsx
 │   │   ├── CountrySelect.jsx
+│   │   ├── MediaViewer.jsx
 │   │   ├── MessageBubble.jsx
 │   │   ├── MessageInput.jsx
 │   │   ├── QRDisplay.jsx
@@ -38,7 +67,9 @@ WaPlus-dev/
 │   │   └── useMediaPrefetch.js
 │   ├── pages/
 │   │   ├── Auth.jsx
-│   │   └── Main.jsx
+│   │   ├── Main.jsx
+│   │   ├── ModManager.jsx
+│   │   └── StatusUploader.jsx
 │   ├── store/
 │   │   ├── app.js
 │   │   ├── auth.js
@@ -47,12 +78,11 @@ WaPlus-dev/
 │   ├── main.jsx
 │   └── styles.css
 ├── .gitignore
+├── README.md
 ├── Tree_Project.txt
-├── WaPlus-dev.zip
 ├── index.html
 ├── output (1).json
 ├── output.json
-├── package-lock.json
 ├── package.json
 ├── project_tree.py
 ├── tailwind.config.js

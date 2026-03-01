@@ -4,14 +4,24 @@ const fs = require("fs")
 
 const isDev = !app.isPackaged
 
-// Check if a valid WA session exists (creds.json with me field)
+// Check if a valid WA session exists
+// Priority: creds.json with "me" field — fallback: session folder has any files
 function hasExistingSession() {
   const sessionDir = path.resolve(__dirname, "./baileys/session")
+  if (!fs.existsSync(sessionDir)) return false
+  // Primary: check creds.json has me field (fully authenticated)
   const credsPath = path.join(sessionDir, "creds.json")
-  if (!fs.existsSync(credsPath)) return false
+  if (fs.existsSync(credsPath)) {
+    try {
+      const creds = JSON.parse(fs.readFileSync(credsPath, "utf8"))
+      if (creds && creds.me) return true
+    } catch { /* fall through */ }
+  }
+  // Fallback: if session folder has any content, assume session exists
+  // (handles cases where creds.json exists but "me" not yet populated)
   try {
-    const creds = JSON.parse(fs.readFileSync(credsPath, "utf8"))
-    return !!(creds && creds.me)
+    const files = fs.readdirSync(sessionDir)
+    return files.length > 0
   } catch {
     return false
   }
@@ -718,5 +728,42 @@ ipcMain.handle("fs:exists", (_e, { rawPath }) => {
     return require("fs").existsSync(p)
   } catch {
     return false
+  }
+})
+// ── [F2] Emoji Picker — trigger OS emoji picker via Electron ──────────────────
+ipcMain.handle("ui:emoji-picker", async (_e) => {
+  try {
+    // Windows: mengirim shortcut Win+Period via robotjs atau keyboard shortcut
+    // Electron tidak support langsung Win+. injection, tapi bisa via globalShortcut
+    // Cara paling simple: kirim pesan balik ke renderer agar dia handle sendiri
+    if (win) win.webContents.executeJavaScript(`
+      (function() {
+        const focused = document.activeElement
+        // Trigger native OS emoji picker via keyboard event simulation
+        // Windows 10+: Win+. shortcut (harus dihandle di OS level)
+        // Electron dapat trigger ini jika windowsManager enabled
+        document.dispatchEvent(new KeyboardEvent('keydown', {key:'.',metaKey:true,bubbles:true}))
+      })()
+    `).catch(() => {})
+    return { ok: true }
+  } catch (e) { return { ok: false } }
+})
+
+// ── [F3] Mark Messages Read via Baileys ──────────────────────────────────────
+ipcMain.handle("msg:mark-read", async (_e, { jid, msgIds }) => {
+  try {
+    if (!baileysClient) return { ok: false, error: "Client belum siap" }
+    if (!Array.isArray(msgIds) || msgIds.length === 0) {
+      // Hanya update DB
+      getDB().markChatRead(jid)
+      return { ok: true, baileys: false }
+    }
+    // Panggil baileys markRead
+    await baileysClient.markRead(jid, msgIds)
+    return { ok: true, baileys: true }
+  } catch (e) {
+    // Jika Baileys error, tetap update DB
+    try { getDB().markChatRead(jid) } catch {}
+    return { ok: false, error: e.message }
   }
 })

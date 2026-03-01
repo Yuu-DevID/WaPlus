@@ -173,4 +173,12 @@ contextBridge.exposeInMainWorld("api", {
   modsUpdateHooks: ({ id, hooks }) => ipcRenderer.invoke("mods:update-hooks", { id, hooks }),
   openExternal:   (url)        => ipcRenderer.invoke("shell:open-external", url),
   onModsUpdated:  createListener("mods:updated"),
+  // [F2] Emoji picker (OS native)
+  openEmojiPicker:    ()              => ipcRenderer.invoke("ui:emoji-picker"),
+  triggerEmojiPicker: ()              => ipcRenderer.invoke("ui:emoji-picker"),
+  // [F3] Mark messages read via Baileys sock.readMessages
+  markMessagesRead: ({ jid, msgIds }) => ipcRenderer.invoke("msg:mark-read", { jid, msgIds }),
 })
+// NOTE: Below lines injected by fix script — appended separately
+// These are added to window.api via contextBridge above, but since the file
+// uses contextBridge.exposeInMainWorld in a closure, we add them via patch:

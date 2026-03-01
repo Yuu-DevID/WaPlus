@@ -290,9 +290,19 @@ const ChatItem = memo(function ChatItem({ chat, isActive, onClick, observe, unob
               textOverflow: "ellipsis",
               flex:         1,
               minWidth:     0,
+              display:      "flex",
+              alignItems:   "center",
+              gap:          5,
             }}
           >
             {displayName}
+            {/* [F4] Newsletter/channel badge */}
+            {isChannel && (
+              <span className="channel-badge">
+                <svg width="8" height="8" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M10.34 15.84c-.688-.06-1.386-.09-2.09-.09H7.5a4.5 4.5 0 1 1 0-9h.75c.704 0 1.402-.03 2.09-.09m0 9.18c.253.962.584 1.892.985 2.783M10.34 6.66a23.847 23.847 0 0 1 8.835-2.535m0 0A23.74 23.74 0 0 1 18.795 3"/></svg>
+                Saluran
+              </span>
+            )}
           </span>
           <span
             style={{
