@@ -132,6 +132,8 @@ const DevEvalModal = memo(function DevEvalModal({ msg, onClose }) {
   const [searchIdx,   setSearchIdx]   = useState(0)
   // ── Pinned output ───────────────────────────────────────────────────────────
   const [pinned,      setPinned]      = useState(null)
+  // ── Pretty JSON ─────────────────────────────────────────────────────────────
+  const [prettyJson,  setPrettyJson]  = useState(false)
 
   const edRef      = useRef(null)
   const outRef     = useRef(null)
@@ -163,6 +165,7 @@ const DevEvalModal = memo(function DevEvalModal({ msg, onClose }) {
   useEffect(() => {
     setFullView(false)
     setSearchIdx(0)
+    setPrettyJson(false)
     if (outRef.current) outRef.current.scrollTop = 0
   }, [result])
 
@@ -243,11 +246,54 @@ const DevEvalModal = memo(function DevEvalModal({ msg, onClose }) {
     ? (result.ok ? result.result : (result.error + (result.stack ? "\n\nStack:\n" + result.stack : "")))
     : null
 
+  // Detect apakah output bisa di-pretty-print sebagai JSON
+  const isJsonOutput = useMemo(() => {
+    if (!outText) return false
+    const t = outText.trim()
+    if (!(t.startsWith("{") || t.startsWith("[") || t.startsWith("'"))) return false
+    // Coba parse — util.inspect output pakai single quote, coba JSON juga
+    try { JSON.parse(t); return true } catch {}
+    // util.inspect format: coba konversi single → double quote sederhana
+    try {
+      const j = t
+        .replace(/'/g, '"')
+        .replace(/(\w+):/g, '"$1":')
+        .replace(/,\s*}/g, '}')
+        .replace(/,\s*]/g, ']')
+      JSON.parse(j); return true
+    } catch {}
+    return false
+  }, [outText])
+
+  // Versi pretty — kalau prettyJson aktif, coba format ulang
+  const prettyOutText = useMemo(() => {
+    if (!prettyJson || !outText) return outText
+    const t = outText.trim()
+    // Try direct JSON parse dulu
+    try {
+      return JSON.stringify(JSON.parse(t), null, 2)
+    } catch {}
+    // util.inspect format — replace biar parseable
+    try {
+      // Ganti single quote string, undefined, trailing comma
+      let s = t
+        .replace(/undefined/g, 'null')
+        .replace(/\[Function[^\]]*\]/g, '"[Function]"')
+        .replace(/\[Circular\]/g, '"[Circular]"')
+        .replace(/([{,]\s*)([a-zA-Z_$][\w$]*)(\s*:)/g, '$1"$2"$3')
+        .replace(/'/g, '"')
+        .replace(/,(\s*[}\]])/g, '$1')
+      return JSON.stringify(JSON.parse(s), null, 2)
+    } catch {}
+    return outText  // fallback ke original kalau gagal
+  }, [prettyJson, outText])
+
   const TRUNC = 30000
-  const isBig = outText && outText.length > TRUNC && !fullView
+  const activeText = prettyJson ? (prettyOutText || outText) : outText
+  const isBig = activeText && activeText.length > TRUNC && !fullView
   const display = isBig
-    ? outText.slice(0, TRUNC) + `\n\n... ▲ TRUNCATED — click "Full View" to show all ${outText.length.toLocaleString()} chars`
-    : outText
+    ? activeText.slice(0, TRUNC) + `\n\n... ▲ TRUNCATED — click "Full View" to show all ${activeText.length.toLocaleString()} chars`
+    : activeText
 
   // Match count on plain text
   const matchCount = useMemo(() => countMatches(display, searchQ), [display, searchQ])
@@ -274,8 +320,9 @@ const DevEvalModal = memo(function DevEvalModal({ msg, onClose }) {
 
   const copyOut = useCallback(() => {
     if (!outText) return
-    navigator.clipboard?.writeText(outText).then(() => { setCopied(true); setTimeout(() => setCopied(false), 2000) })
-  }, [outText])
+    const toCopy = prettyJson ? (prettyOutText || outText) : outText
+    navigator.clipboard?.writeText(toCopy).then(() => { setCopied(true); setTimeout(() => setCopied(false), 2000) })
+  }, [outText, prettyJson, prettyOutText])
 
   const saveOut = useCallback(async () => {
     if (!outText) return
@@ -308,6 +355,7 @@ const DevEvalModal = memo(function DevEvalModal({ msg, onClose }) {
   const IconSearch   = () => <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
   const IconPin      = () => <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><line x1="12" y1="17" x2="12" y2="22"/><path d="M5 17h14v-1.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V6h1a2 2 0 0 0 0-4H8a2 2 0 0 0 0 4h1v4.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24Z"/></svg>
   const IconLines    = () => <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>
+  const IconJson     = () => <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M4 7c0-1.1.9-2 2-2h1a2 2 0 0 1 2 2v1a2 2 0 0 0 2 2 2 2 0 0 0-2 2v1a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2"/><path d="M20 7c0-1.1-.9-2-2-2h-1a2 2 0 0 0-2 2v1a2 2 0 0 1-2 2 2 2 0 0 1 2 2v1a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2"/></svg>
 
   return (
     <div className="deveval-backdrop" onClick={e => e.target === e.currentTarget && !running && onClose()} role="dialog" aria-modal="true">
@@ -428,6 +476,16 @@ const DevEvalModal = memo(function DevEvalModal({ msg, onClose }) {
               </div>
 
               <div style={{ display: "flex", gap: 5, alignItems: "center" }}>
+                {/* Pretty JSON */}
+                {outText && (
+                  <button
+                    className={`deveval-copy-btn${prettyJson ? " copied" : ""}`}
+                    onClick={() => setPrettyJson(v => !v)}
+                    title={prettyJson ? "Tampilkan output original" : "Format sebagai JSON (pretty print)"}
+                    style={{ color: prettyJson ? "var(--green)" : isJsonOutput ? undefined : "rgba(255,255,255,0.3)" }}>
+                    <IconJson />&nbsp;JSON
+                  </button>
+                )}
                 {/* Search toggle */}
                 <button
                   className={`deveval-copy-btn${showSearch ? " copied" : ""}`}
