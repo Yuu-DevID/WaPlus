@@ -10,6 +10,7 @@
 // [N-5] Settings Modal: Lebih banyak tipe field (json, textarea, color, range)
 
 import { useState, useEffect, useCallback } from "react"
+import PluginDocs from "../components/PluginDocs"
 
 const Icon = ({ d, size = 18, className = "" }) => (
   <svg width={size} height={size} viewBox="0 0 24 24" fill="none"
@@ -528,11 +529,21 @@ function SettingsModal({ plugin, onClose, onSaved }) {
           >
             ⚡ Hooks
           </button>
+          <button
+            className={"settings-tab" + (tab === "docs" ? " settings-tab--active" : "")}
+            onClick={() => setTab("docs")}
+            title="Plugin Context API Documentation"
+          >
+            📖 Docs
+          </button>
         </div>
 
         <div className="modal__body">
           {loading ? (
             <div className="mod-loading">Memuat...</div>
+          ) : tab === "docs" ? (
+            /* ── Docs tab — Plugin Context API reference ── */
+            <PluginDocs inline />
           ) : tab === "settings" ? (
             <>
               {schema.length === 0 && customFields.length === 0 && (
@@ -605,7 +616,7 @@ function SettingsModal({ plugin, onClose, onSaved }) {
 
         <div className="modal__footer">
           <button className="btn-secondary" onClick={onClose}>Tutup</button>
-          {tab === "settings" ? (
+          {tab === "docs" ? null : tab === "settings" ? (
             <button
               className={"btn-primary" + (saved ? " btn-saved" : "")}
               onClick={handleSave}

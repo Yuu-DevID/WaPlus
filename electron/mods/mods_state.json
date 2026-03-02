@@ -7,6 +7,6 @@
   "business-message": false,
   "forwarded-score": false,
   "is-forwarded": false,
-  "interactive-button": false,
+  "interactive-button": true,
   "test-pugin-w": false
 }

@@ -1,7 +1,0 @@
-{
-  "id": "business-message",
-  "name": "Business Message Injector",
-  "version": "1.0.0",
-  "description": "Inject contextInfo.businessMessageForwardInfo ke setiap pesan yang dikirim",
-  "author": "WaPlus"
-}

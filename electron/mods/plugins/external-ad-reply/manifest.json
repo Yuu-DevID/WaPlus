@@ -1,7 +1,0 @@
-{
-  "id": "external-ad-reply",
-  "name": "External Ad Reply Injector",
-  "version": "1.0.0",
-  "description": "Otomatis inject contextInfo.externalAdReply ke setiap pesan yang dikirim",
-  "author": "WaPlus"
-}

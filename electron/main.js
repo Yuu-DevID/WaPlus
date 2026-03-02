@@ -450,56 +450,21 @@ ipcMain.handle("db:sync:status", () => {
 // BAILEYS EVENT → DB BRIDGE
 // ════════════════════════════════════════════════════════════
 
+// [BUG FIX 4] onBaileysMessage adalah DEAD CODE — tidak pernah dipanggil oleh client.js.
+// Pesan disimpan langsung di client.js handleMessage() → db.insertMessage(parsed).
+// Function ini sisa refactor lama yang tidak pernah dihapus.
+// JANGAN dihapus tiba-tiba karena mungkin ada kode luar yang references ini —
+// cukup tandai deprecated dan arahkan ke flow yang benar.
+//
+// Flow yang benar:
+//   client.js: messages.upsert → handleMessage() → db.insertMessage(parsed)
+//                                                 → send("messages:new", payload)
+//
+// @deprecated - tidak dipanggil, akan dihapus di versi berikutnya
 module.exports.onBaileysMessage = function (payload) {
-  try {
-    const d = getDB()
-    const msgId = payload.key?.id
-    if (!msgId) return
-
-    d.insertMessage({
-      id: msgId,
-      chat_jid: payload.jid,
-      sender_jid: payload.sender,
-      sender_name: payload.pushname,
-      body: payload.body || null,
-      msg_type: payload.msgType || "conversation",
-      timestamp: payload.timestamp,
-      status: payload.status || 0,
-      from_me: payload.isMe ? 1 : 0,
-      is_group: payload.isGroup ? 1 : 0,
-      has_media: payload.hasMedia ? 1 : 0,
-      starred: payload.starred ? 1 : 0,
-      quoted_id: null,
-      raw: null,
-    })
-
-    // Push ke renderer — media_saved_path mungkin belum ada saat ini,
-    // akan di-update via "media:updated" event setelah download selesai
-    win?.webContents.send("db:messages:new", {
-      chat_jid: payload.jid,
-      message: {
-        id: msgId,
-        chat_jid: payload.jid,
-        sender_name: payload.pushname,
-        body: payload.body,
-        msg_type: payload.msgType,
-        timestamp: payload.timestamp,
-        from_me: payload.isMe ? 1 : 0,
-        status: payload.status || 0,
-        has_media: payload.hasMedia ? 1 : 0,
-        mimetype: payload.mimetype || null,
-        duration: payload.duration || null,
-        // FIX 3: media_saved_path awalnya null, akan di-update via event "media:updated"
-        media_saved_path: null,
-        media_url: payload.mediaUrl || null,
-        is_group: payload.isGroup ? 1 : 0,
-      }
-    })
-
-    win?.webContents.send("db:chats:updated")
-  } catch (err) {
-    console.error("[AuroraChat] DB write error:", err.message)
-  }
+  console.warn("[AuroraChat] onBaileysMessage() dipanggil — function ini DEPRECATED dan tidak digunakan.")
+  console.warn("[AuroraChat] Pesan seharusnya diproses via client.js handleMessage() → db.insertMessage()")
+  // Tidak melakukan apa-apa — dead code path
 }
 
 // ── FIX 4: Event baru — dipanggil dari client.js setelah media selesai didownload ──
@@ -799,6 +764,8 @@ ipcMain.handle("msg:mark-read", async (_e, { jid, msgIds }) => {
 //   • Tidak ada akses dari luar proses Electron
 //   • Variabel yang di-inject terbatas: sock, db, baileys, util, path, fs
 //   • Tidak di-expose ke webContents dari window lain
+//   • [SECURITY] Blocklist untuk API berbahaya: child_process, eval native, dll
+//   • [SECURITY] Code length limit — cegah DoS via giant eval
 //
 // MODE:
 //   "expr"  → eval satu ekspresi, auto-return (seperti => di case.js)
@@ -806,6 +773,41 @@ ipcMain.handle("msg:mark-read", async (_e, { jid, msgIds }) => {
 // ════════════════════════════════════════════════════════════
 ipcMain.handle("dev:eval", async (_e, { code, mode, msgId, chatJid, fullOutput }) => {
   if (!code || typeof code !== "string") return { ok: false, error: "Code kosong" }
+
+  // ── [SECURITY] Code length limit — cegah giant payload ──────────────────
+  if (code.length > 50_000) return { ok: false, error: "Code terlalu panjang (max 50.000 karakter)" }
+
+  // ── [SECURITY] Blocklist pola berbahaya ───────────────────────────────────
+  // Cek string literal untuk API yang tidak boleh dipanggil dari eval
+  const DANGEROUS_PATTERNS = [
+    // Native shell/exec
+    /require\s*\(\s*['"`]child_process['"`]\s*\)/,
+    /child_process/,
+    /\.exec\s*\(/,
+    /\.execSync\s*\(/,
+    /\.spawn\s*\(/,
+    /\.spawnSync\s*\(/,
+    // Native eval bypass
+    /\bnative\s+code\b/i,
+    /Function\s*\(\s*['"`]return\s+this/,
+    // VM module escape
+    /require\s*\(\s*['"`]vm['"`]\s*\)/,
+    // Electron dangerous APIs
+    /app\s*\.\s*quit\s*\(/,
+    /app\s*\.\s*exit\s*\(/,
+    /BrowserWindow/,
+    /autoUpdater/,
+    // Exfil via network (fetch is ok, but block node http raw)
+    /require\s*\(\s*['"`]https?['"`]\s*\)/,
+    /require\s*\(\s*['"`]net['"`]\s*\)/,
+    /require\s*\(\s*['"`]dgram['"`]\s*\)/,
+  ]
+
+  for (const pattern of DANGEROUS_PATTERNS) {
+    if (pattern.test(code)) {
+      return { ok: false, error: `[Security] Pola berbahaya terdeteksi: ${pattern.toString().slice(0, 60)}` }
+    }
+  }
 
   const util    = require("util")
   const sock    = baileysClient?.getSocket?.() || null

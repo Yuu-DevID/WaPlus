@@ -150,21 +150,31 @@ class ModManager extends EventEmitter {
   // ─── PLUGIN CONTEXT ───────────────────────────────────────
   // Setiap plugin mendapat context object dengan utils yang berguna
   _createContext(pluginId) {
+    // [BUG FIX 1] Capture `this` (ModManager instance) ke closure variable.
+    // Sebelumnya pakai `get sock() { return this._manager?._sock }` — tapi `this`
+    // di dalam object literal getter merujuk ke context object itu sendiri,
+    // BUKAN ModManager instance. Hasilnya ctx.sock selalu null di semua plugin!
+    // Fix: closure `manager` yang captured saat _createContext() dipanggil.
+    const manager = this
+
     return {
       pluginId,
 
       // ── Full Baileys socket — sama persis dengan `dims` / `sock` ──
+      // [FIXED] Getter ini sekarang pakai closure `manager` bukan `this`.
       // Semua method Baileys tersedia:
       //   ctx.sock.sendMessage(jid, payload, opts)
       //   ctx.sock.groupMetadata(jid)
       //   ctx.sock.sendPresenceUpdate("composing", jid)
       //   ctx.sock.ev.on("messages.upsert", handler)
       //   ... dll
-      get sock() { return this._manager?._sock ?? null },
+      get sock() { return manager._sock ?? null },
 
-      // ── Shortcut helpers (opsional, tetap ada) ────────────────
-      sendText:  (jid, text)      => this._sock?.sendMessage(jid, { text }),
-      sendImage: (jid, img, cap)  => this._sock?.sendMessage(jid, { image: typeof img === "string" ? { url: img } : img, caption: cap || "" }),
+      // ── Shortcut helpers ─────────────────────────────────────
+      sendText:  (jid, text)      => manager._sock?.sendMessage(jid, { text }),
+      sendImage: (jid, img, cap)  => manager._sock?.sendMessage(jid, { image: typeof img === "string" ? { url: img } : img, caption: cap || "" }),
+      sendVideo: (jid, vid, cap)  => manager._sock?.sendMessage(jid, { video: typeof vid === "string" ? { url: vid } : vid, caption: cap || "" }),
+      sendAudio: (jid, aud, ptt = false) => manager._sock?.sendMessage(jid, { audio: typeof aud === "string" ? { url: aud } : aud, ptt, mimetype: ptt ? "audio/ogg; codecs=opus" : "audio/mp4" }),
 
       // ── DB ────────────────────────────────────────────────────
       getDB: () => {
@@ -173,22 +183,36 @@ class ModManager extends EventEmitter {
 
       // ── Renderer ──────────────────────────────────────────────
       sendToUI: (channel, data) => {
-        this._win?.webContents?.send(channel, data)
+        manager._win?.webContents?.send(channel, data)
       },
 
       // ── Log ───────────────────────────────────────────────────
       log:  (...args) => console.log(`[Plugin:${pluginId}]`, ...args),
       logE: (...args) => console.error(`[Plugin:${pluginId}][ERR]`, ...args),
+      logW: (...args) => console.warn(`[Plugin:${pluginId}][WARN]`, ...args),
 
       // ── Storage per-plugin ────────────────────────────────────
       storage: {
-        get:    (key)        => this._pluginStorageGet(pluginId, key),
-        set:    (key, value) => this._pluginStorageSet(pluginId, key, value),
-        getAll: ()           => this._pluginStorageGetAll(pluginId),
+        get:    (key)        => manager._pluginStorageGet(pluginId, key),
+        set:    (key, value) => manager._pluginStorageSet(pluginId, key, value),
+        delete: (key)        => manager._pluginStorageDelete(pluginId, key),
+        getAll: ()           => manager._pluginStorageGetAll(pluginId),
+        clear:  ()           => manager._pluginStorageClear(pluginId),
       },
 
-      // referensi ke manager agar getter sock bisa akses _sock
-      _manager: this,
+      // ── Utils ─────────────────────────────────────────────────
+      // require() terbatas — hanya built-in Node.js modules yang aman
+      require: (mod) => {
+        const ALLOWED = new Set(["path", "fs", "crypto", "os", "url", "util", "events", "stream", "buffer", "querystring"])
+        if (!ALLOWED.has(mod)) throw new Error(`[Plugin Security] require("${mod}") tidak diizinkan. Modul yang diperbolehkan: ${[...ALLOWED].join(", ")}`)
+        return require(mod)
+      },
+
+      // ── Baileys helpers ───────────────────────────────────────
+      // Expose beberapa fungsi Baileys yang umum dipakai plugin
+      get baileys() {
+        try { return require("wileys") } catch { return {} }
+      },
     }
   }
 
@@ -216,6 +240,24 @@ class ModManager extends EventEmitter {
       fs.writeFileSync(this._pluginStoragePath(pluginId), JSON.stringify(all, null, 2))
     } catch (e) {
       this._logE(`Storage write error for "${pluginId}":`, e.message)
+    }
+  }
+
+  _pluginStorageDelete(pluginId, key) {
+    const all = this._pluginStorageGetAll(pluginId)
+    delete all[key]
+    try {
+      fs.writeFileSync(this._pluginStoragePath(pluginId), JSON.stringify(all, null, 2))
+    } catch (e) {
+      this._logE(`Storage delete error for "${pluginId}":`, e.message)
+    }
+  }
+
+  _pluginStorageClear(pluginId) {
+    try {
+      fs.writeFileSync(this._pluginStoragePath(pluginId), "{}", "utf8")
+    } catch (e) {
+      this._logE(`Storage clear error for "${pluginId}":`, e.message)
     }
   }
 
@@ -555,32 +597,41 @@ ${hookCode},
     // We'll do a full rebuild of module.exports keeping user code for enabled hooks
     // Strategy: extract each hook body, rebuild module.exports with only enabledHooks
 
-    // Extract individual hook bodies from source using regex
-    const extractedBodies = {}
-    for (const hook of ALL_HOOKS) {
-      // Match: async hookName(... ) { ... } inside module.exports
-      const re = new RegExp(
-        `(async\s+${hook}\s*\([^)]*\)\s*\{)([\s\S]*?)(^  \})`,
-        "m"
-      )
-      const m = source.match(re)
-      if (m) {
-        extractedBodies[hook] = m[1] + m[2] + m[3]
+    // [BUG FIX 5] Extractor lama pakai regex dengan flag "m" yang fragile.
+    // Regex `(^  \})` gagal total jika indentasi plugin berbeda (tab, 4-spasi, dll).
+    // Fix: brace-counting extractor yang sepenuhnya indent-agnostic.
+    function extractHookBody(src, hookName) {
+      const startRe = new RegExp(`async\\s+${hookName}\\s*\\(`)
+      const match = startRe.exec(src)
+      if (!match) return null
+      let i = match.index
+      while (i < src.length && src[i] !== "{") i++
+      if (i >= src.length) return null
+      let depth = 0, bodyStart = match.index
+      while (i < src.length) {
+        if (src[i] === "{") depth++
+        else if (src[i] === "}") {
+          depth--
+          if (depth === 0) return src.slice(bodyStart, i + 1)
+        }
+        i++
       }
+      return null
     }
 
-    // Build new module.exports block
-    const hookParts = enabledHooks.map(h => {
-      // Use existing body if available, else use template
-      return extractedBodies[h] || HOOK_TEMPLATES[h]
-    }).filter(Boolean)
+    const extractedBodies = {}
+    for (const hook of ALL_HOOKS) {
+      const body = extractHookBody(source, hook)
+      if (body) extractedBodies[hook] = body
+    }
 
-    // Replace module.exports = { ... } block entirely
-    const newExports = 'module.exports = {\n' + hookParts.join(',\n\n') + ',\n}'
+    const hookParts = enabledHooks.map(h => extractedBodies[h] || HOOK_TEMPLATES[h]).filter(Boolean)
+    const newExports = "module.exports = {\n" + hookParts.join(",\n\n") + ",\n}"
 
     if (source.includes("module.exports = {")) {
       const exportsStart = source.indexOf("module.exports = {")
-      let depth = 0, i = exportsStart
+      const braceStart   = source.indexOf("{", exportsStart)
+      let depth = 0, i = braceStart
       while (i < source.length) {
         if (source[i] === "{") depth++
         else if (source[i] === "}") { depth--; if (depth === 0) break }
@@ -591,7 +642,7 @@ ${hookCode},
       source += "\n" + newExports + "\n"
     }
 
-    fs.writeFileSync(indexPath, source, "utf8")
+        fs.writeFileSync(indexPath, source, "utf8")
 
     // Update manifest hooks list
     const manifestPath = path.join(PLUGINS_DIR, plugin.folderName, "manifest.json")
