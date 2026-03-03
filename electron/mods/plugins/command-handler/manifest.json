@@ -1,0 +1,7 @@
+{
+  "id": "command-handler",
+  "name": "Command Handler",
+  "version": "1.0.0",
+  "description": "Handle perintah custom dengan prefix ! (contoh: !ping, !uptime, !info)",
+  "author": "WaPlus"
+}

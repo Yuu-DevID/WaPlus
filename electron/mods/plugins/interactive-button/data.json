@@ -1,0 +1,11 @@
+{
+  "config": {
+    "enabled": true,
+    "displayText": "[ Aurora WaPlus Client ]",
+    "url": "https://google.com",
+    "title": "",
+    "subtitle": "",
+    "footer": "",
+    "_customFields": []
+  }
+}

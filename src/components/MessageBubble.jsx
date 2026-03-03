@@ -99,6 +99,11 @@ function renderContent(msg, opts = {}) {
     case "eventMessage":     return <EventBubble msg={msg} />
     case "newsletterAdminInviteMessage": return <NewsletterBubble msg={msg} />
 
+    // [FIX-ALBUM] albumMessage is the WA album container — its children (imageMessage/videoMessage)
+    // arrive as separate consecutive messages and are grouped by groupMessages() into an AlbumBubble.
+    // The container itself has no displayable content — suppress it here.
+    case "albumMessage": return null
+
     case "protocol":
     case "ephemeral":
     case "messageContextInfo":
@@ -672,7 +677,8 @@ function AlbumBubbleWrapper({ msgs, isMe, isGroup, onMediaClick, openMedia, onRe
 // ════════════════════════════════════════════════════════════
 export { AlbumBubbleWrapper }
 
-export default function MessageBubble({ msg, onReply, onScrollToMsg, onMediaClick }) {
+// [PERF] Memoize MessageBubble to prevent re-renders when sibling messages update
+const _MessageBubbleInner = function MessageBubble({ msg, onReply, onScrollToMsg, onMediaClick }) {
   const isMe = toBool(msg.from_me)
   const isGroup = toBool(msg.is_group)
   const isForwarded = toBool(msg.is_forwarded)
@@ -1027,3 +1033,12 @@ export default function MessageBubble({ msg, onReply, onScrollToMsg, onMediaClic
     </div>
   )
 }
+
+export default memo(_MessageBubbleInner, (prev, next) => {
+  // Only re-render if msg data changed, or callback refs changed
+  if (prev.msg !== next.msg) return false  // re-render needed
+  if (prev.onReply !== next.onReply) return false
+  if (prev.onScrollToMsg !== next.onScrollToMsg) return false
+  if (prev.onMediaClick !== next.onMediaClick) return false
+  return true  // props equal — skip re-render
+})

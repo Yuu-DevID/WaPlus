@@ -7,6 +7,7 @@ import ChatList from "../components/ChatList"
 import ChatWindow from "../components/ChatWindow"
 import ModManagerPage from "./ModManager"
 import StatusUploader from "./StatusUploader"
+import ContactStatusPage from "./ContactStatusPage"
 import MediaViewer from "../components/MediaViewer"
 
 const CONN_STATUS = { connected:"connected", open:"connected", reconnecting:"reconnecting", close:"failed", connecting:"connecting" }
@@ -67,13 +68,48 @@ function WelcomeScreen({ connStatus, user }) {
   )
 }
 
+// ── Status Tab: Upload & Fetch sub-tabs ───────────────────────────────────────
+function StatusTabsView() {
+  const [subTab, setSubTab] = useState("upload")
+  return (
+    <div style={{ display: "flex", flexDirection: "column", height: "100%", overflow: "hidden" }}>
+      <div style={{
+        display: "flex", gap: 0, background: "var(--bg-2)",
+        borderBottom: "1px solid var(--border)", flexShrink: 0,
+      }}>
+        {[
+          { id: "upload", icon: "📡", label: "Upload Status" },
+          { id: "fetch",  icon: "👁️", label: "Status Kontak" },
+        ].map(t => (
+          <button key={t.id} onClick={() => setSubTab(t.id)}
+            style={{
+              padding: "10px 18px", border: "none", background: "none", cursor: "pointer",
+              fontSize: 13, fontWeight: subTab === t.id ? 700 : 400,
+              color: subTab === t.id ? "var(--green)" : "var(--text-2)",
+              borderBottom: subTab === t.id ? "2px solid var(--green)" : "2px solid transparent",
+              transition: "all 0.15s", display: "flex", alignItems: "center", gap: 6,
+            }}>
+            <span>{t.icon}</span>{t.label}
+          </button>
+        ))}
+      </div>
+      <div style={{ flex: 1, overflow: "hidden" }}>
+        {subTab === "upload" ? <StatusUploader /> : <ContactStatusPage />}
+      </div>
+    </div>
+  )
+}
+
 export default function Main() {
   const { connectedUser } = useAuthStore()
   const { loadChats, loadContacts, appendMessage, setSyncStatus } = useChatStore()
-  const { activeJid, navTab } = useAppStore()
+  const { activeJid, navTab, loadSettings } = useAppStore()
   const [connStatus, setConnStatus] = useState("connecting")
 
   useEffect(() => {
+    // [FIX-3] Load persisted settings (auto-download etc.) from electron userData
+    loadSettings?.()
+
     // Load from SQLite immediately on mount
     loadChats()
     loadContacts()
@@ -120,19 +156,20 @@ export default function Main() {
     window.api.onChatsUpdated?.(() => loadChats())
     window.api.onContactsUpdated?.(() => loadContacts())
 
-    // New messages — append immediately for real-time feel
-    // payload is buildRendererPayload output — fields: chat_jid, from_me, body, msg_type, etc.
+    // New messages — append immediately for real-time feel.
+    // [FIX-CHAT-POS] Do NOT call loadChats() here — appendMessage() already
+    // updates last_msg_at and re-sorts the chat list atomically in-memory.
+    // Calling loadChats() right after races against the DB write and reverts
+    // the sort back to stale DB order, making the chat jump back down.
     window.api.onMessagesNew?.((payload) => {
       if (!payload?.chat_jid) return
       appendMessage(payload.chat_jid, payload)
-      loadChats()
     })
 
     // DB-written messages (fallback)
     window.api.onNewMessage?.((msg) => {
       if (!msg?.chat_jid) return
       appendMessage(msg.chat_jid, msg)
-      loadChats()
     })
   }, [])
 
@@ -145,8 +182,8 @@ export default function Main() {
           <ModManagerPage />
         </div>
       ) : navTab === "status" ? (
-        <div style={{ flex: 1, overflow: "hidden" }}>
-          <StatusUploader />
+        <div style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column" }}>
+          <StatusTabsView />
         </div>
       ) : (
         <>

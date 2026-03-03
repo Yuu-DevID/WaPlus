@@ -358,7 +358,17 @@ const DevEvalModal = memo(function DevEvalModal({ msg, onClose }) {
   const IconJson     = () => <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M4 7c0-1.1.9-2 2-2h1a2 2 0 0 1 2 2v1a2 2 0 0 0 2 2 2 2 0 0 0-2 2v1a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2"/><path d="M20 7c0-1.1-.9-2-2-2h-1a2 2 0 0 0-2 2v1a2 2 0 0 1-2 2 2 2 0 0 1 2 2v1a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2"/></svg>
 
   return (
-    <div className="deveval-backdrop" onClick={e => e.target === e.currentTarget && !running && onClose()} role="dialog" aria-modal="true">
+    <div
+      className="deveval-backdrop"
+      role="dialog"
+      aria-modal="true"
+      onClick={e => {
+        // [FIX-2] Always stop propagation — prevents click-through to conversation behind modal
+        e.stopPropagation()
+        if (e.target === e.currentTarget && !running) onClose()
+      }}
+      onMouseDown={e => e.stopPropagation()}
+    >
       <div className="deveval-modal" style={{ maxWidth: 900, width: "96vw" }}>
 
         {/* ── Header ──────────────────────────────────────────────────── */}
@@ -575,6 +585,7 @@ const DevEvalModal = memo(function DevEvalModal({ msg, onClose }) {
             <div ref={outRef} className="deveval-output-wrap"
               style={{ maxHeight: fullView ? "70vh" : "42vh", overflowY: "auto" }}>
               <pre className={`deveval-output-pre${showLines ? " has-lines" : ""}`}
+                style={{ userSelect: "text", cursor: "text" }}
                 dangerouslySetInnerHTML={{ __html: outputWithLines }} />
             </div>
 
@@ -590,7 +601,7 @@ const DevEvalModal = memo(function DevEvalModal({ msg, onClose }) {
                 </div>
                 <div style={{ maxHeight: "20vh", overflowY: "auto" }}>
                   <pre className={`deveval-output-pre${showLines ? " has-lines" : ""}`}
-                    style={{ opacity: 0.6 }}
+                    style={{ opacity: 0.6, userSelect: "text", cursor: "text" }}
                     dangerouslySetInnerHTML={{ __html: colorize(pinned || "") }} />
                 </div>
               </div>
@@ -608,10 +619,17 @@ const DevEvalModal = memo(function DevEvalModal({ msg, onClose }) {
             margin-right: 12px;
             color: rgba(255,255,255,.2);
             user-select: none;
+            -webkit-user-select: none;
             text-align: right;
             font-size: 0.9em;
           }
           .deveval-output-pre.has-lines { padding-left: 6px; }
+          /* [FIX-SELECTABLE] Output text is always selectable */
+          .deveval-output-pre {
+            user-select: text;
+            -webkit-user-select: text;
+            cursor: text;
+          }
         `}</style>
       </div>
     </div>

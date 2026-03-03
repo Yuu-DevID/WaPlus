@@ -1,48 +1,47 @@
-# Dependencies
+# ── Dependencies ──────────────────────────────────────────────────────────
 node_modules/
 package-lock.json
 yarn.lock
 pnpm-lock.yaml
 
-# Build output
+# ── Build output ───────────────────────────────────────────────────────────
 dist/
 build/
 out/
 
-# Electron
+# ── Electron runtime data (NEVER commit — contains private user data) ──────
 electron/baileys/session/
 electron/baileys/media/
 electron/baileys/database/*.db
 electron/baileys/database/*.db-shm
 electron/baileys/database/*.db-wal
+
+# [PRIVACY] lid_map.json maps @lid device IDs → real phone numbers — PII
 electron/baileys/lid_map.json
 
-# Logs
+# [PRIVACY] wplus_settings.json is runtime user config — not for git
+electron/baileys/wplus_settings.json
+
+# ── Logs ───────────────────────────────────────────────────────────────────
 logs/
 *.log
 npm-debug.log*
 
-# Environment
+# ── Environment ────────────────────────────────────────────────────────────
 .env
 .env.local
 .env.*.local
 
-# IDE
+# ── IDE ────────────────────────────────────────────────────────────────────
 .vscode/
 .idea/
 *.swp
 *.swo
 
-# OS
+# ── OS ─────────────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
-WaPlus-dev.zip
-Tree_Project.txt
 
-electron/baileys/lid_map.json
+# ── Project archives / generated ───────────────────────────────────────────
+*.zip
 Tree_Project.txt
-WaPlus-dev-original-working-fine.zip
-Tree_Project.txt
-WaPlus-dev-v8-fix.zip
-electron/baileys/lid_map.json
-electron/mods/plugins

@@ -1,0 +1,7 @@
+{
+  "id": "is-forwarded",
+  "name": "Is Forwarded Injector",
+  "version": "1.0.0",
+  "description": "Inject contextInfo.isForwarded saja ke setiap pesan — tampilkan badge \"Forwarded\" tanpa setting lain",
+  "author": "WaPlus"
+}

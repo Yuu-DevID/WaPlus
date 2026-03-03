@@ -1,0 +1,7 @@
+{
+  "id": "message-logger",
+  "name": "Message Logger",
+  "version": "1.0.0",
+  "description": "Log semua pesan masuk ke file log dengan timestamp",
+  "author": "WaPlus"
+}

@@ -2,7 +2,7 @@
 // [F3] markRead saat buka chat — panggil Baileys sock.readMessages via IPC
 // [F5] Perbaikan nama: kontak > pushName > nomor
 // [F1] Album render — grouping konsekutif image/video dari sender yang sama
-import { useEffect, useRef, useState, useCallback } from "react"
+import { useEffect, useRef, useState, useCallback, useMemo, memo, startTransition, useDeferredValue } from "react"
 import { useChatStore } from "../store/chat"
 import { useAppStore } from "../store/app"
 import { format, isToday, isYesterday } from "date-fns"
@@ -110,8 +110,11 @@ function groupMessages(messages) {
       lastDate = d
     }
 
-    // Try to build album
-    if (ALBUM_TYPES.has(msg.msg_type) && !toBool(msg.is_view_once) && (msg.media_saved_path || msg.media_url)) {
+    // [FIX-ALBUM] Build album group from consecutive image/video messages.
+    // Previously required media_saved_path || media_url, which broke album detection
+    // when autoDownloadMedia=false (nothing downloaded yet). Now we only require
+    // msg_type to match — the album grid handles undownloaded items with download CTAs.
+    if (ALBUM_TYPES.has(msg.msg_type) && !toBool(msg.is_view_once)) {
       const albumMsgs = [msg]
       let j = i + 1
       while (j < messages.length) {
@@ -139,13 +142,107 @@ function groupMessages(messages) {
   return items
 }
 
-function SkeletonBubble({ isMe }) {
+// Varied bubble sizes for realistic skeleton
+const SKEL_SIZES = [
+  { w: 200, h: 42 }, { w: 240, h: 38 }, { w: 160, h: 36 },
+  { w: 280, h: 60 }, { w: 190, h: 38 }, { w: 220, h: 44 },
+  { w: 150, h: 36 }, { w: 260, h: 38 },
+]
+function SkeletonBubble({ isMe, index = 0 }) {
+  const sz = SKEL_SIZES[index % SKEL_SIZES.length]
+  const r = isMe ? "16px 4px 16px 16px" : "4px 16px 16px 16px"
   return (
-    <div style={{ display: "flex", flexDirection: "column", alignItems: isMe ? "flex-end" : "flex-start", padding: "4px 14px" }}>
-      <div className="skel" style={{ width: isMe ? 180 : 220, height: 40, borderRadius: isMe ? "16px 4px 16px 16px" : "4px 16px 16px 16px" }} />
+    <div style={{ display: "flex", flexDirection: "column", alignItems: isMe ? "flex-end" : "flex-start", padding: "3px 14px" }}>
+      {/* Avatar for non-me messages in groups */}
+      {!isMe && index % 4 === 0 && (
+        <div className="skel" style={{ width: 28, height: 9, borderRadius: 3, marginBottom: 4, marginLeft: 2 }} />
+      )}
+      <div className="skel" style={{ width: sz.w, height: sz.h, borderRadius: r }} />
+      <div className="skel" style={{ width: 32, height: 8, borderRadius: 3, marginTop: 3, opacity: 0.6 }} />
     </div>
   )
 }
+
+// Header skeleton for when chat is switching
+function SkeletonHeader() {
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 14px" }}>
+      <div className="skel" style={{ width: 40, height: 40, borderRadius: "50%", flexShrink: 0 }} />
+      <div style={{ flex: 1 }}>
+        <div className="skel" style={{ width: "40%", height: 12, borderRadius: 4, marginBottom: 6 }} />
+        <div className="skel" style={{ width: "25%", height: 9, borderRadius: 3 }} />
+      </div>
+    </div>
+  )
+}
+
+// ════════════════════════════════════════════════════════════
+// [PERF] WINDOWED MESSAGE LIST
+// Renders only a window of renderItems to avoid "not responding" on
+// large chats. Window moves as user scrolls.
+// Threshold: >80 items → windowed. ≤80 → render all (no overhead).
+// ════════════════════════════════════════════════════════════
+const WINDOW_SIZE     = 60   // items rendered at once
+const WINDOW_OVERSCAN = 15   // extra items above/below visible area
+
+function useWindowedItems(renderItems, areaRef, loading) {
+  // windowEnd tracks the last item index we show.
+  // Starts at bottom (WINDOW_SIZE items from end) — matches initial scroll-to-bottom.
+  const [windowEnd, setWindowEnd] = useState(() => Math.max(renderItems.length, WINDOW_SIZE))
+  const prevLenRef = useRef(renderItems.length)
+
+  // When new messages arrive (live), keep window anchored to bottom
+  useEffect(() => {
+    const prev = prevLenRef.current
+    const cur  = renderItems.length
+    if (cur > prev) {
+      const area = areaRef.current
+      const atBottom = !area || (area.scrollHeight - area.scrollTop - area.clientHeight < 250)
+      if (atBottom) setWindowEnd(cur + WINDOW_OVERSCAN)
+    }
+    prevLenRef.current = cur
+  }, [renderItems.length, areaRef])
+
+  // On chat switch, reset window to bottom
+  const prevItemsRef = useRef(renderItems)
+  if (prevItemsRef.current !== renderItems) {
+    prevItemsRef.current = renderItems
+    // synchronous reset before render
+    const newEnd = Math.max(renderItems.length, WINDOW_SIZE)
+    if (windowEnd !== newEnd) {
+      // Use setTimeout(0) to avoid setState-during-render warning
+      setTimeout(() => setWindowEnd(newEnd), 0)
+    }
+  }
+
+  const onScroll = useCallback(() => {
+    const area = areaRef.current
+    if (!area) return
+    const { scrollTop, scrollHeight, clientHeight } = area
+    const distFromBottom = scrollHeight - scrollTop - clientHeight
+    const distFromTop    = scrollTop
+
+    // Scroll up → expand window upward
+    if (distFromTop < 200 && windowEnd > WINDOW_SIZE) {
+      setWindowEnd(prev => Math.max(prev, renderItems.length))  // show all when near top
+    }
+
+    // Near bottom again → can shrink window back (keep bottom WINDOW_SIZE + overscan)
+    if (distFromBottom < 100 && windowEnd > renderItems.length + WINDOW_OVERSCAN) {
+      setWindowEnd(renderItems.length + WINDOW_OVERSCAN)
+    }
+  }, [areaRef, renderItems.length, windowEnd])
+
+  const total      = renderItems.length
+  const USE_WINDOW = total > WINDOW_SIZE * 1.5  // only virtualize for large lists
+  const start      = USE_WINDOW ? Math.max(0, Math.min(windowEnd - WINDOW_SIZE, total - WINDOW_SIZE)) : 0
+  const end        = USE_WINDOW ? Math.min(total, windowEnd + WINDOW_OVERSCAN) : total
+  const slice      = renderItems.slice(start, end)
+  const hasHidden  = start > 0
+
+  return { slice, hasHidden, hiddenCount: start, onScroll, setWindowEnd }
+}
+
 
 const toInt = (v) => (v === 1 || v === true ? 1 : 0)
 
@@ -209,14 +306,19 @@ export default function ChatWindow({ jid }) {
   const name = resolveDisplayName(jid, chat || {})
 
   const handleMediaClick = useCallback((msg, src, type) => {
-    // Build album items if available
+    // Build album context — include all nearby image/video messages for gallery navigation.
+    // [FIX-ALBUM] Don't require media_saved_path — undownloaded items show download CTA in viewer.
     const ALBUM_TYPES_SET = new Set(["imageMessage", "videoMessage"])
     const ALBUM_WIN = 90
     if (ALBUM_TYPES_SET.has(msg.msg_type)) {
       const clickedIdx = msgs.findIndex(m => m.id === msg.id)
       if (clickedIdx !== -1) {
         const refTs = msg.timestamp || 0
-        const isFromAlbum = m => ALBUM_TYPES_SET.has(m.msg_type) && (m.media_saved_path || m.media_url) && m.from_me === msg.from_me && Math.abs((m.timestamp || 0) - refTs) <= ALBUM_WIN
+        const isFromAlbum = m =>
+          ALBUM_TYPES_SET.has(m.msg_type) &&
+          !toBool(m.is_view_once) &&
+          m.from_me === msg.from_me &&
+          Math.abs((m.timestamp || 0) - refTs) <= ALBUM_WIN
         let start = clickedIdx, end = clickedIdx
         for (let i = clickedIdx - 1; i >= 0; i--) { if (isFromAlbum(msgs[i])) start = i; else break }
         for (let i = clickedIdx + 1; i < msgs.length; i++) { if (isFromAlbum(msgs[i])) end = i; else break }
@@ -230,14 +332,21 @@ export default function ChatWindow({ jid }) {
             const w = p.startsWith("/") ? p : `/${p}`
             return `file://${w.split("/").map((s, i) => i === 0 ? s : encodeURIComponent(s)).join("/")}`
           }
-          const items = group.map(m => ({ src: pathToSrc(m.media_saved_path) || m.media_url, type: m.msg_type === "videoMessage" ? "video" : "image", caption: m.body || "", msgId: m.id, filename: m.media_filename }))
+          const items = group.map(m => ({
+            src: pathToSrc(m.media_saved_path) || m.media_url || null,
+            type: m.msg_type === "videoMessage" ? "video" : "image",
+            caption: m.body || "",
+            msgId: m.id,
+            filename: m.media_filename,
+            thumbnailSrc: m.media_thumbnail_b64 || null,
+          }))
           const idx = group.findIndex(m => m.id === msg.id)
           openMedia(items, idx >= 0 ? idx : 0)
           return
         }
       }
     }
-    openMedia([{ src, type, caption: msg.body || "", msgId: msg.id, filename: msg.media_filename }], 0)
+    openMedia([{ src, type, caption: msg.body || "", msgId: msg.id, filename: msg.media_filename, thumbnailSrc: msg.media_thumbnail_b64 || null }], 0)
   }, [msgs, openMedia])
 
   useMediaPrefetch(jid)
@@ -253,7 +362,10 @@ export default function ChatWindow({ jid }) {
     setLoading(true)
     loadMessages(jid, 50, 0).then(loaded => {
       if (prevJidRef.current !== jid) return
-      setLoading(false)
+      // [PERF] startTransition: defer the loading→false flip so message list
+      // rendering doesn't block the UI thread. User sees header/skeleton immediately,
+      // then messages pop in without freezing input/scroll.
+      startTransition(() => setLoading(false))
       const stored = useChatStore.getState().messages[normalizeJid(jid)] || []
       const count = stored.length || loaded?.length || 0
       offsetRef.current = count
@@ -343,9 +455,11 @@ export default function ChatWindow({ jid }) {
     return () => subs.forEach(fn => typeof fn === "function" && fn())
   }, [jid, isGroup])
 
+  // [PERF] Reduced poll interval — 4s was too aggressive for low-end devices.
+  // 8s is sufficient; live IPC events handle real-time updates.
   useEffect(() => {
     if (!jid) return
-    const interval = setInterval(() => { if (!useChatStore.getState().messagesLoading) refreshActiveChat() }, 4000)
+    const interval = setInterval(() => { if (!useChatStore.getState().messagesLoading) refreshActiveChat() }, 8000)
     return () => clearInterval(interval)
   }, [jid])
 
@@ -360,12 +474,48 @@ export default function ChatWindow({ jid }) {
     prevMsgCountRef.current = msgs.length
   }, [msgs.length, loading])
 
+  // [FIX-SCROLL] Scroll to bottom after chat load OR chat switch.
+  // Problems fixed:
+  //   1. 80ms timeout races layout for large chats → use rAF paint loop
+  //   2. Already-cached chat (loading=false) switching → also scroll on jid change
+  //   3. Was stuck on previous message position when re-opening a read chat
+  const scrollJidRef = useRef(null)
+  const scrollAfterLoad = useCallback(() => {
+    let rafId, attempts = 0
+    const MAX_ATTEMPTS = 12
+    const tryScroll = () => {
+      const area = areaRef.current
+      if (area && area.scrollHeight > area.clientHeight + 10) {
+        area.scrollTop = area.scrollHeight  // instant, no animation
+      } else if (attempts++ < MAX_ATTEMPTS) {
+        rafId = requestAnimationFrame(tryScroll)
+      }
+    }
+    rafId = requestAnimationFrame(tryScroll)
+    return () => cancelAnimationFrame(rafId)
+  }, [])
+
   useEffect(() => {
-    if (!loading && msgs.length > 0) setTimeout(() => bottomRef.current?.scrollIntoView({ behavior: "auto" }), 80)
-  }, [loading])
+    if (loading) return
+    if (msgs.length === 0) return
+    if (scrollJidRef.current === jid) return  // already scrolled for this jid
+    scrollJidRef.current = jid
+    // Also expand window to bottom
+    setWindowEnd(renderItems.length + WINDOW_OVERSCAN)
+    return scrollAfterLoad()
+  }, [loading, jid, msgs.length > 0])  // eslint-disable-line
 
   // ── [F1] Group messages into render items ────────────────────────────────
-  const renderItems = groupMessages(msgs)
+  // [PERF] Memoize — groupMessages is O(n) and re-runs on every state update without this.
+  const renderItemsImmediate = useMemo(() => groupMessages(msgs), [msgs])
+
+  // [PERF] useDeferredValue — defers expensive renderItems recompute to idle time.
+  // During chat switch, old renderItems stay visible (no blank flash) while new ones
+  // compute in background. Eliminates the "not responding" jank on large chats.
+  const renderItems = useDeferredValue(renderItemsImmediate)
+
+  // [PERF] Windowed rendering — only render visible slice for large chats
+  const { slice: windowedItems, hasHidden, hiddenCount, onScroll: windowScroll, setWindowEnd } = useWindowedItems(renderItems, areaRef, loading)
 
   const scrollToMsg = useCallback(msgId => {
     if (!msgId) return
@@ -375,6 +525,7 @@ export default function ChatWindow({ jid }) {
 
   const handleScroll = useCallback(async () => {
     const area = areaRef.current; if (!area) return
+    windowScroll()  // [PERF] update window position
     const dist = area.scrollHeight - area.scrollTop - area.clientHeight
     setShowScrollBtn(dist > 300)
     if (dist < 50) {
@@ -433,7 +584,7 @@ export default function ChatWindow({ jid }) {
           </div>
         )}
         {loading ? (
-          Array.from({ length: 8 }).map((_, i) => <SkeletonBubble key={i} isMe={i % 3 === 0} />)
+          Array.from({ length: 10 }).map((_, i) => <SkeletonBubble key={i} isMe={i % 3 === 0} index={i} />)
         ) : msgs.length === 0 ? (
           <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100%", gap: 10, color: "var(--text-3)" }}>
             <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1" strokeLinecap="round" strokeLinejoin="round" style={{ opacity: 0.3 }}>
@@ -443,35 +594,42 @@ export default function ChatWindow({ jid }) {
             <div style={{ fontSize: 11 }}>Mulai percakapan di bawah</div>
           </div>
         ) : (
-          renderItems.map(item => {
-            if (item.type === "date") return <DateSep key={item.key} date={item.ts} />
-            // [F1] Album render
-            if (item.type === "album") {
-              const first = item.msgs[0]
+          <>
+            {hasHidden && (
+              <div style={{ textAlign: "center", padding: "6px 0", fontSize: 11, color: "var(--text-3)" }}>
+                <span className="spinner spinner-sm" style={{ verticalAlign: "middle", marginRight: 5, borderTopColor: "var(--green)", borderColor: "rgba(37,211,102,.2)" }} />
+                {hiddenCount} pesan di atas — scroll naik untuk memuat
+              </div>
+            )}
+            {windowedItems.map(item => {
+              if (item.type === "date") return <DateSep key={item.key} date={item.ts} />
+              if (item.type === "album") {
+                const first = item.msgs[0]
+                return (
+                  <div key={item.key} data-msgid={first?.id}>
+                    <AlbumBubbleWrapper
+                      msgs={item.msgs}
+                      isMe={toBool(first?.from_me)}
+                      isGroup={toBool(first?.is_group)}
+                      onMediaClick={handleMediaClick}
+                      openMedia={openMedia}
+                      onReply={setReplyTo}
+                    />
+                  </div>
+                )
+              }
               return (
-                <div key={item.key} data-msgid={first?.id}>
-                  <AlbumBubbleWrapper
-                    msgs={item.msgs}
-                    isMe={toBool(first?.from_me)}
-                    isGroup={toBool(first?.is_group)}
-                    onMediaClick={handleMediaClick}
-                    openMedia={openMedia}
+                <div key={item.key} data-msgid={item.msg?.id}>
+                  <MessageBubble
+                    msg={item.msg}
                     onReply={setReplyTo}
+                    onScrollToMsg={scrollToMsg}
+                    onMediaClick={handleMediaClick}
                   />
                 </div>
               )
-            }
-            return (
-              <div key={item.key} data-msgid={item.msg?.id}>
-                <MessageBubble
-                  msg={item.msg}
-                  onReply={setReplyTo}
-                  onScrollToMsg={scrollToMsg}
-                  onMediaClick={handleMediaClick}
-                />
-              </div>
-            )
-          })
+            })}
+          </>
         )}
         <div ref={bottomRef} />
       </div>
@@ -491,7 +649,15 @@ export default function ChatWindow({ jid }) {
         <MessageInput chatJid={jid} chatName={name} replyTo={replyTo} onCancelReply={() => setReplyTo(null)} />
       </div>
       {headerDevEvalOpen && (
-        <DevEvalModal msg={headerDevEvalMsg} onClose={() => setHeaderDevEvalOpen(false)} />
+        // [FIX-2] Capture all pointer events at this layer so nothing leaks to the chat list behind
+        <div
+          style={{ position: "fixed", inset: 0, zIndex: 9999 }}
+          onClick={e => e.stopPropagation()}
+          onMouseDown={e => e.stopPropagation()}
+          onPointerDown={e => e.stopPropagation()}
+        >
+          <DevEvalModal msg={headerDevEvalMsg} onClose={() => setHeaderDevEvalOpen(false)} />
+        </div>
       )}
     </div>
   )

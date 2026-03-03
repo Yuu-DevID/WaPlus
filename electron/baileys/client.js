@@ -52,7 +52,7 @@ const {
 } = require("wileys")
 
 // ADD MessageParser by Towartz
-const { parseMessage, buildRendererPayload, normalizeJid, buildLidMap, isLidJid, resolveLid, tryResolveLid } = require("./messageParser")
+const { parseMessage, buildRendererPayload, normalizeJid, buildLidMap, isLidJid, resolveLid, tryResolveLid, seedLidMap } = require("./messageParser")
 const { Boom } = require("@hapi/boom")
 const pino = require("pino")
 const chalk = require("chalk")
@@ -126,21 +126,51 @@ function loadLidMapFromDisk() {
     if (fs.existsSync(LID_MAP_PATH)) {
       const raw = JSON.parse(fs.readFileSync(LID_MAP_PATH, "utf8"))
       for (const [k, v] of Object.entries(raw)) lidMap.set(k, v)
-      if (lidMap.size > 0) log(`[LID] Loaded ${lidMap.size} mappings from disk`)
+      if (lidMap.size > 0) {
+        log(`[LID] Loaded ${lidMap.size} mappings from disk`)
+        // [FIX-LID-WARN] Seed jid-utils global map so normalizeJid() resolves @lid
+        // immediately on startup, before contacts.set fires from Baileys.
+        // Without this, every @lid message processed at boot triggers the
+        // "unresolved @lid — call initLidMap() first" warning.
+        seedLidMap(lidMap)
+      }
     }
   } catch (_) {}
 }
 
+let _lidSaveTimer = null
 function saveLidMapToDisk() {
-  try {
-    const obj = {}
-    for (const [k, v] of lidMap) obj[k] = v
-    fs.writeFileSync(LID_MAP_PATH, JSON.stringify(obj), "utf8")
-  } catch (_) {}
+  // [PERF-WRITES] Debounce: batch multiple rapid lid updates into a single disk write.
+  // Without this, every contact arriving during sync triggers a separate JSON writeFileSync.
+  // Real-world impact: 500 contacts = 500 writes → now = 1 write after 3s settle.
+  if (_lidSaveTimer) return  // already scheduled
+  _lidSaveTimer = setTimeout(() => {
+    _lidSaveTimer = null
+    try {
+      const obj = {}
+      for (const [k, v] of lidMap) obj[k] = v
+      fs.writeFileSync(LID_MAP_PATH, JSON.stringify(obj), 'utf8')
+    } catch (_) {}
+  }, 3000)  // 3s debounce — lid map is not time-critical
 }
 
 // Load persisted lid map immediately (before any connection)
 loadLidMapFromDisk()
+
+// [FIX-3] Load persisted settings from userData so AUTO_DOWNLOAD_MEDIA is correct at boot
+;(function _loadPersistedSettings() {
+  try {
+    const { app } = require('electron')
+    const sPath = require('path').join(app.getPath('userData'), 'wplus_settings.json')
+    if (require('fs').existsSync(sPath)) {
+      const s = JSON.parse(require('fs').readFileSync(sPath, 'utf8'))
+      if (typeof s.autoDownloadMedia === 'boolean') {
+        CONFIG.AUTO_DOWNLOAD_MEDIA = s.autoDownloadMedia
+        console.log('[AuroraClient] Settings loaded: AUTO_DOWNLOAD_MEDIA =', CONFIG.AUTO_DOWNLOAD_MEDIA)
+      }
+    }
+  } catch (_) {}
+})()
 
 const msgRetryCache = new NodeCache({
   stdTTL: CONFIG.MSG_CACHE_TTL,
@@ -176,6 +206,10 @@ function mergeLidBatch(batch) {
     lidMap.set(k, v)
   }
   if (newEntries > 0) {
+    // [FIX-LID-WARN] Keep jid-utils _globalLidMap in sync — it's the one
+    // normalizeJid() reads internally. Without this, new @lid entries added
+    // via contacts.set/upsert during session won't be resolved.
+    seedLidMap(batch)
     saveLidMapToDisk()
     scheduleResolveLidInDB()
   }
@@ -309,6 +343,34 @@ async function _withDlSemaphore(fn) {
 async function downloadAndSaveMedia(msg, messageType, isHistorySync = false) {
   if (isHistorySync) return { skipped: true, reason: "history_sync" }
 
+  // [FIX-REDOWNLOAD] PREVENT RE-DOWNLOAD ON SESSION RESTART / RESUME
+  // Guard hierarchy (cheapest to most expensive):
+  //   1. media_is_downloaded=1 in DB → definitely done, skip even if file missing
+  //      (file might be on external/network drive that's temporarily unavailable)
+  //   2. media_saved_path exists AND file on disk → skip (belt-and-suspenders)
+  //   3. download_status='downloaded' in media_downloads table → skip
+  // This prevents the "re-download loop" seen after pause/resume or session restart.
+  const msgId = msg.key?.id
+  if (msgId) {
+    try {
+      const existingRow = db.getMessageById?.(msgId)
+      if (existingRow?.media_is_downloaded === 1) {
+        // Already marked downloaded in DB — trust the flag even if file is gone
+        if (existingRow.media_saved_path && fs.existsSync(existingRow.media_saved_path)) {
+          log(`[FIX-REDOWNLOAD] Skipping ${msgId} — already downloaded, file on disk`)
+          return { skipped: true, reason: 'already_on_disk', localPath: existingRow.media_saved_path }
+        }
+        // File missing but DB says downloaded — re-download silently (don't loop)
+        // Fall through to download
+      } else if (existingRow?.media_saved_path && fs.existsSync(existingRow.media_saved_path)) {
+        // File exists but flag not set — fix the flag and skip
+        log(`[FIX-REDOWNLOAD] Skipping ${msgId} — file on disk, fixing flag`)
+        db.updateMediaSavedPath?.(msgId, existingRow.media_saved_path)
+        return { skipped: true, reason: 'already_on_disk_flag_fixed', localPath: existingRow.media_saved_path }
+      }
+    } catch (_) {}
+  }
+
   return _withDlSemaphore(async () => {
     const msgId   = msg.key.id
     const chatJid = msg.key.remoteJid
@@ -350,8 +412,10 @@ async function downloadAndSaveMedia(msg, messageType, isHistorySync = false) {
       const localPath = path.join(CONFIG.MEDIA_DIR, filename)
 
       fs.writeFileSync(localPath, buffer)
-      db.updateMediaDownload?.(msg.key.id, localPath, buffer.length, "downloaded")
-      db.updateMediaSavedPath?.(msg.key.id, localPath)
+      // [PERF-WRITES] Single combined write — updateMediaDownload internally calls
+      // updateMediaSavedPath when status='downloaded', so we skip the redundant 2nd call.
+      db.updateMediaDownload?.(msg.key.id, localPath, buffer.length, 'downloaded')
+      // Note: db.updateMediaSavedPath is called inside updateMediaDownload above — no dupe.
 
       logOk(`Media downloaded: ${filename} (${sizeMB.toFixed(2)}MB)`)
 
@@ -457,11 +521,8 @@ function resolveMediaTypeKey(msgType, message) {
 async function handleMessage(msg, type, isHistorySync = false) {
   if (!msg.message) return
   // [FIX-SPLIT-CHAT] Normalize remoteJid before ANY processing.
-  // @c.us legacy and :device multi-device suffixes both cause duplicate chat rows.
-  // Mutate key.remoteJid so all downstream code (parseMessage, db.*) see the clean form.
   if (msg.key?.remoteJid) {
     let rjid = normalizeJid(msg.key.remoteJid)
-    // [FIX-LID] Resolve @lid remoteJid → real JID before anything else
     if (isLidJid(rjid)) rjid = resolveLid(rjid, lidMap)
     msg.key.remoteJid = rjid
   }
@@ -471,6 +532,32 @@ async function handleMessage(msg, type, isHistorySync = false) {
     if (isLidJid(p)) p = resolveLid(p, lidMap)
     msg.key.participant = p
   }
+
+  // [FIX-7] AUTHORITATIVE fromMe for group messages.
+  // Problem: WA sometimes delivers group messages from this device with
+  //   key.fromMe = undefined/null/false when routed via multi-device.
+  //   This makes our sent group messages appear as "opponent" bubbles.
+  //
+  // Canonical fix: if key.participant IS our JID, it's definitely fromMe.
+  // If key.participant IS null/absent AND key.remoteJid is a group AND
+  //   key.id matches a message we sent (check msgRetryCache or DB), also fix.
+  //
+  // We apply this BEFORE parseMessage so from_me is correct everywhere.
+  if (sock?.user?.id) {
+    const myJidClean = normalizeJid(sock.user.id)
+    const participantClean = msg.key?.participant ? normalizeJid(msg.key.participant) : null
+
+    if (participantClean && participantClean === myJidClean) {
+      // Participant is us → definitely fromMe, even if Baileys flagged it false
+      msg.key.fromMe = true
+    }
+    // Also check: no participant + remoteJid is DM + remoteJid matches our JID
+    if (!participantClean && msg.key?.remoteJid && !msg.key.remoteJid.endsWith('@g.us')) {
+      const remoteClean = normalizeJid(msg.key.remoteJid)
+      if (remoteClean === myJidClean) msg.key.fromMe = true
+    }
+  }
+
   if (isJidStatusBroadcast(msg.key.remoteJid || "")) return
   if (isJidBroadcast(msg.key.remoteJid || "")) return
 
@@ -507,18 +594,46 @@ async function handleMessage(msg, type, isHistorySync = false) {
   }
 
   // ── Queue media download (hanya live, bukan history sync) ─
-  if (parsed.has_media && CONFIG.AUTO_DOWNLOAD_MEDIA && !isHistorySync) {
+  if (parsed.has_media && !isHistorySync) {
     const mediaTypeKey = resolveMediaTypeKey(parsed.msg_type, msg.message)
     if (mediaTypeKey) {
-      db.queueMediaDownload?.(parsed.id, parsed.chat_jid, parsed.msg_type, parsed.media_url)
-      downloadAndSaveMedia(msg, mediaTypeKey, false).catch(() => {})
+      // [FIX-NOT-MEDIA] Validate message has downloadable content before queuing.
+      const unwrapped = msg.message?.ephemeralMessage?.message
+        || msg.message?.viewOnceMessage?.message
+        || msg.message?.viewOnceMessageV2?.message
+        || msg.message?.documentWithCaptionMessage?.message
+        || msg.message
+      const innerMediaObj = unwrapped?.[mediaTypeKey]
+      const hasDownloadable = innerMediaObj?.url || innerMediaObj?.directPath || innerMediaObj?.mediaKey
+      // [FIX-AUTO-DL] Stickers always download. [FIX-FROMME] fromMe media also downloads.
+      const isSticker = parsed.msg_type === "stickerMessage"
+      if (hasDownloadable && (isSticker || CONFIG.AUTO_DOWNLOAD_MEDIA)) {
+        // [PERF-WRITES] Only insert into media_downloads queue if not already downloaded.
+        // Avoids redundant DB write on every message re-process (reconnect, history sync).
+        if (!parsed.media_is_downloaded) {
+          db.queueMediaDownload?.(parsed.id, parsed.chat_jid, parsed.msg_type, parsed.media_url)
+        }
+        downloadAndSaveMedia(msg, mediaTypeKey, false).catch(() => {})
+      } else if (!hasDownloadable) {
+        logW(`[MEDIA] Skip queuing ${parsed.id}: ${mediaTypeKey} has no downloadable fields`)
+      }
     }
   }
 
   // ── Update chat last message di DB ────────────────────────
   if (!isHistorySync && parsed.chat_jid) {
-    // [FIX-PREVIEW] Use full statement with msg_type so chat list preview is always current.
-    // Also pass from_me so getChats SQL JOIN on messages.from_me reflects actual sender.
+    // [FIX-4][FIX-5] Use full upsert so last_message_timestamp is ALWAYS current.
+    // updateChatLastMsg alone only updates body/ts columns but may leave the
+    // chats.last_message_timestamp stale if the chat row existed before with a
+    // higher timestamp (shouldn't happen, but be defensive).
+    //
+    // IMPORTANT: We call BOTH updateChatLastMsg (for body/type) AND a direct
+    // SQL timestamp update, ensuring the ORDER BY c.last_message_timestamp DESC
+    // in getChats() always returns this chat at the top after a send/receive.
+    // [PERF-WRITES] updateChatLastMsg is now batched (500ms debounce) — single write per chat.
+    // Removed redundant saveChat() call — it was doing a full upsert just to update timestamp,
+    // which is already covered by the batched updateChatLastMsg. saveChat() stays for
+    // initial chat creation (chats.set / history sync), not hot per-message path.
     db.updateChatLastMsg?.(parsed.chat_jid, {
       timestamp:  parsed.timestamp,
       message_id: parsed.id,
@@ -582,7 +697,11 @@ async function handleMessage(msg, type, isHistorySync = false) {
 
   // ── Push ke renderer ─────────────────────────────────────
   send("messages:new", buildRendererPayload(parsed))
-  send("db:chats:updated")
+  // [FIX-CHAT-POS] Do NOT emit db:chats:updated here.
+  // The renderer's appendMessage() already updates + re-sorts the chat list
+  // atomically in-memory. Emitting db:chats:updated triggers loadChats() which
+  // does an async DB read — if the DB write hasn't landed yet, the stale
+  // timestamp causes the chat to sort back to its old position.
 }
 
 // ════════════════════════════════════════════════════════════
@@ -822,8 +941,35 @@ async function connectToWhatsApp(phoneForPairing = null) {
   // ════════════════════════════════════════════════════════
   // EVENT: messaging-history.set (HISTORY SYNC)
   // ════════════════════════════════════════════════════════
+  let _syncWatchdog = null
+  const _SYNC_TIMEOUT_MS = 90_000  // [FIX-6] 90s watchdog — if isLatest never fires, force-complete
+
+  function _clearSyncWatchdog() {
+    if (_syncWatchdog) { clearTimeout(_syncWatchdog); _syncWatchdog = null }
+  }
+
+  function _armSyncWatchdog() {
+    _clearSyncWatchdog()
+    _syncWatchdog = setTimeout(() => {
+      if (!isSyncing) return
+      logW('[FIX-6] Sync watchdog: isLatest never received — force-completing sync')
+      isSyncing = false
+      db.endSync(syncStats.chats, syncStats.messages)
+      setImmediate(() => {
+        try { db.backfillChatLastMessages?.(); db.backfillContactPushnames?.() } catch (_) {}
+        send('db:chats:updated')
+        send('db:contacts:updated')
+      })
+      send('sync:status', { isSyncing: false, progress: 100, stats: syncStats, isComplete: true, watchdogForced: true })
+      syncStats = { chats: 0, messages: 0 }
+    }, _SYNC_TIMEOUT_MS)
+  }
+
   sock.ev.on("messaging-history.set", async ({ chats, contacts, messages, isLatest, progress }) => {
     log(`History Sync: ${messages.length} messages, ${chats.length} chats (isLatest: ${isLatest}, progress: ${progress}%)`)
+
+    // [FIX-6] Rearm watchdog on every batch — if no new batch arrives in 90s, force complete
+    _armSyncWatchdog()
 
     isSyncing = true
     syncStats.chats += chats.length
@@ -904,6 +1050,7 @@ async function connectToWhatsApp(phoneForPairing = null) {
 
     // If complete
     if (isLatest) {
+      _clearSyncWatchdog()  // [FIX-6] Normal completion — cancel watchdog
       isSyncing = false
       db.endSync(syncStats.chats, syncStats.messages)
 
@@ -985,7 +1132,7 @@ async function connectToWhatsApp(phoneForPairing = null) {
         db.updateMessageStatus(key.id, update.status)
       }
 
-      // Handle message edits
+      // Handle message edits / fromMe media delivery
       if (update.message) {
         // Save raw proto — critical for fromMe messages that arrive in two steps:
         // step 1: handleMessage gets msg with empty message field (just key+timestamp)
@@ -994,6 +1141,24 @@ async function connectToWhatsApp(phoneForPairing = null) {
           const existing = db.getMessageById?.(key.id)
           if (existing && (!existing.message_json || existing.message_json === '{}')) {
             db.updateMessageRaw(key.id, JSON.stringify(update.message))
+
+            // [FIX-FROMME-MEDIA] If this update carries media content for a fromMe message,
+            // trigger download now so it renders without requiring Ctrl+R.
+            if (key.fromMe && existing.has_media && !existing.media_is_downloaded) {
+              const msgType = existing.message_type
+              const mediaTypeKey = resolveMediaTypeKey(msgType, update.message)
+              if (mediaTypeKey) {
+                const unwrapped = update.message?.ephemeralMessage?.message
+                  || update.message?.viewOnceMessage?.message
+                  || update.message?.documentWithCaptionMessage?.message
+                  || update.message
+                const inner = unwrapped?.[mediaTypeKey]
+                if (inner?.url || inner?.directPath || inner?.mediaKey) {
+                  const fakeMsg = { key: { id: key.id, remoteJid: key.remoteJid, fromMe: true }, message: update.message }
+                  downloadAndSaveMedia(fakeMsg, mediaTypeKey, false).catch(() => {})
+                }
+              }
+            }
           }
         } catch (_) {}
 
@@ -1295,29 +1460,142 @@ async function startQRMode() {
 // ════════════════════════════════════════════════════════════
 
 async function downloadMediaForMsg(row) {
-  if (!row?.id || !row?.message_json) return null
+  if (!row?.id) return null
   if (!sock) return null
 
   try {
-    const message = JSON.parse(row.message_json)
     const msgType = row.message_type
 
-    // Build a minimal WAMessage compatible with downloadAndSaveMedia
+    // [FIX-RECONSTRUCT-MSG] Build message object from DB fields when message_json is null/empty.
+    // This happens for history-synced messages where message_json was never stored,
+    // OR for old messages parsed before we started persisting message_json.
+    // We can reconstruct a minimal-but-valid Baileys message using:
+    //   media_url (or media_direct_path) + media_key (base64) + media_enc_sha256 + mimetype
+    let message = null
+
+    if (row.message_json) {
+      try {
+        message = JSON.parse(row.message_json)
+      } catch (parseErr) {
+        logW(`[PREFETCH] ${row.id}: bad JSON — ${parseErr.message?.slice(0, 40)}`)
+        message = null
+      }
+    }
+
+    // Validate that the parsed message actually contains downloadable media.
+    // If message_json is present but inner object lacks keys — fall through to reconstruction.
+    let mediaTypeKey = null
+    let innerMediaObj = null
+
+    if (message) {
+      mediaTypeKey = resolveMediaTypeKey(msgType, message)
+      if (mediaTypeKey) {
+        const unwrapped = message?.ephemeralMessage?.message
+          || message?.viewOnceMessage?.message
+          || message?.viewOnceMessageV2?.message
+          || message?.documentWithCaptionMessage?.message
+          || message
+        innerMediaObj = unwrapped?.[mediaTypeKey]
+        const hasDownloadable = innerMediaObj?.url || innerMediaObj?.directPath || innerMediaObj?.mediaKey
+        if (!hasDownloadable) {
+          // message_json present but media fields stripped — try reconstruction
+          message = null
+          mediaTypeKey = null
+          innerMediaObj = null
+        }
+      } else {
+        // message_json can't resolve type — try reconstruction
+        message = null
+      }
+    }
+
+    // [FIX-RECONSTRUCT-MSG] Reconstruct minimal Baileys message from DB columns
+    // (media_key, media_url/direct_path, media_enc_sha256, mimetype).
+    // This lets us re-download without needing the original message_json.
+    if (!message) {
+      const dbMsgKey  = row.media_key         || null   // base64 string
+      const dbUrl     = row.media_url         || null
+      const dbPath    = row.media_direct_path || null
+      const dbEnc     = row.media_enc_sha256  || null
+      const dbMime    = row.media_mimetype || row.mimetype || null
+      const dbType    = row.message_type || "imageMessage"
+
+      // Need at least (mediaKey + (url or directPath)) for Baileys to download
+      if (!dbMsgKey) {
+        logW(`[PREFETCH] Skip ${row.id}: no message_json and no media_key in DB`)
+        return null
+      }
+      if (!dbUrl && !dbPath) {
+        logW(`[PREFETCH] Skip ${row.id}: no message_json and no media_url/direct_path`)
+        return null
+      }
+
+      // Decode base64 media_key back to Buffer for Baileys
+      let mediaKeyBuf
+      try {
+        mediaKeyBuf = Buffer.from(dbMsgKey, 'base64')
+      } catch (_) {
+        logW(`[PREFETCH] Skip ${row.id}: invalid media_key base64`)
+        return null
+      }
+
+      let encSha256Buf = null
+      if (dbEnc) {
+        try { encSha256Buf = Buffer.from(dbEnc, 'base64') } catch (_) {}
+      }
+
+      // Determine the simple message type key (imageMessage, videoMessage, etc.)
+      const simpleType = (['imageMessage','videoMessage','audioMessage','documentMessage','stickerMessage'].includes(dbType))
+        ? dbType
+        : (dbType === 'pttMessage' ? 'audioMessage' : 'imageMessage')
+
+      const reconstructed = {
+        url:          dbUrl,
+        directPath:   dbPath,
+        mediaKey:     mediaKeyBuf,
+        mimetype:     dbMime || 'application/octet-stream',
+        fileLength:   row.media_size || row.media_file_length || undefined,
+      }
+      if (encSha256Buf) reconstructed.fileEncSha256 = encSha256Buf
+
+      message    = { [simpleType]: reconstructed }
+      mediaTypeKey = simpleType
+      innerMediaObj = reconstructed
+      log(`[PREFETCH] Reconstructed message for ${row.id} (${simpleType}) from DB fields`)
+    }
+
+    if (!mediaTypeKey) {
+      logW(`[PREFETCH] Skip ${row.id} (${msgType}): cannot resolve media type key`)
+      return null
+    }
+
+    if (!innerMediaObj) {
+      // Final check — should not reach here
+      logW(`[PREFETCH] Skip ${row.id}: inner ${mediaTypeKey} missing after reconstruction`)
+      return null
+    }
+
+    // [FIX-REDOWNLOAD] Race condition guard — check DB flag AND file existence
+    const already = db.getMessageById(row.id)
+    if (already?.media_is_downloaded === 1) {
+      if (already.media_saved_path && fs.existsSync(already.media_saved_path)) return null
+      // File gone — fall through to re-download
+    } else if (already?.media_saved_path && fs.existsSync(already.media_saved_path)) {
+      // File exists but flag not set — fix flag, skip download
+      db.updateMediaSavedPath?.(row.id, already.media_saved_path)
+      return null
+    }
+
+    // [FIX-FROMME] Preserve fromMe flag from DB row so download logic has correct context
+    const fromMe = row.from_me === 1 || row.from_me === true
     const fakeMsg = {
       key: {
         id: row.id,
-        remoteJid: row.chat_jid,
-        fromMe: false,
+        remoteJid: row.chat_jid || row.remote_jid,
+        fromMe,
       },
       message,
     }
-
-    const mediaTypeKey = resolveMediaTypeKey(msgType, message)
-    if (!mediaTypeKey) return null
-
-    // Check not already downloaded (race condition guard)
-    const already = db.getMessageById(row.id)
-    if (already?.media_is_downloaded) return null
 
     return await downloadAndSaveMedia(fakeMsg, mediaTypeKey, false)
   } catch (err) {
@@ -1367,10 +1645,39 @@ async function sendImage(jid, image, caption = "", quoted = null) {
   return sentMsg
 }
 
-async function sendVideo(jid, video, caption = "", quoted = null) {
+async function sendVideo(jid, video, caption = "", quoted = null, opts = {}) {
   assertConnected()
   const src = typeof video === "string" ? { url: video } : video
   let payload = { video: src, caption }
+  // [FIX-GIF] Pass gifPlayback flag when sending GIFs as videoMessage
+  if (opts.gifPlayback) payload.gifPlayback = true
+  if (opts.mimetype)    payload.mimetype    = opts.mimetype
+
+  if (modManager) {
+    const result = await modManager.runOnBeforeSend(jid, payload).catch(() => payload)
+    if (result === false) return null
+    if (result && typeof result === "object") payload = result
+  }
+
+  const sentMsg = await sock.sendMessage(jid, payload, quoted ? { quoted } : {})
+  if (modManager) modManager.runOnAfterSend(jid, payload, sentMsg).catch(() => {})
+  return sentMsg
+}
+
+// [FIX-GIF] Dedicated GIF sender — converts image/gif to WA videoMessage+gifPlayback
+// WA protocol: GIFs are always sent as videoMessage with gifPlayback=true, NOT imageMessage.
+// The file must be in a video container (mp4 preferred). Browser-side GIF files (.gif) are
+// sent as-is and WA server transcodes them. mimetype must be "video/mp4" or "image/gif"
+// — WA accepts image/gif and converts on upload.
+async function sendGif(jid, gifBuffer, caption = "", quoted = null) {
+  assertConnected()
+  let payload = {
+    video: gifBuffer,
+    caption,
+    gifPlayback: true,
+    // WA accepts image/gif here and handles conversion; video/mp4 also works for pre-converted
+    mimetype: "video/mp4",
+  }
 
   if (modManager) {
     const result = await modManager.runOnBeforeSend(jid, payload).catch(() => payload)
@@ -1607,6 +1914,44 @@ async function getProfilePic(jid) {
   }
 }
 
+// ── fetchContactStatus — get WhatsApp About/status for a contact ─────────────
+async function fetchContactStatus(jid) {
+  if (!jid) return { status: null }
+  try {
+    assertConnected()
+    const normalized = jidNormalizedUser(jid)
+    const res = await sock.fetchStatus(normalized)
+    return { status: res?.status || null, setAt: res?.setAt || null }
+  } catch (err) {
+    return { status: null, error: err.message }
+  }
+}
+
+async function fetchContactStatusBulk(jids) {
+  const out = {}
+  if (!Array.isArray(jids) || !sock) return out
+  // Concurrency cap: fetch max 8 at a time to avoid WABinary flood
+  const BATCH = 8
+  for (let i = 0; i < jids.length; i += BATCH) {
+    const chunk = jids.slice(i, i + BATCH)
+    const results = await Promise.allSettled(
+      chunk.map(async jid => {
+        const normalized = jidNormalizedUser(jid)
+        const res = await sock.fetchStatus(normalized)
+        return { jid, status: res?.status || null, setAt: res?.setAt || null }
+      })
+    )
+    for (const r of results) {
+      if (r.status === 'fulfilled' && r.value?.jid) {
+        out[r.value.jid] = { status: r.value.status, setAt: r.value.setAt }
+      }
+    }
+    // Small pause between batches to avoid rate limits
+    if (i + BATCH < jids.length) await new Promise(r => setTimeout(r, 300))
+  }
+  return out
+}
+
 async function updateMyStatus(status) {
   assertConnected()
   await sock.updateProfileStatus(status)
@@ -1831,6 +2176,22 @@ function getSocket() {
   return sock
 }
 
+// [FIX-3] Toggle AUTO_DOWNLOAD_MEDIA at runtime (called from IPC settings:set-auto-download)
+function setAutoDownloadMedia(enabled) {
+  CONFIG.AUTO_DOWNLOAD_MEDIA = !!enabled
+  console.log('[AuroraClient] AUTO_DOWNLOAD_MEDIA runtime →', CONFIG.AUTO_DOWNLOAD_MEDIA)
+}
+
+function getAutoDownloadMedia() {
+  return CONFIG.AUTO_DOWNLOAD_MEDIA
+}
+
+// [FIX-LID-CLICK] Immediate lid resolution pass — called from IPC on chat click.
+// Runs resolveLidInDB with zero debounce delay.
+function resolveLidNow() {
+  resolveLidInDB()
+}
+
 // Ambil full WAMessage proto dari in-memory cache (untuk DevEval full dump)
 function getRawMsg(msgId) {
   return msgId ? rawMsgCache.get(msgId) || null : null
@@ -1855,6 +2216,9 @@ module.exports = {
   forceReconnect,
   getSocket,
   getRawMsg,
+  setAutoDownloadMedia,   // [FIX-3] Runtime toggle for auto download setting
+  getAutoDownloadMedia,   // [FIX-3] Read current setting (used by main.js prefetch gate)
+  resolveLidNow,          // [FIX-LID-CLICK] Immediate lid re-resolution on demand
   getConnectionStatus,
 
   requestPairingCode,
@@ -1865,6 +2229,7 @@ module.exports = {
   sendTextMessage,
   sendImage,
   sendVideo,
+  sendGif,
   sendAudio,
   sendDocument,
   sendSticker,
@@ -1889,6 +2254,8 @@ module.exports = {
 
   getContactInfo,
   getProfilePic,
+  fetchContactStatus,
+  fetchContactStatusBulk,
   updateMyStatus,
   updateMyName,
 

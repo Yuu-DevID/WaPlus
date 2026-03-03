@@ -63,6 +63,10 @@ export default function MediaViewer() {
   const { mediaViewer, closeMedia, openMedia } = useAppStore()
   const [currentZoom, setCurrentZoom] = useState(1)
   const [sliding, setSliding] = useState(false)
+  // [FIX-VIEWER-DL] Per-item download state: { [msgId]: "pending" | "failed" | null }
+  const [dlState, setDlState] = useState({})
+  // [FIX-VIEWER-DL] Local src overrides — filled when media:updated fires after download
+  const [srcOverride, setSrcOverride] = useState({})
 
   // Extract values safely for use in callbacks
   const items = mediaViewer?.items || []
@@ -71,6 +75,44 @@ export default function MediaViewer() {
   const isAlbum = items.length > 1
   const canPrev = index > 0
   const canNext = index < items.length - 1
+
+  // [FIX-VIEWER-DL] Resolve current src — prefer override (post-download) over original
+  const resolvedItems = items.map(item => ({
+    ...item,
+    src: srcOverride[item.msgId] || item.src || null,
+  }))
+  const resolvedCurrent = resolvedItems[index] || null
+
+  // [FIX-VIEWER-DL] Listen for media:updated events — when a download completes,
+  // update the src in our local override map so the viewer re-renders without reopening.
+  useEffect(() => {
+    if (!window.api?.onMediaUpdated) return
+    const unsub = window.api.onMediaUpdated?.((payload) => {
+      if (!payload?.id || !payload?.media_saved_path) return
+      // Build file:// URL from the saved path
+      let p = payload.media_saved_path.replace(/\\/g, "/")
+      if (/^[A-Za-z]:\//.test(p)) p = `file://${p.split("/").map((s, i) => i === 0 ? s : encodeURIComponent(s)).join("/")}`
+      else if (!p.startsWith("file://")) p = `file://${p}`
+      setSrcOverride(prev => ({ ...prev, [payload.id]: p }))
+      setDlState(prev => ({ ...prev, [payload.id]: null }))
+    })
+    return () => { try { unsub?.() } catch (_) {} }
+  }, [])
+
+  // [FIX-VIEWER-DL] Download trigger for current item
+  const handleViewerDownload = useCallback(async (item) => {
+    if (!item?.msgId || dlState[item.msgId] === "pending") return
+    setDlState(prev => ({ ...prev, [item.msgId]: "pending" }))
+    try {
+      const res = await window.api?.mediaTriggerDownload?.({ msgId: item.msgId })
+      if (res?.ok === false) {
+        setDlState(prev => ({ ...prev, [item.msgId]: "failed" }))
+      }
+      // Success: media:updated event will set srcOverride and clear pending
+    } catch (_) {
+      setDlState(prev => ({ ...prev, [item.msgId]: "failed" }))
+    }
+  }, [dlState])
 
   // ✅ 2. ALL useCallback hooks - defined unconditionally
   const navigate = useCallback((dir) => {
@@ -499,7 +541,9 @@ export default function MediaViewer() {
         }}
         className="thumb-strip"
       >
-        {items.map((item, i) => (
+        {items.map((item, i) => {
+          const rItem = resolvedItems[i]
+          return (
           <div
             key={i}
             onClick={() => { setCurrentZoom(1); openMedia(items, i) }}
@@ -513,16 +557,23 @@ export default function MediaViewer() {
               background: "#1a1a1a",
             }}
           >
-            {item.type === "image" ? (
-              <img src={item.src} alt={`Slide ${i + 1}`}
+            {rItem.type === "image" && rItem.src ? (
+              <img src={rItem.src} alt={`Slide ${i + 1}`}
                 style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }} />
-            ) : (
+            ) : rItem.thumbnailSrc ? (
+              <img src={rItem.thumbnailSrc} alt={`Slide ${i + 1}`}
+                style={{ width: "100%", height: "100%", objectFit: "cover", display: "block", filter: "blur(3px)" }} />
+            ) : rItem.type === "video" ? (
               <div style={{ width: "100%", height: "100%", display: "flex", alignItems: "center", justifyContent: "center", background: "#222" }}>
                 <span style={{ fontSize: 20 }}>🎬</span>
               </div>
+            ) : (
+              <div style={{ width: "100%", height: "100%", display: "flex", alignItems: "center", justifyContent: "center", background: "#1a1a1a" }}>
+                <DownloadIcon />
+              </div>
             )}
           </div>
-        ))}
+        )})}
       </div>
     )
   }
@@ -560,7 +611,19 @@ export default function MediaViewer() {
           {current?.type !== "video" && currentZoom > 1 && (
             topBtn(() => setCurrentZoom(1), "Reset zoom", <span style={{ fontSize: 12, fontWeight: 600 }}>1:1</span>)
           )}
-          {current?.src && topBtn(() => downloadMedia(current), "Unduh media", <DownloadIcon />)}
+          {/* Download button: if src exists → save file, if not → trigger download */}
+          {resolvedCurrent?.src
+            ? topBtn(() => downloadMedia(resolvedCurrent), "Unduh media", <DownloadIcon />)
+            : resolvedCurrent?.msgId
+              ? topBtn(
+                  () => handleViewerDownload(resolvedCurrent),
+                  "Unduh media",
+                  dlState[resolvedCurrent.msgId] === "pending"
+                    ? <span className="spinner spinner-sm" style={{ borderTopColor: "#fff", borderColor: "rgba(255,255,255,.3)", width: 15, height: 15 }} />
+                    : <DownloadIcon />
+                )
+              : null
+          }
           {topBtn(closeMedia, "Tutup (Esc)", <CloseIcon />)}
         </div>
       </div>
@@ -582,14 +645,51 @@ export default function MediaViewer() {
           opacity: sliding ? 0 : 1,
           transition: "opacity 0.08s",
         }}>
-          {current?.type === "video" ? (
-            <VideoDisplay src={current.src} />
-          ) : current?.src ? (
-            <ImageDisplay src={current.src} caption={current.caption} />
+          {resolvedCurrent?.type === "video" && resolvedCurrent?.src ? (
+            <VideoDisplay src={resolvedCurrent.src} />
+          ) : resolvedCurrent?.src ? (
+            <ImageDisplay src={resolvedCurrent.src} caption={resolvedCurrent.caption} />
+          ) : dlState[resolvedCurrent?.msgId] === "pending" ? (
+            // Downloading — show spinner with thumbnail bg if available
+            <div style={{ position: "relative", display: "flex", flexDirection: "column", alignItems: "center", gap: 14, width: "100%", height: "100%", justifyContent: "center" }}>
+              {resolvedCurrent?.thumbnailSrc && (
+                <img src={resolvedCurrent.thumbnailSrc} alt="" draggable={false}
+                  style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "cover", filter: "blur(20px)", transform: "scale(1.1)", opacity: 0.3, pointerEvents: "none" }} />
+              )}
+              <div className="spinner" style={{ width: 44, height: 44, borderTopColor: "var(--green)", borderColor: "rgba(37,211,102,.2)", position: "relative" }} />
+              <span style={{ fontSize: 13, color: "rgba(255,255,255,0.6)", position: "relative" }}>Mengunduh media...</span>
+            </div>
+          ) : dlState[resolvedCurrent?.msgId] === "failed" ? (
+            // Failed
+            <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 14 }}>
+              <span style={{ fontSize: 48 }}>⚠️</span>
+              <span style={{ fontSize: 13, color: "rgba(255,255,255,0.55)" }}>Gagal mengunduh media</span>
+              <button
+                onClick={() => handleViewerDownload(resolvedCurrent)}
+                style={{ padding: "8px 20px", borderRadius: 20, background: "rgba(37,211,102,0.85)", border: "none", color: "#fff", cursor: "pointer", fontSize: 13, fontWeight: 500 }}
+              >Coba lagi</button>
+            </div>
+          ) : resolvedCurrent?.msgId ? (
+            // Not downloaded — show download CTA with thumbnail preview
+            <div
+              onClick={() => handleViewerDownload(resolvedCurrent)}
+              style={{ position: "relative", display: "flex", flexDirection: "column", alignItems: "center", gap: 14, cursor: "pointer", width: "100%", height: "100%", justifyContent: "center" }}
+            >
+              {resolvedCurrent?.thumbnailSrc && (
+                <img src={resolvedCurrent.thumbnailSrc} alt="" draggable={false}
+                  style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "cover", filter: "blur(22px)", transform: "scale(1.1)", opacity: 0.28, pointerEvents: "none" }} />
+              )}
+              <div style={{ position: "relative", zIndex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 12 }}>
+                <div style={{ width: 72, height: 72, borderRadius: "50%", background: "rgba(37,211,102,0.85)", display: "flex", alignItems: "center", justifyContent: "center", boxShadow: "0 4px 24px rgba(0,0,0,0.5)" }}>
+                  <DownloadIcon />
+                </div>
+                <span style={{ fontSize: 13, color: "rgba(255,255,255,0.75)" }}>Klik untuk unduh media</span>
+              </div>
+            </div>
           ) : (
             <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 10, color: "rgba(255,255,255,0.4)" }}>
               <div className="spinner" style={{ width: 36, height: 36, borderTopColor: "var(--green)", borderColor: "rgba(37,211,102,.2)" }} />
-              <span style={{ fontSize: 12 }}>Mengunduh media...</span>
+              <span style={{ fontSize: 12 }}>Memuat...</span>
             </div>
           )}
         </div>
@@ -605,7 +705,7 @@ export default function MediaViewer() {
       </div>
 
       {/* Caption */}
-      {current?.caption && (
+      {resolvedCurrent?.caption && (
         <div style={{
           padding: "10px 24px 4px",
           color: "rgba(255,255,255,0.75)",
@@ -613,7 +713,7 @@ export default function MediaViewer() {
           textShadow: "0 1px 4px rgba(0,0,0,0.8)",
           flexShrink: 0,
         }}>
-          {current.caption}
+          {resolvedCurrent.caption}
         </div>
       )}
 

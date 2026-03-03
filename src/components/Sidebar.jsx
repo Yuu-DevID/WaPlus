@@ -1,5 +1,7 @@
 import { useAuthStore } from "../store/auth"
 import { useAppStore } from "../store/app"
+import { useState } from "react"
+import SettingsPanel from "./SettingsPanel"
 
 const IconChats = () => (
   <svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
@@ -82,6 +84,7 @@ export default function Sidebar() {
   const { connectedUser } = useAuthStore()
   const name = connectedUser?.name || connectedUser?.pushName || "Me"
   const color = getColor(name)
+  const [showSettings, setShowSettings] = useState(false)
 
   const handleLogout = () => {
     if (window.confirm("Keluar dari AuroraChat?")) window.api?.logout?.()
@@ -113,13 +116,17 @@ export default function Sidebar() {
 
       <div className="sidebar-spacer"/>
 
-      <button className="sidebar-nav-btn" title="Pengaturan"><IconSettings/></button>
+      {/* [FIX-3] Settings button opens SettingsPanel */}
+      <button className="sidebar-nav-btn" title="Pengaturan" onClick={() => setShowSettings(true)}><IconSettings/></button>
       <button className="sidebar-nav-btn" title="Keluar" onClick={handleLogout}><IconLogout/></button>
 
       {/* User avatar */}
       <div className="sidebar-avatar" style={{background:color}} title={name}>
         {initials(name)}
       </div>
+
+      {/* [FIX-3] Settings panel modal */}
+      {showSettings && <SettingsPanel onClose={() => setShowSettings(false)} />}
     </div>
   )
 }

@@ -1,0 +1,7 @@
+{
+  "id": "interactive-button",
+  "name": "Interactive Button Injector",
+  "version": "1.0.0",
+  "description": "Inject interactiveButtons (cta_url) ke setiap pesan yang dikirim — menambahkan tombol link ke pesan",
+  "author": "WaPlus"
+}

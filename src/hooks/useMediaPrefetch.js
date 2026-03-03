@@ -10,6 +10,10 @@
 //   4. Dedup: never prefetch same JID twice per session
 //   5. Rate-limit: scroll events coalesced with 300ms debounce per JID
 //
+// [FIX-AUTO-DL] When autoDownloadMedia=false, prefetch is suppressed entirely.
+// The backend also enforces this gate, but suppressing here avoids pointless IPC.
+// Sticker-only prefetch is handled server-side via the backend filter.
+//
 // Architecture:
 //   useMediaPrefetch()     → hook for ChatWindow (on-open instant prefetch)
 //   useChatListPrefetch()  → hook for ChatList  (IntersectionObserver scroll)
@@ -31,6 +35,23 @@ const MAX_CONCURRENT = 2
 let   _running    = 0
 // Scroll debounce timers per JID
 const _debounce   = new Map()
+
+// ── Helper: check if auto-download is enabled ─────────────────────────────────
+// Reads Zustand store state without subscribing (snapshot). Safe to call
+// from non-hook contexts. Defaults to true if store not yet initialized.
+let _getAutoDownload = null
+function _isAutoDownloadEnabled() {
+  if (!_getAutoDownload) {
+    try {
+      // Lazy import to avoid circular dep at module load time
+      const { useAppStore } = require("../store/app")
+      _getAutoDownload = () => useAppStore.getState().autoDownloadMedia
+    } catch {
+      return true
+    }
+  }
+  return _getAutoDownload?.() ?? true
+}
 
 // ── Queue processor ───────────────────────────────────────────────────────────
 
@@ -68,6 +89,12 @@ function _flush() {
  */
 export function prefetchChat(jid, limit = 20, priority = false) {
   if (!jid || !window.api?.mediaPrefetch) return
+
+  // [FIX-AUTO-DL] When auto-download is OFF, skip prefetch entirely.
+  // The backend will still serve sticker-only requests from media:trigger-download.
+  // Suppress the IPC call here to avoid queue buildup and wasted round-trips.
+  if (!_isAutoDownloadEnabled()) return
+
   if (_prefetched.has(jid) || _inflight.has(jid)) return
 
   // Dedup queue entries

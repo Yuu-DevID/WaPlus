@@ -21,6 +21,18 @@ function initLidMap(contacts) {
 }
 
 /**
+ * seedLidMap — directly merge a pre-built Map (e.g. loaded from lid_map.json on disk)
+ * into the global lid map, without needing to re-parse contacts objects.
+ * Call this in loadLidMapFromDisk() so normalizeJid resolves @lid from the first message.
+ *
+ * @param {Map} map — Map<lidUser|lidJid, realJid>
+ */
+function seedLidMap(map) {
+  if (!map || !(map instanceof Map)) return
+  for (const [k, v] of map) _globalLidMap.set(k, v)
+}
+
+/**
  * updateLidMap — tambah/update entries tanpa rebuild seluruh map.
  * Panggil di contacts.update event untuk incremental update.
  *
@@ -77,12 +89,12 @@ function normalizeJid(jid) {
   const cleaned = `${user}@${server}`
 
   // @lid — attempt resolve via global map
-  // If NOT resolved → warn so dev knows map wasn't populated
+  // If NOT resolved → return as-is (will be fixed later by resolveLidInDB).
+  // We intentionally do NOT warn here — @lid JIDs arrive before contacts.set
+  // fires during every session start, producing thousands of useless log lines.
   if (server === "lid") {
     const resolved = _globalLidMap.get(user) || _globalLidMap.get(cleaned)
-    if (resolved) return resolved
-    console.warn(`[jid-utils] unresolved @lid JID: ${cleaned} — call initLidMap() with contacts first`)
-    return cleaned
+    return resolved || cleaned
   }
 
   return cleaned
@@ -150,11 +162,25 @@ function buildLidMap(contacts) {
     const realJid = _normalizeBase(c.id)
     if (!realJid) continue
 
+    // Skip if c.id itself is a @lid — that means Baileys doesn't know the real phone
+    // for this contact yet. We can only map when c.id is a real @s.whatsapp.net JID.
+    const realServer = realJid.split("@")[1]
+    if (realServer === "lid") continue
+
     if (c.lid) {
-      const lidUser = c.lid.split("@")[0]
+      const lidJid  = _normalizeBase(c.lid)
+      const lidUser = lidJid.split("@")[0]
       if (lidUser) {
+        // Standard: @lid JID → real JID
         map.set(lidUser, realJid)
-        map.set(c.lid, realJid)
+        map.set(`${lidUser}@lid`, realJid)
+
+        // [FIX-LID-PROMOTE] Also map lid-number@s.whatsapp.net → realJid.
+        // When resolveLidRows runs BEFORE contacts.set (race), it renames
+        // the chat row from lidUser@lid → lidUser@s.whatsapp.net using the
+        // lid number as the "user" part. This produces fake JIDs like
+        // 273517190848685@s.whatsapp.net. After contacts.set we can fix them.
+        map.set(`${lidUser}@s.whatsapp.net`, realJid)
       }
     }
 
@@ -197,6 +223,7 @@ module.exports = {
   // Init (WAJIB di contacts.upsert handler)
   initLidMap,
   updateLidMap,
+  seedLidMap,   // [FIX] seed from disk-loaded Map directly
 
   // Core
   normalizeJid,

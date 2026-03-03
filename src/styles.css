@@ -301,11 +301,24 @@ textarea {
 
 /* ── Skeleton ───────────────────────────────────────────── */
 .skel {
-  background: linear-gradient(90deg, var(--bg-card) 25%, var(--bg-hover) 50%, var(--bg-card) 75%);
-  background-size: 200% 100%;
-  animation: shimmer 1.6s infinite;
+  background: linear-gradient(
+    90deg,
+    rgba(255,255,255,0.04) 0%,
+    rgba(255,255,255,0.10) 40%,
+    rgba(255,255,255,0.06) 60%,
+    rgba(255,255,255,0.04) 100%
+  );
+  background-size: 250% 100%;
+  animation: shimmer 1.5s ease-in-out infinite;
   border-radius: var(--radius-sm);
+  will-change: background-position;
 }
+/* Stagger skeleton items for organic shimmer */
+.skel:nth-child(2) { animation-delay: 0.08s; }
+.skel:nth-child(3) { animation-delay: 0.16s; }
+.skel:nth-child(4) { animation-delay: 0.24s; }
+.skel:nth-child(5) { animation-delay: 0.32s; }
+.skel:nth-child(6) { animation-delay: 0.40s; }
 
 /* ══════════════════════════════════════════════════════════
    SPINNER
@@ -1699,6 +1712,25 @@ textarea {
   border-radius: var(--radius);
   overflow: hidden;
   background: var(--bg-hover);
+  position: relative;
+}
+
+/* GIF badge overlay */
+.gif-badge {
+  position: absolute;
+  bottom: 8px;
+  left: 8px;
+  background: rgba(0,0,0,0.62);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.8px;
+  padding: 2px 7px;
+  border-radius: 4px;
+  pointer-events: none;
+  user-select: none;
+  backdrop-filter: blur(2px);
+  z-index: 2;
 }
 
 .media-img-thumb {
@@ -2682,6 +2714,10 @@ textarea {
   tab-size: 2;
   min-height: 100%;
   word-break: break-all;
+  /* [FIX-SELECTABLE] Allow text selection in raw viewer */
+  user-select: text;
+  -webkit-user-select: text;
+  cursor: text;
 }
 
 /* ctx-item-hint missing from original */

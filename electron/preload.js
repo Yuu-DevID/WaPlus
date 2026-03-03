@@ -159,6 +159,10 @@ contextBridge.exposeInMainWorld("api", {
   statusGetContactCount: ()        => ipcRenderer.invoke("status:get-contact-count"),
   statusSend:            (payload) => ipcRenderer.invoke("status:send", payload),
 
+  // Contact status
+  contactFetchStatus:     ({ jid })    => ipcRenderer.invoke("contact:fetch-status", { jid }),
+  contactFetchStatusBulk: ({ jids })   => ipcRenderer.invoke("contact:fetch-status-bulk", { jids }),
+
   // ═══════════════════════════════════════════════════════════
   // MOD / PLUGIN MANAGER
   // ═══════════════════════════════════════════════════════════
@@ -188,6 +192,18 @@ contextBridge.exposeInMainWorld("api", {
   // ══════════════════════════════════════════════════════════
   devEval: (opts) => ipcRenderer.invoke("dev:eval", { mode: "expr", ...opts }),
   saveFile: ({ content, filename }) => ipcRenderer.invoke("dev:save-file", { content, filename }),
+
+  // [FIX-3] Settings API — auto-download media, persisted settings
+  settingsLoad:            ()          => ipcRenderer.invoke("settings:load"),
+  settingsSave:            (settings)  => ipcRenderer.invoke("settings:save", settings),
+  settingsSetAutoDownload: ({ enabled }) => ipcRenderer.invoke("settings:set-auto-download", { enabled }),
+  settingsSetRamLimit:     ({ mb })      => ipcRenderer.invoke("settings:set-ram-limit", { mb }),
+
+  // [FIX-LID-CLICK] On-demand lid re-resolution — called when user clicks a chat with @lid leak
+  lidResolveNow: () => ipcRenderer.invoke("lid:resolve-now"),
+
+  // [FIX-3] Manual media download — called when user clicks a media bubble with auto-download OFF
+  mediaTriggerDownload: ({ msgId }) => ipcRenderer.invoke("media:trigger-download", { msgId }),
 })
 // NOTE: Below lines injected by fix script — appended separately
 // These are added to window.api via contextBridge above, but since the file

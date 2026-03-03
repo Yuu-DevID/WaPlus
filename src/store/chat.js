@@ -331,11 +331,42 @@ export const useChatStore = create((set, get) => ({
         const groups      = allChats.filter(c => c.is_group)
         const communities = allRaw.filter(c => c.is_community)
 
+        // [FIX-CHAT-POS] Preserve in-memory timestamps that are NEWER than DB.
+        // appendMessage() updates last_msg_at optimistically in the store.
+        // If loadChats() fires before the DB write lands (race condition), the DB
+        // row still has the old timestamp — which would sort this chat back down.
+        // Solution: for each chat, keep whichever timestamp is larger.
+        const currentChats = get().chats || []
+        const currentByJid = {}
+        for (const c of currentChats) if (c.jid) currentByJid[c.jid] = c
+
+        const mergedChats = allChats.map(c => {
+          const inMem = currentByJid[c.jid]
+          if (!inMem) return c
+          const dbTs  = c.last_msg_at || c.last_message_timestamp || 0
+          const memTs = inMem.last_msg_at || inMem.last_message_timestamp || 0
+          if (memTs > dbTs) {
+            // In-memory is fresher — keep its timestamp + preview fields
+            return {
+              ...c,
+              last_msg_at:  inMem.last_msg_at,
+              last_msg:     inMem.last_msg     || c.last_msg,
+              from_me:      inMem.from_me      ?? c.from_me,
+            }
+          }
+          return c
+        })
+
+        // Sort AFTER merge so preserved timestamps are reflected
+        const getTs = c => c.last_msg_at || c.last_message_timestamp || 0
+        mergedChats.sort((a, b) => (b.pinned - a.pinned) || (getTs(b) - getTs(a)))
+        const mergedGroups = mergedChats.filter(c => c.is_group)
+
         set({
-          chats:            allChats,
-          chatsTotal:       result.total || allChats.length,
-          groups,
-          groupsTotal:      groups.length,
+          chats:            mergedChats,
+          chatsTotal:       result.total || mergedChats.length,
+          groups:           mergedGroups,
+          groupsTotal:      mergedGroups.length,
           communities,
           communitiesTotal: communities.length,
           channels,
@@ -616,7 +647,7 @@ export const useChatStore = create((set, get) => ({
     return { messages: { ...s.messages, [cleanJid]: msgs } }
   }),
 
-  // [FIX-5] appendMessage — normalized + cross-chat dedup guard
+  // [FIX-5] appendMessage — normalized + cross-chat dedup guard + bubble chat to top
   appendMessage: (jid, msg) => set((s) => {
     // [FIX-SPLIT-CHAT] Normalize store key — IPC may deliver different JID forms
     const cleanJid = normalizeJid(jid)
@@ -630,11 +661,36 @@ export const useChatStore = create((set, get) => ({
     if (existing.some(m => m.id === msg.id)) return s
 
     const contacts = s.contacts
+    const normalized = normalizeMsg(msg, contacts, getOwnJid())
+
+    // [FIX-5] Also update the chat list entry so this chat sorts to the top immediately.
+    // We do this INSIDE the same setState so it's atomic (one render).
+    let newChats = s.chats ? [...s.chats] : []
+    const chatIdx = newChats.findIndex(c => c.jid === cleanJid)
+    const getTs = c => c.last_msg_at || c.last_message_timestamp || 0
+    const newTs = msg.timestamp || msg.message_timestamp || Math.floor(Date.now() / 1000)
+
+    if (chatIdx >= 0) {
+      newChats[chatIdx] = {
+        ...newChats[chatIdx],
+        last_msg:    msg.body || (msg.msg_type ? `[${msg.msg_type}]` : ""),
+        last_msg_at: newTs,
+        from_me:     normalized.from_me,
+        // Increment unread only for incoming messages while chat is NOT active
+        unread_count: normalized.from_me ? 0
+          : (newChats[chatIdx].unread_count || 0) + 1,
+      }
+    }
+    // Re-sort: pinned first, then by timestamp desc
+    newChats.sort((a, b) => (b.pinned - a.pinned) || (getTs(b) - getTs(a)))
+
     return {
       messages: {
         ...s.messages,
-        [cleanJid]: [...existing, normalizeMsg(msg, contacts, getOwnJid())],
-      }
+        [cleanJid]: [...existing, normalized],
+      },
+      chats:  newChats,
+      groups: newChats.filter(c => c.is_group),
     }
   }),
 
@@ -649,7 +705,7 @@ export const useChatStore = create((set, get) => ({
     const idx = msgs.findIndex(m => m.id === id)
     if (idx < 0) return s
     const updated = [...msgs]
-    updated[idx] = { ...updated[idx], media_saved_path: normalizeMediaPath(media_saved_path) }
+    updated[idx] = { ...updated[idx], media_saved_path: normalizeMediaPath(media_saved_path), media_is_downloaded: 1 }
     return { messages: { ...s.messages, [cleanJid]: updated } }
   }),
 

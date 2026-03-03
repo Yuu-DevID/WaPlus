@@ -6,6 +6,7 @@
 import { useState, useEffect, useRef, memo, useMemo } from "react"
 import { format } from "date-fns"
 import { prefetchChat } from "../../hooks/useMediaPrefetch"
+import { useAppStore } from "../../store/app"
 import { HiArrowDownTray, HiExclamationTriangle, HiPhoto, HiVideoCamera, HiMusicalNote, HiDocument, HiArchiveBox, HiForward } from "./icons"
 
 // ════════════════════════════════════════════════════════════
@@ -142,8 +143,17 @@ export function useMediaSrc(msg) {
     window.api.fsExists({ rawPath })
       .then(exists => {
         if (!exists) {
+          // [FIX-MISSING-FILE] File path in DB but file is gone (moved, deleted, external drive).
+          // 1. Clear src so bubble switches to download-trigger mode (shows thumbnail + spinner)
+          // 2. Trigger a re-download via mediaTriggerDownload so file comes back automatically
           setVerifiedSrc(null)
-          if (msg.chat_jid) prefetchChat(msg.chat_jid, 30, true)
+          const msgId = msg?.id
+          if (msgId && window.api?.mediaTriggerDownload) {
+            window.api.mediaTriggerDownload({ msgId }).catch(() => {})
+          } else if (msg?.chat_jid) {
+            // Fallback: re-prefetch the chat if no direct trigger available
+            prefetchChat(msg.chat_jid, 30, true)
+          }
         }
       })
       .catch(() => {})

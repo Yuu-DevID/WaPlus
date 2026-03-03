@@ -1,4 +1,22 @@
 const { app, BrowserWindow, ipcMain, protocol } = require("electron")
+
+// ── [RAM] Apply memory limit from settings before window creation ─────────────
+// Reads wplus_settings.json synchronously at boot to set V8 heap limit.
+// Default: 256 MB. Range: 32–512 MB.
+;(function _applyMemorySettings() {
+  try {
+    const _fs = require('fs'), _path = require('path')
+    const sPath = _path.join(app.getPath('userData'), 'wplus_settings.json')
+    if (_fs.existsSync(sPath)) {
+      const s = JSON.parse(_fs.readFileSync(sPath, 'utf8'))
+      const mb = parseInt(s.ramLimitMb, 10)
+      if (!isNaN(mb) && mb >= 32 && mb <= 512) {
+        app.commandLine.appendSwitch('js-flags', `--max-old-space-size=${mb}`)
+        console.log(`[AuroraChat] RAM limit set to ${mb}MB`)
+      }
+    }
+  } catch (_) {}
+})()
 const path = require("path")
 const fs = require("fs")
 
@@ -269,13 +287,20 @@ ipcMain.handle("msg:send-media", async (_e, { jid, items, quotedMsgId }) => {
       const base64 = item.dataUrl.split(",")[1]
       const buf    = Buffer.from(base64, "base64")
       let r
-      if (item.mimeType?.startsWith("image/")) {
+      const mime = item.mimeType || ""
+
+      // [FIX-GIF] image/gif must be sent as videoMessage+gifPlayback, NOT imageMessage.
+      // WA protocol: GIFs are always videoMessage { gifPlayback: true }.
+      // Routing priority: gif → sendGif, other images → sendImage, video → sendVideo, rest → document
+      if (mime === "image/gif" || item.isGif) {
+        r = await baileysClient.sendGif(jid, buf, item.caption || "", quotedWAMsg)
+      } else if (mime.startsWith("image/")) {
         r = await baileysClient.sendImage(jid, buf, item.caption || "", quotedWAMsg)
-      } else if (item.mimeType?.startsWith("video/")) {
+      } else if (mime.startsWith("video/")) {
         r = await baileysClient.sendVideo(jid, buf, item.caption || "", quotedWAMsg)
       } else {
         const fname = item.fileName || "file"
-        r = await baileysClient.sendDocument(jid, buf, fname, item.mimeType || "application/octet-stream", item.caption || "", quotedWAMsg)
+        r = await baileysClient.sendDocument(jid, buf, fname, mime || "application/octet-stream", item.caption || "", quotedWAMsg)
       }
       results.push({ ok: true, id: r?.key?.id })
       quotedWAMsg = null
@@ -412,8 +437,8 @@ ipcMain.handle("db:backfill:previews", () => {
 // ── Media prefetch IPC ────────────────────────────────────
 // Called by renderer when a chat scrolls into view or is clicked.
 // Triggers background download of all pending media for a chat.
-// Fire-and-forget: returns immediately, downloads happen in background.
-// Each downloaded file emits a "media:updated" event to the renderer.
+// [FIX-AUTO-DL] Respects AUTO_DOWNLOAD_MEDIA setting — when disabled,
+// only stickers are fetched (they're tiny and required for bubble rendering).
 ipcMain.handle("media:prefetch", async (_e, { jid, limit = 20 }) => {
   try {
     if (!baileysClient) return { ok: false, queued: 0 }
@@ -421,16 +446,25 @@ ipcMain.handle("media:prefetch", async (_e, { jid, limit = 20 }) => {
     const pending = db.getMediaPendingForChat?.(jid, limit) || []
     if (pending.length === 0) return { ok: true, queued: 0 }
 
+    const autoDownload = baileysClient.getAutoDownloadMedia?.() ?? true
+
+    // Filter: when auto-download is OFF, only download stickers
+    const toDownload = autoDownload
+      ? pending
+      : pending.filter(row => row.msg_type === "stickerMessage")
+
+    if (toDownload.length === 0) return { ok: true, queued: 0 }
+
     // Kick off downloads in background — do NOT await
     setImmediate(async () => {
-      for (const row of pending) {
+      for (const row of toDownload) {
         try {
           await baileysClient.downloadMediaForMsg?.(row)
         } catch (_) {}
       }
     })
 
-    return { ok: true, queued: pending.length }
+    return { ok: true, queued: toDownload.length }
   } catch (err) {
     return { ok: false, error: err.message }
   }
@@ -691,10 +725,34 @@ ipcMain.handle("auth:check-session", () => {
 ipcMain.handle("profile:get-pic", async (_e, { jid }) => {
   try {
     if (!baileysClient) return { ok: false, url: null }
-    const info = await baileysClient.getContactInfo(jid)
-    return { ok: true, url: info.imgUrl }
+    // [FIX-PROFILE-PIC] Use getProfilePic (DB cache + 30min network cooldown) not
+    // getContactInfo which calls sock.fetchStatus + profilePictureUrl on every call.
+    // getContactInfo was causing 2 network round-trips per avatar render.
+    const result = await baileysClient.getProfilePic(jid)
+    return { ok: true, url: result?.url || null }
   } catch {
     return { ok: false, url: null }
+  }
+})
+
+// ── Contact Status fetch ──────────────────────────────────────────────────
+ipcMain.handle("contact:fetch-status", async (_e, { jid }) => {
+  try {
+    if (!baileysClient) return { ok: false, status: null }
+    const result = await baileysClient.fetchContactStatus(jid)
+    return { ok: true, status: result?.status || null, setAt: result?.setAt || null }
+  } catch (err) {
+    return { ok: false, status: null, error: err.message }
+  }
+})
+
+ipcMain.handle("contact:fetch-status-bulk", async (_e, { jids }) => {
+  try {
+    if (!baileysClient || !Array.isArray(jids)) return { ok: false, data: {} }
+    const result = await baileysClient.fetchContactStatusBulk(jids)
+    return { ok: true, data: result }
+  } catch (err) {
+    return { ok: false, data: {}, error: err.message }
   }
 })
 
@@ -1108,4 +1166,81 @@ ipcMain.handle("dev:save-file", async (_e, { content, filename }) => {
   } catch (e) {
     return { ok: false, error: e.message }
   }
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+// [FIX-3] SETTINGS — Auto Download Media & App Settings
+// ════════════════════════════════════════════════════════════════════════════
+
+// [FIX-3] Lazy path — evaluated after app is ready (app.getPath needs app:ready)
+function getSettingsPath() {
+  return path.join(require("electron").app.getPath("userData"), "wplus_settings.json")
+}
+
+ipcMain.handle("settings:load", () => {
+  try {
+    const fs = require("fs")
+    const p = getSettingsPath()
+    if (!fs.existsSync(p)) return { ok: true, data: {} }
+    return { ok: true, data: JSON.parse(fs.readFileSync(p, "utf8")) }
+  } catch { return { ok: true, data: {} } }
+})
+
+ipcMain.handle("settings:save", (_e, settings) => {
+  try {
+    require("fs").writeFileSync(getSettingsPath(), JSON.stringify(settings, null, 2), "utf8")
+    return { ok: true }
+  } catch (err) { return { ok: false, error: err.message } }
+})
+
+ipcMain.handle("settings:set-ram-limit", (_e, { mb }) => {
+  try {
+    const fs = require("fs")
+    const p = getSettingsPath()
+    let existing = {}
+    try { existing = JSON.parse(fs.readFileSync(p, "utf8")) } catch (_) {}
+    const safeMb = Math.min(512, Math.max(32, parseInt(mb, 10) || 256))
+    existing.ramLimitMb = safeMb
+    fs.writeFileSync(p, JSON.stringify(existing, null, 2), "utf8")
+    // Note: RAM limit change requires app restart to take effect (V8 heap set at boot)
+    return { ok: true, mb: safeMb, requiresRestart: true }
+  } catch (err) { return { ok: false, error: err.message } }
+})
+
+ipcMain.handle("settings:set-auto-download", (_e, { enabled }) => {
+  try {
+    const fs = require("fs")
+    const p = getSettingsPath()
+    let existing = {}
+    try { existing = JSON.parse(fs.readFileSync(p, "utf8")) } catch (_) {}
+    existing.autoDownloadMedia = !!enabled
+    fs.writeFileSync(p, JSON.stringify(existing, null, 2), "utf8")
+    baileysClient?.setAutoDownloadMedia?.(!!enabled)
+    return { ok: true }
+  } catch (err) { return { ok: false, error: err.message } }
+})
+
+// [FIX-LID-CLICK] On-demand LID re-resolution — called when user clicks a chat
+// with a suspicious JID (long numeric @s.whatsapp.net or @lid). Triggers a
+// full resolveLidRows pass which will remap lid-promoted JIDs to real phones.
+ipcMain.handle("lid:resolve-now", () => {
+  try {
+    if (!baileysClient) return { ok: false }
+    baileysClient.resolveLidNow?.()
+    return { ok: true }
+  } catch (err) {
+    return { ok: false, error: err.message }
+  }
+})
+
+// [FIX-3] Manual media download for a single bubble (when auto-download is OFF)
+ipcMain.handle("media:trigger-download", async (_e, { msgId }) => {
+  try {
+    if (!baileysClient) return { ok: false, error: "Client not ready" }
+    const db = getDB()
+    const row = db.getMessageById?.(msgId)
+    if (!row) return { ok: false, error: "Message not found" }
+    const result = await baileysClient.downloadMediaForMsg(row)
+    return { ok: true, result }
+  } catch (err) { return { ok: false, error: err.message } }
 })

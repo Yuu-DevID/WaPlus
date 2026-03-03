@@ -70,8 +70,10 @@ function ReplyPreviewBar({ replyTo, onCancel, chatName }) {
 
 // ─── Media Preview Card ───────────────────────────────────────────────────────
 function MediaPreviewCard({ item, index, total, onRemove, onCaptionChange }) {
-  const isImage = item.mimeType?.startsWith("image/")
-  const isVideo = item.mimeType?.startsWith("video/")
+  const isGif   = item.isGif || item.mimeType === "image/gif"
+  // [FIX-GIF] GIFs are image/gif in browser but sent as videoMessage — treat as video for preview
+  const isImage = !isGif && item.mimeType?.startsWith("image/")
+  const isVideo = !isGif && item.mimeType?.startsWith("video/")
   return (
     <div style={{
       position: "relative", display: "flex", flexDirection: "column", gap: 6,
@@ -79,7 +81,20 @@ function MediaPreviewCard({ item, index, total, onRemove, onCaptionChange }) {
       border: "1px solid rgba(255,255,255,0.1)", minWidth: 140, maxWidth: 180, flexShrink: 0,
     }}>
       <div style={{ position: "relative", lineHeight: 0 }}>
-        {isImage ? (
+        {isGif ? (
+          // [FIX-GIF] Render GIF as animated image preview with GIF badge
+          // dataUrl is base64 image/gif so <img> plays it correctly in preview
+          <div style={{ position: "relative" }}>
+            <img src={item.dataUrl} alt="GIF preview"
+              style={{ width: "100%", height: 110, objectFit: "cover", borderRadius: 7, display: "block" }} />
+            <div style={{
+              position: "absolute", bottom: 4, left: 4,
+              background: "rgba(0,0,0,0.72)", color: "#fff",
+              borderRadius: 4, fontSize: 10, fontWeight: 700, padding: "1px 5px",
+              letterSpacing: 0.5,
+            }}>GIF</div>
+          </div>
+        ) : isImage ? (
           <img src={item.dataUrl} alt="preview"
             style={{ width: "100%", height: 110, objectFit: "cover", borderRadius: 7, display: "block" }} />
         ) : (
@@ -166,12 +181,21 @@ function DragOverlay() {
 function fileToMediaItem(file) {
   return new Promise(resolve => {
     const reader = new FileReader()
-    reader.onload = e => resolve({
-      dataUrl: e.target.result,
-      mimeType: file.type || "application/octet-stream",
-      fileName: file.name,
-      caption: "",
-    })
+    reader.onload = e => {
+      const mime = file.type || "application/octet-stream"
+      // [FIX-GIF] GIF files report as "image/gif" from browser File API.
+      // WA protocol sends GIFs as videoMessage+gifPlayback, not imageMessage.
+      // Tag them with isGif=true so the IPC routing sends sendGif() instead of sendImage().
+      // Keep original mimeType for reference but add the flag for routing.
+      const isGif = mime === "image/gif"
+      resolve({
+        dataUrl:  e.target.result,
+        mimeType: mime,
+        fileName: file.name,
+        caption:  "",
+        isGif,
+      })
+    }
     reader.readAsDataURL(file)
   })
 }
@@ -286,10 +310,41 @@ export default function MessageInput({ chatJid, chatName, replyTo, onCancelReply
     setSending(true); onCancelReply?.()
     try {
       if (window.api?.sendMedia) {
-        await window.api.sendMedia({
+        const res = await window.api.sendMedia({
           jid: chatJid,
           items: mediaItems,
           quotedMsgId: quotedMsg?.id || null,
+        })
+        // [FIX-GIF] Optimistic update per media item with correct msg_type.
+        // GIF → msg_type=videoMessage + is_gif=1
+        // image → msg_type=imageMessage
+        // video → msg_type=videoMessage
+        const results = res?.results || []
+        const now = Math.floor(Date.now() / 1000)
+        mediaItems.forEach((item, idx) => {
+          const msgId = results[idx]?.id || ("local-media-" + Date.now() + "-" + idx)
+          const isGif  = item.isGif || item.mimeType === "image/gif"
+          const isVid  = !isGif && item.mimeType?.startsWith("video/")
+          const msgType = (isGif || isVid) ? "videoMessage" : "imageMessage"
+          appendMessage(chatJid, {
+            id: msgId,
+            chat_jid: chatJid,
+            body: item.caption || "",
+            msg_type: msgType,
+            has_media: 1,
+            mimetype: isGif ? "video/mp4" : (item.mimeType || null),
+            media_saved_path: null,
+            media_thumbnail_b64: isGif || isVid ? null : item.dataUrl,  // only for images
+            is_gif: isGif ? 1 : 0,
+            timestamp: now + idx,
+            from_me: 1,
+            status: 1,
+            quoted_id: idx === 0 ? (quotedMsg?.id || null) : null,
+            quoted_body: idx === 0 ? (quotedMsg?.body || null) : null,
+            quoted_sender: idx === 0 ? (quotedMsg?.sender_name || quotedMsg?.sender_jid || null) : null,
+            quoted_type: idx === 0 ? (quotedMsg?.msg_type || null) : null,
+            quoted_has_media: idx === 0 ? (quotedMsg?.has_media || 0) : 0,
+          })
         })
       }
       setMediaItems([])
@@ -300,7 +355,7 @@ export default function MessageInput({ chatJid, chatName, replyTo, onCancelReply
       }
     } catch(e) { console.error("Send media error:", e) }
     finally { setSending(false); ref.current?.focus() }
-  }, [mediaItems, chatJid, sending, replyTo, onCancelReply, text])
+  }, [mediaItems, chatJid, sending, replyTo, onCancelReply, text, appendMessage])
 
   const send = useCallback(() => {
     if (hasMedia) return sendMedia()

@@ -105,11 +105,23 @@ function extractMediaInfo(message, msgType) {
     width:            mediaObj.width       || null,
     height:           mediaObj.height      || null,
     url:              mediaObj.url         || null,
+    // [FIX-MEDIA-CRYPTO] Store crypto fields needed for re-download when URL expires.
+    // Baileys needs mediaKey + directPath (or url) + fileEncSha256 to reconstruct the download.
     mediaKey:         mediaObj.mediaKey    ? Buffer.from(mediaObj.mediaKey).toString("base64") : null,
+    directPath:       mediaObj.directPath  || null,
+    encSha256:        mediaObj.fileEncSha256 ? Buffer.from(mediaObj.fileEncSha256).toString("base64") : null,
     thumbnailDataUrl,
     isAnimated:       mediaObj.isAnimated  || false,
     isPtt:            actualType === "pttMessage",
-    isGif:            msgType === "videoMessage" && mediaObj.gifPlayback === true,
+    // [FIX-GIF] WA GIFs arrive as videoMessage with gifPlayback=true and mimetype=video/mp4.
+    // gifAttribution (GIPHY/TENOR) is also a reliable GIF signal.
+    // image/gif mimetype should never come from WA servers but handle it as a fallback
+    // for locally-sourced files that bypass WA conversion.
+    isGif:            msgType === "videoMessage" && (
+                        mediaObj.gifPlayback === true ||
+                        !!mediaObj.gifAttribution ||
+                        mediaObj.mimetype === "image/gif"
+                      ),
     isViewOnce:       msgType === "viewOnceMessage" || msgType === "viewOnceMessageV2",
   }
 }
