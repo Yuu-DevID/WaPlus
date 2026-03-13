@@ -139,9 +139,16 @@ function parseMessage(msg, opts = {}) {
   }
 
   // ── Sender JID — normalized + lid resolved ───────────────
+  // [FIX-GROUP-PARTICIPANT] History sync kadang mengisi key.participant dengan
+  // JID group itu sendiri (@g.us) — data bogus dari proto WA. Kalau participant
+  // sama dengan remoteJid (keduanya @g.us), abaikan dan fallback ke jid saja.
+  const validParticipant = (key.participant && key.participant !== key.remoteJid)
+    ? key.participant
+    : undefined
+
   const rawSender = isMe
     ? (opts.myJid || key.remoteJid || jid)
-    : (key.participant || jid)
+    : (validParticipant || jid)
 
   let sender = normalizeJid(rawSender)
   if (isLidJid(sender) && lidMapOverride) {

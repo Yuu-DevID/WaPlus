@@ -1784,13 +1784,18 @@ ipcMain.handle("dev:eval", async (_e, { code, mode, msgId, chatJid, fullOutput }
     m.chat     = cJid
     m.fromMe   = fromMe
     m.isGroup  = isGroup
+    // [FIX-GROUP-PARTICIPANT] Participant yang sama dengan remoteJid (@g.us) adalah
+    // data bogus dari history sync proto WA — abaikan, jangan dipakai sebagai sender.
+    const _vKeyP = (m.key?.participant && m.key.participant !== cJid) ? m.key.participant : undefined
+    const _vRowP = (row?.participant   && row.participant   !== cJid) ? row.participant   : undefined
+
     m.sender   = decodeJid(
       (fromMe && dims?.user?.id) ||
-      m.key?.participant ||
-      row?.participant ||
+      _vKeyP ||
+      _vRowP ||
       cJid || ""
     )
-    if (isGroup) m.participant = decodeJid(m.key.participant || row?.participant || "") || ""
+    if (isGroup) m.participant = decodeJid(_vKeyP || _vRowP || "") || ""
 
     // ── m.message block (myfunc.js lines 9-ff) ──────────────────────────────
     m.message = msgJson || {}
@@ -2018,8 +2023,10 @@ ipcMain.handle("dev:eval", async (_e, { code, mode, msgId, chatJid, fullOutput }
         const msgType  = row.message_type || "conversation"
         const isGroup  = cJid.endsWith("@g.us")
         const fromMe   = row.from_me === 1
+        // [FIX-GROUP-PARTICIPANT] Skip participant bila sama dengan group JID (data bogus history sync)
+        const _validPart = (row.participant && row.participant !== cJid) ? row.participant : undefined
         const senderJid = isGroup
-          ? (row.participant || "")
+          ? (_validPart || cJid)
           : (fromMe ? (sock?.user?.id || cJid) : cJid)
 
         // Parse stored raw message JSON (WAMessage proto)

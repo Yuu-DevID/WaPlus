@@ -2760,6 +2760,22 @@ const database = {
      * getDBPath — return absolute path to the DB file (for debug/devtools).
      */
     getDBPath() { return DB_PATH; },
+
+    /**
+     * hasLidParticipant — cek apakah ada row di messages yang masih pakai @lid ini sebagai participant.
+     * Dipakai oleh [FIX-LID-RETROACTIVE] di messages.upsert untuk memutuskan apakah perlu fix.
+     * Menggunakan EXISTS + LIMIT 1 agar sangat cepat (stop scan setelah baris pertama).
+     *
+     * @param {string} lidJid  — e.g. "628xxx@lid"
+     * @returns {boolean}
+     */
+    hasLidParticipant(lidJid) {
+        if (!lidJid) return false;
+        try {
+            const row = db.prepare('SELECT 1 FROM messages WHERE participant = ? LIMIT 1').get(lidJid);
+            return !!row;
+        } catch (_) { return false; }
+    },
 };
 
 module.exports = database;

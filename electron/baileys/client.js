@@ -1703,6 +1703,17 @@ async function handleMessage(msg, type, isHistorySync = false) {
     msg.key.participant = p
   }
 
+  // [FIX-GROUP-PARTICIPANT] History sync terkadang mengisi participant dengan
+  // JID group itu sendiri (@g.us) — data bogus dari proto WA.
+  // Hapus sebelum fromMe check & parseMessage supaya tidak salah jadi senderId.
+  if (
+    msg.key?.participant &&
+    isGroupJid(msg.key.participant) &&
+    msg.key.participant === msg.key.remoteJid
+  ) {
+    msg.key.participant = undefined
+  }
+
   // [FIX-7] AUTHORITATIVE fromMe for group messages.
   // Problem: WA sometimes delivers group messages from this device with
   //   key.fromMe = undefined/null/false when routed via multi-device.
@@ -2290,8 +2301,6 @@ async function connectToWhatsApp(phoneForPairing = null) {
   sock.ev.on("messaging-history.set", async ({ chats, contacts, messages, isLatest, progress, syncType }) => {
     log(`History Sync [${syncType ?? 'unknown'}]: ${messages.length} msg, ${chats.length} chats, ${contacts.length} contacts | isLatest: ${isLatest} | progress: ${progress}%`)
 
-    
-
     isSyncing = true
     syncStats.chats += chats.length
     syncStats.messages += messages.length
@@ -2528,6 +2537,46 @@ async function connectToWhatsApp(phoneForPairing = null) {
     // The renderer should suppress desktop notifications for 'append' messages
     // (use the 'type' field in the payload if needed).
     await handleMessage(msg, type, false)
+
+    // [FIX-LID-RETROACTIVE] Saat live message datang dari @s.whatsapp.net dengan pushName,
+    // update DB history dimana participant masih tersimpan sebagai @lid dengan user number
+    // yang sama. Ini terjadi karena history sync menyimpan sender sebagai @lid (unresolved),
+    // lalu pesan live pertama dari orang yang sama memberi kita @s.whatsapp.net + pushName.
+    //
+    // Kondisi: hanya untuk 'notify' (bukan 'append'), hanya pesan masuk (bukan fromMe),
+    // hanya jika senderJid adalah @s.whatsapp.net (bukan @lid / @g.us / dll).
+    if (type === 'notify' && !msg.key?.fromMe && msg.pushName) {
+      try {
+        const remoteJid = msg.key?.remoteJid
+        // Ambil sender JID: untuk grup = participant, untuk DM = remoteJid
+        const senderJid = normalizeJid(
+          (remoteJid && isGroupJid(remoteJid) ? msg.key?.participant : remoteJid) || ''
+        )
+        if (senderJid && isUserJid(senderJid)) {
+          const userNumber = senderJid.split('@')[0]
+          const lidVariant  = `${userNumber}@lid`
+
+          // Cek apakah ada rows di DB yang masih pakai @lid ini sebagai participant
+          const hasLidRows = db.hasLidParticipant?.(lidVariant)
+
+          if (hasLidRows) {
+            // 1. Ganti semua participant @lid → @s.whatsapp.net di messages table
+            db.statements?.lidFixParticipant?.run(senderJid, lidVariant)
+
+            // 2. Perbarui lidMap global agar resolve ini persisten
+            const newEntry = new Map([[lidVariant, senderJid]])
+            mergeLidBatch?.(newEntry)
+
+            // 3. Upsert pushName ke contacts sekarang kita tahu JID-nya
+            if (msg.pushName) {
+              db.upsertContactPushname?.(senderJid, msg.pushName)
+            }
+
+            log(`[LID-RETRO] Resolved ${lidVariant} → ${senderJid} (pushName: ${msg.pushName}) — updated history`)
+          }
+        }
+      } catch (_) { /* non-critical, jangan crash */ }
+    }
 
     // Track resume-sync progress
     if (isAppend && _isResumeSyncing) {
