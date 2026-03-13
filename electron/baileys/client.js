@@ -1830,14 +1830,22 @@ async function handleMessage(msg, type, isHistorySync = false) {
   // ── [FIX-PUSHNAME] Persist sender pushname → contacts table ──
   // This is the source of truth for display names in chat list.
   // Without this, getChats() JOIN returns null and raw JID is shown.
-  if (!isHistorySync && parsed.pushname && parsed.sender_jid && !parsed.from_me) {
-    db.upsertContactPushname?.(parsed.sender_jid, parsed.pushname)
+  // [FIX-LID-HISTORY] Also persist pushname from history sync messages — they
+  // carry pushName/sender_name from WA which is the only source of truth for
+  // @lid senders that were never in the address book.
+  if (parsed.pushname && parsed.sender_jid && !parsed.from_me) {
+    // Only persist if sender_jid is resolved (@s.whatsapp.net) — never store against @lid
+    const senderIsPhone = parsed.sender_jid.endsWith('@s.whatsapp.net')
+    if (senderIsPhone) {
+      db.upsertContactPushname?.(parsed.sender_jid, parsed.pushname)
+    }
   }
 
-  // ── [FIX-SENDER-NAME] Resolve sender_name from contacts DB before pushing ──
-  // buildRendererPayload only has parsed.pushname (proto field).
+  // ── [FIX-SENDER-NAME] Resolve sender_name from contacts DB before insert/push ──
+  // For live messages: buildRendererPayload only has parsed.pushname (proto field).
+  // For history sync: sender_name field in DB row must be set here since
+  // backfillSenderNamesFromMessages runs AFTER all messages are inserted.
   // We need: phonebook name > push_name > pushname from proto > null
-  // This prevents duplicate/wrong name when contacts table has a better name.
   if (!parsed.from_me && parsed.sender_jid) {
     try {
       const contact = db.getContact?.(parsed.sender_jid)
@@ -1845,6 +1853,38 @@ async function handleMessage(msg, type, isHistorySync = false) {
         parsed._resolved_sender_name = contact.name || contact.push_name
       }
     } catch (_) { }
+    // [FIX-LID-SENDER-NAME] If sender_jid is still @lid, try to resolve via lidMap
+    // then lookup contact. This ensures history sync messages from @lid senders get
+    // proper sender_name stored in DB and shown in bubble.
+    if (!parsed._resolved_sender_name && isLidJid(parsed.sender_jid)) {
+      const resolvedJid = resolveLid(parsed.sender_jid, lidMap)
+      if (!isLidJid(resolvedJid)) {
+        try {
+          const contact = db.getContact?.(resolvedJid)
+          if (contact?.name || contact?.push_name) {
+            parsed._resolved_sender_name = contact.name || contact.push_name
+          }
+        } catch (_) { }
+        // Fallback: show phone number decoded from resolved JID
+        if (!parsed._resolved_sender_name) {
+          const phoneUser = resolvedJid.split('@')[0].split(':')[0]
+          if (/^\d{6,}$/.test(phoneUser)) {
+            parsed._resolved_sender_name = `+${phoneUser}`
+          }
+        }
+      } else {
+        // lid still unresolved — show pushname or lid-derived numeric as fallback
+        if (!parsed.pushname) {
+          const lidUser = parsed.sender_jid.split('@')[0]
+          const numericPart = lidUser.replace(/\D/g, '')
+          if (numericPart.length >= 6) parsed._resolved_sender_name = `+${numericPart}`
+        }
+      }
+    }
+    // Promote _resolved_sender_name as sender_name so it gets stored in DB
+    if (parsed._resolved_sender_name && !parsed.pushname) {
+      parsed.pushname = parsed._resolved_sender_name
+    }
   }
   // Also resolve quoted sender name
   if (parsed.quoted_sender && parsed.quoted_sender !== '__me__' && parsed.quoted_sender !== '__self__') {
@@ -2115,71 +2155,7 @@ async function connectToWhatsApp(phoneForPairing = null) {
       db.startSync()
       send("sync:status", { isSyncing: true, progress: 0 })
 
-      // [FIX-ENDLESS-SYNC] If messaging-history.set never fires (WA considers DB
-      // up-to-date and skips sending history), we must auto-complete the sync state.
-      //
-      // This is the normal path for EVERY reconnect after first login — WA only
-      // sends a messaging-history.set batch on first pair or after a long gap.
-      // On a normal reconnect (app relaunch, network blip), it sends nothing and
-      // delivers missed messages via messages.upsert 'append' instead.
-      //
-      // Strategy:
-      //   • 3s  — if DB already has data, resolve immediately (reconnect case)
-      //   • 15s — if DB is empty, keep waiting for first-time history sync
-      if (_syncAutoCompleteTimer) clearTimeout(_syncAutoCompleteTimer)
-      // [FIX-RECONNECT-SYNC] Use hasExistingData() — NOT getSyncStatus().
-      // startSync() resets sync_status.total_messages=0 BEFORE this check runs,
-      // so getSyncStatus() always returns 0 even on a reconnect with full DB.
-      // hasExistingData() does EXISTS on the real messages/chats tables instead.
-      setImmediate(() => {
-        if (!isSyncing) return
-        const hasDataNow = db.hasExistingData?.() ?? false
-        if (hasDataNow) {
-          logOk('[FIX-ENDLESS-SYNC] Reconnect: DB has data, completing sync immediately')
-          isSyncing = false
-          db.endSync(0, 0)
-          setImmediate(() => {
-            try { db.backfillChatLastMessages?.() } catch (_) {}
-            send("db:chats:updated")
-          })
-          send("sync:status", { isSyncing: false, progress: 100, stats: syncStats, isComplete: true, autoCompleted: true })
-          syncStats = { chats: 0, messages: 0 }
-          return
-        }
-      })
-
-      _syncAutoCompleteTimer = setTimeout(() => {
-        _syncAutoCompleteTimer = null
-        if (!isSyncing) return
-
-        const hasData = db.hasExistingData?.() ?? false
-
-        if (hasData) {
-          logOk('[FIX-ENDLESS-SYNC] Reconnect: DB has data, auto-completing sync')
-          isSyncing = false
-          db.endSync(0, 0)
-          setImmediate(() => {
-            try { db.backfillChatLastMessages?.() } catch (_) {}
-            send("db:chats:updated")
-          })
-          send("sync:status", { isSyncing: false, progress: 100, stats: syncStats, isComplete: true, autoCompleted: true })
-          syncStats = { chats: 0, messages: 0 }
-        } else {
-          logW('[FIX-ENDLESS-SYNC] No DB data — first-time login, waiting for history sync...')
-          _syncAutoCompleteTimer = setTimeout(() => {
-            _syncAutoCompleteTimer = null
-            if (!isSyncing) return
-            if (!db.hasExistingData?.()) {
-              logW('[FIX-ENDLESS-SYNC] Still no data after 15s — force-completing')
-              isSyncing = false
-              db.endSync(0, 0)
-              send("sync:status", { isSyncing: false, progress: 100, stats: syncStats, isComplete: true, autoCompleted: true })
-              send("db:chats:updated")
-              syncStats = { chats: 0, messages: 0 }
-            }
-          }, 12000)
-        }
-      }, 3000)
+      
 
       // [FIX-GROUP-NAME] Fetch group subjects for groups that have no name yet.
       // Run after a short delay to not block initial sync.
@@ -2310,41 +2286,11 @@ async function connectToWhatsApp(phoneForPairing = null) {
   // ── Save creds ───────────────────────────────────────
   sock.ev.on("creds.update", saveCreds)
 
-  // ════════════════════════════════════════════════════════
-  // EVENT: messaging-history.set (HISTORY SYNC)
-  // ════════════════════════════════════════════════════════
-  let _syncWatchdog = null
-  const _SYNC_TIMEOUT_MS = 90_000  // [FIX-6] 90s watchdog — if isLatest never fires, force-complete
-
-  function _clearSyncWatchdog() {
-    if (_syncWatchdog) { clearTimeout(_syncWatchdog); _syncWatchdog = null }
-  }
-
-  function _armSyncWatchdog() {
-    _clearSyncWatchdog()
-    _syncWatchdog = setTimeout(() => {
-      if (!isSyncing) return
-      logW('[FIX-6] Sync watchdog: isLatest never received — force-completing sync')
-      isSyncing = false
-      db.endSync(syncStats.chats, syncStats.messages)
-      setImmediate(() => {
-        try { db.backfillChatLastMessages?.(); db.backfillContactPushnames?.(); db.backfillSenderNamesFromMessages?.() } catch (_) { }
-        send('db:chats:updated')
-        send('db:contacts:updated')
-      })
-      send('sync:status', { isSyncing: false, progress: 100, stats: syncStats, isComplete: true, watchdogForced: true })
-      syncStats = { chats: 0, messages: 0 }
-    }, _SYNC_TIMEOUT_MS)
-  }
 
   sock.ev.on("messaging-history.set", async ({ chats, contacts, messages, isLatest, progress, syncType }) => {
     log(`History Sync [${syncType ?? 'unknown'}]: ${messages.length} msg, ${chats.length} chats, ${contacts.length} contacts | isLatest: ${isLatest} | progress: ${progress}%`)
 
-    // [FIX-ENDLESS-SYNC] Real history batch arrived — cancel auto-complete timer
-    if (_syncAutoCompleteTimer) { clearTimeout(_syncAutoCompleteTimer); _syncAutoCompleteTimer = null }
-
-    // [FIX-6] Rearm watchdog on every batch — if no new batch arrives in 90s, force complete
-    _armSyncWatchdog()
+    
 
     isSyncing = true
     syncStats.chats += chats.length
@@ -2443,13 +2389,20 @@ async function connectToWhatsApp(phoneForPairing = null) {
     for (const chat of chats) {
       if (!chat.id) continue
 
-      // [FIX-LID-DOUBLE] Resolve @lid chat.id → real JID sebelum menyentuh DB
+      // [FIX-DUPLICATE] Resolve @lid chat.id → real phone JID.
+      // Jika berhasil di-resolve → update chat.id dan simpan.
+      // Jika TIDAK bisa di-resolve → SKIP sepenuhnya.
+      // Jangan pernah menyimpan @lid sebagai jid di DB — ini menyebabkan
+      // duplikat chat (satu @lid + satu @s.whatsapp.net) di chat list.
       if (isLidJid(chat.id)) {
         const resolved = resolveLid(chat.id, lidMap)
-        if (resolved !== chat.id) {
-          log(`[LID] Chat resolved: ${chat.id} → ${resolved}`)
-          chat.id = resolved
+        if (resolved === chat.id) {
+          // Masih @lid — tidak bisa di-resolve, skip agar tidak ada duplikat
+          log(`[LID] Chat ${chat.id} unresolved, skip saveChat`)
+          continue
         }
+        log(`[LID] Chat resolved: ${chat.id} → ${resolved}`)
+        chat.id = resolved
       }
       db.saveChat(chat)
     }
@@ -2590,16 +2543,7 @@ async function connectToWhatsApp(phoneForPairing = null) {
       messages: _resumeSyncStats.messages,
       chats:    _resumeSyncStats.chats.size,
     })
-    // [FIX-APPEND-CHATLIST] Refresh chat list immediately after each batch so
-    // the latest message preview + unread badge show up without waiting for the
-    // 4s completion debounce. handleMessage already calls updateChatLastMsg()
-    // per-message but the renderer chat list needs a push event to re-render.
-    setImmediate(() => {
-      try { db.backfillChatLastMessages?.() } catch (_) {}
-      send('db:chats:updated')
-    })
-    // Reschedule completion watchdog — fires 4s after the last append batch
-    _scheduleResumeSyncComplete()
+  
   }
 
   // Handler case.js (opsional)
@@ -2611,36 +2555,6 @@ async function connectToWhatsApp(phoneForPairing = null) {
     }
   }
 })
-
-  // ── Resume-sync completion watchdog ─────────────────────────────────────────
-  // WA sends all catch-up 'append' batches in a short burst after reconnect.
-  // After 4s of silence (no new append batch), we declare gap-fill done.
-  // This is purely cosmetic — the DB is already up-to-date by the time the
-  // last batch was processed. We just need to clear the "catching up" indicator.
-  let _resumeSyncCompleteTimer = null
-  function _scheduleResumeSyncComplete() {
-    if (_resumeSyncCompleteTimer) clearTimeout(_resumeSyncCompleteTimer)
-    _resumeSyncCompleteTimer = setTimeout(() => {
-      _resumeSyncCompleteTimer = null
-      if (!_isResumeSyncing) return
-      _isResumeSyncing = false
-      const stats = { messages: _resumeSyncStats.messages, chats: _resumeSyncStats.chats.size }
-      logOk(`[ResumeSync] Gap-fill complete — ${stats.messages} messages across ${stats.chats} chats`)
-      // Refresh chat list + contacts so unread counts and last-message preview are current
-      setImmediate(() => {
-        try {
-          db.backfillChatLastMessages?.()
-          db.backfillSenderNamesFromMessages?.()
-          send('db:chats:updated')
-          send('db:contacts:updated')
-        } catch (_) {}
-      })
-      send('sync:resume:complete', stats)
-      // Clear disconnect stamp — next pause will write a fresh one
-      _saveLastDisconnectTs(0)
-      _resumeSyncStats = { messages: 0, chats: new Set() }
-    }, 4000)
-  }
 
 
   sock.ev.on("messages.update", async (updates) => {
@@ -2735,9 +2649,11 @@ async function connectToWhatsApp(phoneForPairing = null) {
   sock.ev.on("chats.set", ({ chats, isLatest }) => {
     log(`Loaded ${chats.length} chats (isLatest: ${isLatest})`)
     for (const chat of chats) {
-      // [FIX-LID] Resolve @lid in chat.id before saving
+      // [FIX-DUPLICATE] Resolve @lid → phone JID, skip if unresolvable
       if (chat.id && isLidJid(chat.id)) {
-        chat.id = resolveLid(chat.id, lidMap)
+        const resolved = resolveLid(chat.id, lidMap)
+        if (resolved === chat.id) continue  // still @lid — skip
+        chat.id = resolved
       }
       db.saveChat(chat)
     }
@@ -2746,9 +2662,11 @@ async function connectToWhatsApp(phoneForPairing = null) {
 
   sock.ev.on("chats.upsert", (c) => {
     for (const chat of c) {
-      // [FIX-LID] Resolve @lid in chat.id before saving
+      // [FIX-DUPLICATE] Resolve @lid → phone JID, skip if unresolvable
       if (chat.id && isLidJid(chat.id)) {
-        chat.id = resolveLid(chat.id, lidMap)
+        const resolved = resolveLid(chat.id, lidMap)
+        if (resolved === chat.id) continue  // still @lid — skip
+        chat.id = resolved
       }
       db.saveChat(chat)
     }

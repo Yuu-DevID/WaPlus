@@ -92,7 +92,11 @@ function _msgCacheSet(jid, limit, rows) {
 }
 
 function _msgCacheInvalidate(jid) {
-    _chatMsgCache.delete(jid)
+    if (jid === '*') {
+        _chatMsgCache.clear()  // clear all cache entries (used after bulk @lid fix)
+    } else {
+        _chatMsgCache.delete(jid)
+    }
 }
 
 // ════════════════════════════════════════════════════════════
@@ -408,11 +412,12 @@ function getStmts() {
              unread_count, pinned, archived, muted_until, member_count, updated_at
       FROM chats
       WHERE archived = 0
+        AND jid NOT LIKE '%@lid'
       ORDER BY pinned DESC, last_msg_at DESC
       LIMIT ? OFFSET ?
     `),
 
-        getChatCount: d.prepare(`SELECT COUNT(*) AS total FROM chats WHERE archived = 0`),
+        getChatCount: d.prepare(`SELECT COUNT(*) AS total FROM chats WHERE archived = 0 AND jid NOT LIKE '%@lid'`),
 
         getChat: d.prepare(`SELECT * FROM chats WHERE jid = ?`),
 
@@ -426,6 +431,7 @@ function getStmts() {
              unread_count, pinned, archived, muted_until, member_count, updated_at
       FROM chats
       WHERE is_group = 1 AND is_community = 0 AND archived = 0
+        AND jid NOT LIKE '%@lid'
       ORDER BY pinned DESC, last_msg_at DESC
       LIMIT ? OFFSET ?
     `),
@@ -601,6 +607,164 @@ function getStmts() {
 // ════════════════════════════════════════════════════════════
 // PUBLIC API — Chats
 // ════════════════════════════════════════════════════════════
+
+/**
+ * saveChat — save/upsert a Baileys chat object (uses chat.id field).
+ *
+ * Baileys emits chat objects with `.id` (not `.jid`), so this adapter
+ * bridges the gap. It also:
+ *   - Rejects @lid JIDs entirely (never stored — they are opaque device IDs,
+ *     not real chat identities, and storing them causes duplicate chat rows)
+ *   - Maps Baileys camelCase fields → DB snake_case columns
+ */
+function saveChat(chat) {
+    if (!chat || !chat.id) return
+    const jid = chat.id
+
+    // [FIX-DUPLICATE] NEVER store @lid as a chat JID.
+    // @lid is an opaque internal device identifier — it is NOT a real phone number.
+    // Storing it creates a duplicate chat row alongside the real @s.whatsapp.net entry.
+    // If caller hasn't resolved it yet, skip silently — resolveLidInDB() will fix it later.
+    if (jid.endsWith('@lid')) return
+
+    init()
+    const isGroup = jid.endsWith('@g.us') || !!chat.isGroup
+    const phone   = !isGroup ? jid.split('@')[0].split(':')[0] : null
+
+    // Derive last message info from the Baileys chat object
+    const msgs       = chat.messages || []
+    const lastMsgObj = msgs[0]?.message || null
+    let lastBody     = chat.last_msg || null
+    let lastMsgAt    = chat.last_msg_at || chat.conversationTimestamp || 0
+    let lastMsgType  = chat.last_msg_type || null
+
+    if (lastMsgObj && !lastBody) {
+        // Extract a basic body string from the last message if available
+        const mc = lastMsgObj.message
+        if (mc) {
+            lastBody = mc.conversation
+                || mc.extendedTextMessage?.text
+                || mc.imageMessage?.caption
+                || mc.videoMessage?.caption
+                || null
+        }
+        if (!lastMsgAt && lastMsgObj.messageTimestamp) {
+            const ts = lastMsgObj.messageTimestamp
+            lastMsgAt = typeof ts === 'object' ? Number(ts) : ts
+        }
+    }
+
+    return getStmts().upsertChat.run({
+        jid,
+        name:          chat.name          || null,
+        phone,
+        is_group:      isGroup            ? 1 : 0,
+        is_community:  chat.isCommunity   ? 1 : 0,
+        community_jid: chat.communityJid  || null,
+        avatar_url:    chat.avatarUrl     || null,
+        last_msg:      lastBody,
+        last_msg_at:   lastMsgAt,
+        last_msg_type: lastMsgType,
+        unread_count:  chat.unreadCount   || 0,
+        member_count:  chat.memberCount   || (chat.participants?.length ?? 0),
+    })
+}
+
+/**
+ * resolveLidRows — retroactively fix @lid JIDs that leaked into DB rows.
+ *
+ * Called from client.js after lidMap is populated (post history-sync).
+ * Uses a single SQLite transaction for atomicity and performance.
+ *
+ * For each @lid entry:
+ *   - If lidMap has a mapping → rename the row to the real phone JID
+ *     (UPDATE chats SET jid = phoneJid WHERE jid = lidJid)
+ *   - If no mapping exists → DELETE the @lid row (it's a ghost duplicate)
+ *
+ * Returns count of rows fixed (renamed + deleted).
+ */
+function resolveLidRows(lidMap) {
+    if (!lidMap || lidMap.size === 0) return 0
+    const db = getDb()
+    let fixed = 0
+
+    // Find all @lid rows in chats and messages
+    const lidChats    = db.prepare(`SELECT jid FROM chats    WHERE jid LIKE '%@lid'`).all()
+    const lidMessages = db.prepare(`SELECT DISTINCT chat_jid FROM messages WHERE chat_jid LIKE '%@lid'`).all()
+    const lidContacts = db.prepare(`SELECT jid FROM contacts WHERE jid LIKE '%@lid'`).all()
+
+    const tx = db.transaction(() => {
+        // ── Fix chats ──────────────────────────────────────────────────────
+        for (const { jid: lidJid } of lidChats) {
+            const lidUser   = lidJid.split('@')[0]
+            const phoneJid  = lidMap.get(lidJid) || lidMap.get(lidUser) || null
+
+            if (phoneJid) {
+                const exists = db.prepare(`SELECT 1 FROM chats WHERE jid = ?`).get(phoneJid)
+                if (exists) {
+                    // Phone JID row already exists — delete the @lid duplicate
+                    db.prepare(`DELETE FROM chats WHERE jid = ?`).run(lidJid)
+                } else {
+                    // Rename @lid row to phone JID
+                    db.prepare(`UPDATE chats SET jid = ?, phone = ? WHERE jid = ?`)
+                      .run(phoneJid, phoneJid.split('@')[0], lidJid)
+                }
+                fixed++
+            } else {
+                // No mapping — delete the unresolvable @lid ghost row
+                db.prepare(`DELETE FROM chats WHERE jid = ?`).run(lidJid)
+                fixed++
+            }
+        }
+
+        // ── Fix messages.chat_jid ─────────────────────────────────────────
+        for (const { chat_jid: lidJid } of lidMessages) {
+            const lidUser  = lidJid.split('@')[0]
+            const phoneJid = lidMap.get(lidJid) || lidMap.get(lidUser) || null
+            if (phoneJid) {
+                db.prepare(`UPDATE messages SET chat_jid = ? WHERE chat_jid = ?`).run(phoneJid, lidJid)
+                fixed++
+            } else {
+                // No resolution — remove orphan messages (their chat doesn't exist)
+                db.prepare(`DELETE FROM messages WHERE chat_jid = ?`).run(lidJid)
+                fixed++
+            }
+        }
+
+        // ── Fix messages.sender_jid ────────────────────────────────────────
+        const lidSenders = db.prepare(`SELECT DISTINCT sender_jid FROM messages WHERE sender_jid LIKE '%@lid'`).all()
+        for (const { sender_jid: lidJid } of lidSenders) {
+            const lidUser  = lidJid.split('@')[0]
+            const phoneJid = lidMap.get(lidJid) || lidMap.get(lidUser) || null
+            if (phoneJid) {
+                db.prepare(`UPDATE messages SET sender_jid = ? WHERE sender_jid = ?`).run(phoneJid, lidJid)
+                fixed++
+            }
+        }
+
+        // ── Fix contacts ───────────────────────────────────────────────────
+        for (const { jid: lidJid } of lidContacts) {
+            const lidUser  = lidJid.split('@')[0]
+            const phoneJid = lidMap.get(lidJid) || lidMap.get(lidUser) || null
+            if (phoneJid) {
+                const exists = db.prepare(`SELECT 1 FROM contacts WHERE jid = ?`).get(phoneJid)
+                if (exists) {
+                    db.prepare(`DELETE FROM contacts WHERE jid = ?`).run(lidJid)
+                } else {
+                    db.prepare(`UPDATE contacts SET jid = ? WHERE jid = ?`).run(phoneJid, lidJid)
+                }
+                fixed++
+            } else {
+                db.prepare(`DELETE FROM contacts WHERE jid = ?`).run(lidJid)
+                fixed++
+            }
+        }
+    })
+
+    tx()
+    if (fixed > 0) _msgCacheInvalidate('*')  // invalidate all caches
+    return fixed
+}
 
 function upsertChat(data) {
     init()
@@ -1069,6 +1233,8 @@ module.exports = {
     invalidateChatCache,
 
     // Chats
+    saveChat,
+    resolveLidRows,
     upsertChat,
     updateMemberCount,
     getChats,
